@@ -1,0 +1,1549 @@
+#!/usr/bin/env python3
+"""
+Completion-Gate shared library (idea-to-deploy, v1.51.0).
+
+Единое сердце подсистемы «Врата завершения» — реализует то, чего не хватало
+методологии до высокого балла по 4 пунктам «как предотвратить преждевременные
+сдачи»:
+
+  Пункт 4 — сбор runtime-сигналов:   classify_bash() + append_signal()
+  Пункт 2 — трёхслойная валидация:    compute_verdict() (L1→L2→L3, с блокировкой)
+  Пункт 3 — «красные пометки»+FIX:    red_mark() + FIX_HINTS
+  Пункт 1 — экстернализация вето:     compute_verdict() выносит суждение из
+                                      ЗАПИСАННЫХ сигналов, а не из уверенности
+                                      агента; хук completion-gate применяет вето.
+
+Вендор-нейтральность (best-effort invariant): контракт — это JSON-леджер в репо
+(.claude/completion/) + текст в CLAUDE.md. Хуки лишь ТРАНСПОРТИРУЮТ контракт.
+Если леджера нет — verdict деградирует в «unknown», а не в ложное «all green».
+
+Никаких сторонних зависимостей: только stdlib. Любая ошибка проглатывается
+вызывающим хуком (exit 0), чтобы никогда не ронять сессию.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Пути артефактов. .claude/ гарантированно per-project и gitignored (как
+# .claude/traces у execution-trace), поэтому леджер не засоряет репозиторий.
+# ---------------------------------------------------------------------------
+
+DIR_NAME = "completion"
+SIGNALS_FILE = "signals.jsonl"
+VERDICT_FILE = "completion.json"
+SESSION_WINDOW_SEC = 6 * 3600  # если session_id недоступен — окно свежести сигналов
+MAX_LEDGER_LINES = 2000          # верхняя граница строк леджера сигналов
+LEDGER_SOFT_BYTES = 512 * 1024    # прунинг срабатывает только когда файл перерос этот размер
+                                  # (амортизированный O(1) на append: полный rewrite раз в ~MAX строк)
+
+
+ERRORS_FILE = "errors.log"
+ERRORS_SOFT_BYTES = 64 * 1024     # bound the error log the same way as the ledger
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# v1.75.0 (ACID-audit fixes #1–#3) — durable-write primitives
+# ---------------------------------------------------------------------------
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """tmp + fsync + os.replace: a reader never sees a truncated file (fix #1).
+
+    os.replace is atomic on POSIX and on NTFS. The tmp file lives in the SAME
+    directory so the replace never crosses a filesystem boundary.
+    v1.76.0: fsync before the replace — without it the rename can outlive the
+    DATA on a kernel/power crash (ext4/NTFS journal metadata, not content),
+    leaving an empty-but-present file. The orphan tmp is removed on ANY
+    failure, including the write itself (v1.75.0 cleaned up only on a failed
+    replace). Directory fsync is POSIX-only best-effort.
+    """
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        raise
+    try:  # durable rename on POSIX: fsync the containing directory
+        dfd = os.open(str(path.parent), getattr(os, "O_DIRECTORY", os.O_RDONLY))
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except Exception:
+        pass  # Windows has no dir-fsync; the file fsync above is the guarantee
+
+
+def log_persist_error(cwd: Path, where: str, exc: BaseException) -> None:
+    """Persistence failures must be OBSERVABLE, not swallowed (audit fix #3).
+
+    The whole recovery strategy is human-in-loop; an invisible persist failure
+    is the one class the human can never fix. Appends one line to
+    .claude/completion/errors.log, bounded (keeps the tail on overflow).
+    Itself best-effort: never raises.
+    """
+    try:
+        p = completion_dir(cwd) / ERRORS_FILE
+        line = f"{now_iso()} {where}: {type(exc).__name__}: {exc}\n"
+        with p.open("a", encoding="utf-8") as f:
+            f.write(line)
+        if p.stat().st_size > ERRORS_SOFT_BYTES:
+            tail = p.read_text(encoding="utf-8", errors="replace")[-ERRORS_SOFT_BYTES // 2:]
+            atomic_write_text(p, tail)
+    except Exception:
+        pass
+
+
+def _lock_file(fileobj) -> bool:
+    """Advisory exclusive lock (audit fix #2). Best-effort, cross-platform:
+    fcntl on POSIX, msvcrt on Windows; True if the lock was taken.
+
+    v1.76.0: the Windows path is NON-blocking with bounded retries (~2s).
+    msvcrt.locking(LK_LOCK) blocks in 1s probes for up to 10s — longer than
+    the 5s hook timeout in settings.json, so under contention the harness
+    would kill the hook mid-write. LK_NBLCK keeps the worst case under the
+    timeout; on giving up the caller proceeds unlocked and LOGS the
+    degradation (observable isolation loss, not a silent one).
+    v1.80.0: the POSIX path is symmetric — LOCK_EX|LOCK_NB with the same
+    bounded retries; a blocking flock had the same kill-the-hook exposure
+    under extreme contention (re-audit finding, RUNBOOK candidate closed).
+    """
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if fcntl is not None:
+        for _ in range(20):  # 20 × 0.1s = максимум ~2s под hook-timeout 5s
+            try:
+                fcntl.flock(fileobj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except (BlockingIOError, InterruptedError):
+                time.sleep(0.1)
+            except Exception:
+                return False
+        return False
+    try:
+        import msvcrt
+    except Exception:
+        return False
+    for _ in range(20):  # 20 × 0.1s = максимум ~2s под hook-timeout 5s
+        try:
+            fileobj.seek(0)
+            msvcrt.locking(fileobj.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            time.sleep(0.1)
+        except Exception:
+            return False
+    return False
+
+
+def _unlock_file(fileobj) -> None:
+    try:
+        import fcntl
+        fcntl.flock(fileobj.fileno(), fcntl.LOCK_UN)
+        return
+    except ImportError:
+        pass
+    except Exception:
+        return
+    try:
+        import msvcrt
+        fileobj.seek(0)
+        msvcrt.locking(fileobj.fileno(), msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+
+
+def completion_dir(cwd: Path) -> Path:
+    d = Path(cwd) / ".claude" / DIR_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def signals_path(cwd: Path) -> Path:
+    return completion_dir(cwd) / SIGNALS_FILE
+
+
+def verdict_path(cwd: Path) -> Path:
+    return completion_dir(cwd) / VERDICT_FILE
+
+
+# ---------------------------------------------------------------------------
+# Пункт 4 — сбор runtime-сигналов
+# ---------------------------------------------------------------------------
+
+# Раннеры тестов -> layer 2 (доказательство поведения во время выполнения).
+# v1.68.0: itd_init_validate — init-валидатор (bootstrap+test в изолированном
+# клоне) считается L2-сигналом: его exit 0 — реальный прогон тестов в чистом
+# окружении, а не self-asserted галочка (init-audit round 2, C1).
+TEST_RE = re.compile(
+    r"(^|\s|;|&&|\|\|)("
+    r"npm\s+(run\s+)?test|npm\s+t\b|pnpm\s+(run\s+)?test|yarn\s+(run\s+)?test|"
+    r"jest|vitest|mocha|ava|playwright\s+test|cypress\s+run|"
+    r"pytest|py\.test|python\s+-m\s+pytest|unittest|nose2|tox|"
+    r"go\s+test|cargo\s+test|mvn\s+(test|verify)|gradle\s+test|"
+    r"phpunit|rspec|bundle\s+exec\s+rspec|dotnet\s+test|"
+    r"Invoke-Pester|"
+    r"ctest|bats|\S*itd_init_validate(\.py)?)\b",
+    re.I,
+)
+
+# Статика/сборка/типы/линт -> layer 1 (синтаксис и статический анализ).
+STATIC_RE = re.compile(
+    r"(^|\s|;|&&|\|\|)("
+    r"npm\s+run\s+(build|lint|typecheck|type-check|tsc)|next\s+build|"
+    r"tsc\b|eslint|biome\s+(check|lint)|prettier\s+--check|"
+    r"ruff\b|flake8|pylint|mypy|pyright|black\s+--check|"
+    r"cargo\s+(build|check|clippy)|go\s+(build|vet)|gofmt\s+-l|"
+    r"mvn\s+compile|gradle\s+(build|compileJava)|"
+    r"rubocop|phpstan|psalm|dotnet\s+build|Invoke-ScriptAnalyzer)\b",
+    re.I,
+)
+
+# Запуск приложения / проверка готовности / критический путь -> layer 3.
+APP_RE = re.compile(
+    r"(^|\s|;|&&|\|\|)("
+    r"curl\b[^|]*\b(localhost|127\.0\.0\.1|/health|/healthz|/ready|/api/)|"
+    r"wget\b[^|]*\b(localhost|127\.0\.0\.1)|"
+    r"(Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b[^|]*\b(localhost|127\.0\.0\.1|/health)|"
+    r"docker\s+compose\s+up|docker\s+run|"
+    r"npm\s+run\s+(start|dev|serve|e2e)|next\s+start|"
+    r"playwright\s+test|cypress\s+run|"
+    r"httpie|http\s+(GET|POST)|nc\s+-z)\b",
+    re.I,
+)
+
+# Побочные эффекты в durable-состоянии (записи в БД / миграции) -> layer 0 (учёт).
+SIDE_EFFECT_RE = re.compile(
+    r"(^|\s|;|&&|\|\|)("
+    r"prisma\s+(migrate|db\s+push)|psql\b[^|]*-f|alembic\s+upgrade|"
+    r"knex\s+migrate|sequelize\s+db:migrate|"
+    r"rails\s+db:migrate|php\s+artisan\s+migrate|flyway\s+migrate|"
+    r"mongosh|redis-cli)\b",
+    re.I,
+)
+
+# VCS / сдача-репорт — НЕ доказательство. Коммит / пуш / открытие PR — это акт
+# СДАЧИ, а не ПРОВЕРКИ; он никогда не должен выдаваться за прогон теста слоя 2.
+# Прямое исполнение принципа «commit ≠ test»: до этого `git commit … && git log`
+# ловился как test_run/L2 и «зеленил» слой поведения самим фактом коммита.
+VCS_LEAD_RE = re.compile(r"^\s*(git|gh|hg|svn|jj)\s", re.I)
+
+# Очистка временных ресурсов -> layer 0 (учёт «cleanup»).
+CLEANUP_RE = re.compile(
+    r"(^|\s|;|&&|\|\|)(rm\s+-rf?\s+[^|]*\b(tmp|temp|\.cache|node_modules/\.cache|dist|build|coverage)\b|"
+    r"docker\s+compose\s+down|docker\s+rm|git\s+clean)\b",
+    re.I,
+)
+
+# ---------------------------------------------------------------------------
+# v1.88.0 (GP-002, пункт 1 статьи): классы сигналов поверх слоёв.
+# class — ЧТО наблюдаем (lifecycle / verification / data_flow / resource),
+# layer — какому слою завершения это доказательство. Поля аддитивны:
+# verdict-логика (_layer_status/compute_verdict) читает только layer/outcome,
+# классы — телеметрия для читателей леджера (retro, OTel-экспорт).
+# ---------------------------------------------------------------------------
+
+KIND_CLASS = {
+    "static": "verification",
+    "test_run": "verification",
+    "app_start": "lifecycle",
+    "side_effect": "data_flow",
+    "cleanup": "resource",
+    "resource": "resource",
+}
+
+# Фазы жизненного цикла приложения — маркеры в ВЫВОДЕ запуска (не в команде).
+LIFECYCLE_READY_RE = re.compile(
+    r"(listening on|ready in|server (is )?running|started server|"
+    r"Local:\s+https?://|application startup complete|booted in)", re.I)
+LIFECYCLE_SHUTDOWN_RE = re.compile(
+    r"(shutting down|graceful(ly)? shut|server closed|received SIGTERM)", re.I)
+
+# Аномалии ресурсов: OOM/heap/памятный рестарт — «постоянно растущая память»
+# видна в agent-harness именно этими маркерами в выводе (pm2 max_memory_restart —
+# живой инцидент OneOfS: RSS за лимит -> рестарт -> 502).
+RESOURCE_ANOMALY_RE = re.compile(
+    r"(javascript heap out of memory|out of memory|oomkilled|oom-kill|"
+    r"enomem|memoryerror|max_memory_restart|cannot allocate memory)", re.I)
+
+
+def _extract_output(tool_response) -> tuple[str, int | None]:
+    """Достаёт (текст, exit_code|None) из tool_response любого разумного вида."""
+    if tool_response is None:
+        return "", None
+    if isinstance(tool_response, str):
+        return tool_response, None
+    if isinstance(tool_response, dict):
+        parts = []
+        for k in ("stdout", "stderr", "output", "content", "result"):
+            v = tool_response.get(k)
+            if isinstance(v, str) and v:
+                parts.append(v)
+        code = None
+        for k in ("exitCode", "exit_code", "returncode", "code"):
+            v = tool_response.get(k)
+            if isinstance(v, int):
+                code = v
+                break
+        if tool_response.get("interrupted"):
+            # прерванный запуск не может служить доказательством прохождения
+            code = code if code is not None else 1
+        return "\n".join(parts), code
+    return str(tool_response), None
+
+
+# Явные признаки провала в тексте вывода (порядок важнее «passed»).
+FAIL_TEXT_RE = re.compile(
+    r"("
+    r"\b[1-9]\d*\s+fail(ing|ed|ures?)?\b|"        # "3 failed", "1 failing"
+    r"tests?:\s*.*?\b[1-9]\d*\s+failed|"          # jest "Tests: 2 failed"
+    r"=+\s*[1-9]\d*\s+failed|"                    # pytest "=== 2 failed"
+    r"assertionerror|traceback \(most recent|"
+    r"npm\s+err!|error\s+ts\d+|"
+    r"\bexit\s+(code\s+)?[1-9]\b|"
+    r"\bmodule_not_found|cannot find module|"
+    r"econnrefused|relation\s+\S+\s+does not exist|"
+    r"segmentation fault|panic:|build failed|compilation failed)",
+    re.I,
+)
+
+# Явные признаки успеха. ТОЛЬКО сильные сигналы (test-summary / build-summary /
+# TAP): ложный `pass` = опасная false-зелёнка (гейт зелёный на сломанном), тогда
+# как ложный `unknown` безопасно деградирует в advisory. Поэтому слабые фразы
+# («clean», «no errors», голое «ok») из pass-детекции УБРАНЫ — они встречаются в
+# произвольном выводе (HTTP 200-логи, прогресс сборки) и давали FP на L2/L3.
+# Реальный успех почти всегда несёт exit-код или эхо EXIT=0 (см. outcome_from),
+# которые авторитетнее текста; сюда доходит лишь текст-only фоллбэк.
+# Голые маркеры FAILED/FAIL — ТОЛЬКО в верхнем регистре (pytest "FAILED
+# test_x", наш "FAIL  check"). Внутри FAIL_TEXT_RE они стояли под re.I и
+# матчили строчное "failed" в сводках — включая "0 failed" (замеренный долг
+# A2: суммарная строка успеха классифицировалась провалом).
+FAIL_TOKEN_RE = re.compile(r"\bFAILED\b|\bFAIL\b")
+
+PASS_TEXT_RE = re.compile(
+    r"("
+    r"\ball\s+tests?\s+pass|"
+    r"\b0\s+fail(ing|ed|ures?)?\b|"
+    r"tests?:\s*.*?\b\d+\s+passed(?!.*\bfailed)|"
+    r"=+\s*\d+\s+passed(?!.*failed)|"
+    r"\b\d+\s+passing\b|"
+    r"compiled successfully|build succeeded|build passed)",
+    re.I,
+)
+
+
+# Проба наличия модуля/пакета в окружении: `<python> -c "import X"` (payload —
+# ровно один голый import, без вызовов и `;`). Такая команда спрашивает «есть ли
+# X?», её падение — ожидаемый ответ, не провал слоя (retro 2026-07-11 P5).
+ENV_PROBE_RE = re.compile(
+    r"""-c\s+(["'])\s*import\s+[A-Za-z_][\w.]*(?:\s+as\s+\w+)?\s*\1""")
+
+# Эхнутый exit-код команды. Раннеры часто маскируют реальный $? пайпом через
+# head/tail, а хостовый tool_response не всегда несёт структурный exit-код.
+# Проектная конвенция — дописывать echo "EXIT: $?" / TSC_EXIT=$? / "exit: N".
+# Матчит "EXIT: 0", "TSC_EXIT=0", "exit: 0" (последний в выводе — авторитетный).
+_EXIT_ECHO_RE = re.compile(r"\b(?:[A-Z][A-Z0-9_]*_)?EXIT\s*[:=]\s*(\d+)\b", re.I)
+
+
+def outcome_from(text: str, exit_code: int | None) -> str:
+    """pass | fail | unknown — из exit-кода, эхнутого EXIT=N, затем текста."""
+    if exit_code is not None:
+        return "pass" if exit_code == 0 else "fail"
+    if not text:
+        return "unknown"
+    # Эхнутый код команды (последний в выводе) авторитетнее эвристики по тексту:
+    # без него «tsc … ; echo EXIT: 0» молча оставался unknown и слой L1 никогда
+    # не становился pass.
+    m = None
+    for mm in _EXIT_ECHO_RE.finditer(text):
+        m = mm
+    if m is not None:
+        return "pass" if m.group(1) == "0" else "fail"
+    if FAIL_TEXT_RE.search(text) or FAIL_TOKEN_RE.search(text):
+        return "fail"
+    if PASS_TEXT_RE.search(text):
+        return "pass"
+    return "unknown"
+
+
+# Проектный L2-эквивалент (для проектов без юнит-тестов). Каждый проект может
+# объявить свои команды-доказательства поведения в .claude/completion/config.json:
+#   {"l2_evidence_patterns": ["compare-registers", "repost-runner\\.ts"]}
+# Так путь для OneOfS (compare-registers / репост как слой 2) остаётся вне
+# глобальной библиотеки — контракт вендор-нейтрален и настраивается per-project.
+_L2_CACHE: dict = {}
+
+
+def _project_l2_patterns(cwd: Path | None):
+    if cwd is None:
+        return []
+    key = str(cwd)
+    if key in _L2_CACHE:
+        return _L2_CACHE[key]
+    pats = []
+    try:
+        cfg = Path(cwd) / ".claude" / DIR_NAME / "config.json"
+        if cfg.exists():
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            for p in data.get("l2_evidence_patterns", []) or []:
+                try:
+                    pats.append(re.compile(p, re.I))
+                except Exception:
+                    continue
+    except Exception:
+        pats = []
+    _L2_CACHE[key] = pats
+    return pats
+
+
+# Обёртки шелла: wsl.exe -e sh -c '…', wsl bash -lc "…", sh/bash -c '…'.
+# Классифицировать надо ВНУТРЕННЮЮ команду, иначе `wsl … 'git commit …'`
+# обходит VCS_LEAD_RE (проверяет начало строки) и коммит становится test_run
+# (live-FP сет-4, GO-002). Разворачиваем до нескольких уровней вложенности.
+_WRAP_RE = re.compile(
+    r"""^\s*
+        (?:wsl(?:\.exe)?\s+(?:-e\s+)?)?          # опц. wsl.exe -e
+        (?:sh|bash|dash|zsh)\s+                  # шелл
+        (?:-[a-z]+\s+)*                          # опц. флаги перед -c
+        -[a-z]*c\s+                              # флаг с 'c' (-c / -lc / -xc)
+        (['"])(?P<inner>.*)\1\s*$
+    """, re.X | re.S)
+
+# Пути ТЕСТ-КОРПУСА МЕТОДОЛОГИИ: их вывод содержит НАМЕРЕННЫЕ маркеры (OOM в
+# eval-set, «FAILED» в фикстуре) — это данные проверки, не runtime-сигнал
+# (live-FP сет-4). Сужено (ревью v1.89.0): матчим ТОЛЬКО специфичные корпус-пути
+# методологии, а не generic-сегменты `fixtures/`/`testdata/` — иначе глушили бы
+# реальные чужие сьюты (`pytest tests/fixtures/…`, `jest src/__fixtures__/…`).
+SUPPRESS_PATH_RE = re.compile(
+    r"(^|[\s/\\'\"])"
+    r"(benchmarks[/\\]review-evalset|review-evalset"
+    r"|benchmarks[/\\]fixtures|\.itd[/\\]benchmarks)"
+    r"([/\\]|$|['\"\s])",
+    re.I,
+)
+
+
+def unwrap_shell(command: str, depth: int = 3) -> str:
+    """Снять обёртки `wsl … sh -c '<inner>'` -> <inner> (до depth уровней)."""
+    cur = command
+    for _ in range(depth):
+        m = _WRAP_RE.match(cur)
+        if not m:
+            break
+        inner = m.group("inner")
+        if not inner or inner == cur:
+            break
+        cur = inner.strip()
+    return cur
+
+
+def _current_unit(cwd: Path | None) -> str:
+    """currentUnitId активной цели (.itd-memory/GOAL.json) — для атрибуции
+    сигнала к юниту (GO-002). Пусто, если цели нет / не active."""
+    if cwd is None:
+        return ""
+    try:
+        gp = Path(cwd) / ".itd-memory" / "GOAL.json"
+        if not gp.is_file():
+            return ""
+        g = json.loads(gp.read_text(encoding="utf-8"))
+        if g.get("status") != "active":
+            return ""
+        return str(g.get("currentUnitId") or "")
+    except Exception:
+        return ""
+
+
+# Display/write-инструменты: команда, чей КАЖДЫЙ сегмент пайпа начинается с
+# такого токена, только показывает или переписывает текст — она не исполняет
+# проверку, и её вывод/аргументы не могут быть runtime-доказательством. Долг
+# LPD-002 A2 (замерен на R1/R2/R5/R6): heredoc `cat >> HANDOFF.md` с текстом
+# про тесты и `grep … tests/run-all.sh` классифицировались как test_run по
+# проектному L2-паттерну и вешали вечный FAILED на совершенно чужие команды.
+# `diff`/`comm` здесь НЕТ намеренно (находка чекера r6): их exit-код — и есть
+# результат сравнения, это verification-инструменты. `stat`/`ls`/`which`/
+# `file`/`type` остаются: это метаданные/пробы существования — тот же класс,
+# что ENV_PROBE_RE («проба окружения — не сигнал слоя»).
+DISPLAY_TOKENS = frozenset({
+    # sed/awk НАМЕРЕННО исключены (env-r5): это интерпретаторы скриптов,
+    # их exec-диалекты (s///e, голый e, system(), print|"cmd", getline,
+    # не-GNU варианты) неперечислимы — display-гарантию дать нельзя.
+    "cat", "echo", "printf", "grep", "rg", "egrep", "fgrep",
+    "head", "tail", "cut", "tr", "wc", "ls", "sort", "uniq", "column",
+    "stat", "less", "more", "file", "which", "type",
+})
+_TRAILING_REDIRECT_RE = re.compile(r"\s*(2>&1|[12]?>>?\s*\S+)\s*$")
+
+
+class _UncertainShellParse(Exception):
+    """Разбор вышел за поддерживаемое подмножество shell (envelope, PUB-серия):
+    вызывающий обязан считать команду НЕ-display — худший случай ложный
+    красный (снимается чистым перезапуском), никогда не ложное зелёное."""
+
+
+def _split_top(command: str, statements: bool) -> list[str]:
+    """Quote-aware разрез верхнего уровня.
+
+    statements=False: только одиночный `|` (пайп; `||` не рвётся).
+    statements=True: границы стейтментов — `&&`, `||`, `;`, перевод строки
+    (находка чекера r4: `echo x && pytest …` считался одним display-сегментом
+    и настоящий прогон глотался).
+    """
+    segments: list[str] = []
+    cur: list[str] = []
+    quote = ""
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            if statements and quote == '"' and (
+                ch == "`" or (ch == "$" and command[i + 1:i + 2] == "(")
+            ):
+                # Подстановка команды внутри "..." исполняет код (env-r3).
+                raise _UncertainShellParse(command[i:i + 40])
+            cur.append(ch)
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"' and i + 1 < n:
+                cur.append(command[i + 1]); i += 1
+        elif ch == "\\" and i + 1 < n:
+            # Экранирование ВНЕ кавычек: `\'` — литеральный апостроф, не
+            # открытие кавычки (checker envelope-r1: идиома `'...'\''...'`
+            # рассинхронизировала сканер и глотала && pytest).
+            cur.append(command[i:i + 2]); i += 2
+            continue
+        elif statements and (
+            ch == "`" or (ch == "$" and command[i + 1:i + 2] == "(")
+        ):
+            # `...` и $(...) — подстановка команды: внутри исполняется
+            # ПРОИЗВОЛЬНЫЙ код, display-подавление не имеет права гадать
+            # (env-r3: RESULT=$(pytest ...) глотал настоящий прогон).
+            raise _UncertainShellParse(command[i:i + 40])
+        elif statements and ch == "$" and command[i + 1:i + 2] in ("'", '"'):
+            # $'...' (ANSI-C) и $"..." (locale) — вне поддерживаемого
+            # подмножества: их escape-семантика другая, не гадаем.
+            raise _UncertainShellParse(command[i:i + 40])
+        elif ch in ("'", '"'):
+            quote = ch; cur.append(ch)
+        elif ch == "|":
+            double = i + 1 < n and command[i + 1] == "|"
+            if statements:
+                if double:
+                    segments.append("".join(cur)); cur = []; i += 1
+                else:
+                    cur.append(ch)
+            else:
+                if double:
+                    cur.append("||"); i += 1
+                else:
+                    segments.append("".join(cur)); cur = []
+        elif statements and ch == "&" and i + 1 < n and command[i + 1] == "&":
+            segments.append("".join(cur)); cur = []; i += 1
+        elif statements and ch == "&" and not (
+            command[i - 1:i] in (">", "<") or command[i + 1:i + 2] == ">"
+        ):
+            # Одиночный `&` — фоновый запуск: команда слева уходит в фон, а
+            # справа исполняется на переднем плане (находка PUB8B:
+            # `cat f & pytest` целиком считался display и глотал прогон).
+            # Асинхронность вне подмножества — объявляем разбор неуверенным.
+            # Дублирование дескриптора (`2>&1`, `>&2`, `<&3`) и `&>file` —
+            # редиректы, а не оператор: они остаются частью сегмента.
+            raise _UncertainShellParse(command[max(0, i - 20):i + 20])
+        elif statements and ch in (";", "\n"):
+            segments.append("".join(cur)); cur = []
+        elif statements and ch in "<>" and command[i + 1:i + 2] == "(":
+            # Подстановка процесса <(...) / >(...) исполняет код (env-r4).
+            raise _UncertainShellParse(command[i:i + 40])
+        elif (statements and ch == "<" and i + 1 < n and command[i + 1] == "<"
+              and command[i + 2:i + 3] == "<"):
+            # Here-string `<<<слово` — операнд, не heredoc (hd-r2): тела нет,
+            # разрез стейтментов продолжается как обычно.
+            cur.append("<<<")
+            i += 3
+            continue
+        elif statements and ch == "<" and i + 1 < n and command[i + 1] == "<":
+            # Heredoc'и: тела — данные, не стейтменты, но каждый heredoc
+            # КОНЕЧЕН (находки PUB2/hd-r1): собираем ВСЕ делимитеры текущей
+            # строки (`cmd <<A <<B` читает тела последовательно), терминатор
+            # plain `<<` — строка РОВНО delim (без отступов), `<<-` допускает
+            # ведущие табы; нетерминированный heredoc поглощает остаток.
+            nl = command.find("\n", i)
+            line_rest = command[i:nl if nl != -1 else n]
+            # Формы слова-делимитера (находка PUB6): голое слово, `\EOF`
+            # (экранированный первый символ), `'END MARK'` / "END MARK"
+            # (кавычки допускают пробелы). Делимитер — слово после снятия
+            # кавычек/экранирования.
+            delims = [(m.group(1) == "-",
+                       m.group(2) or m.group(3) or m.group(4) or m.group(5))
+                      for m in re.finditer(
+                          r"<<(-?)\s*(?:\\(\S+)|'([^']+)'|\"([^\"]+)\""
+                          r"|([^\s'\"<>|&;()]+))",
+                          line_rest)]
+            # Хвост строки открытия heredoc с операторами стейтментов
+            # (`cat <<EOF && pytest`) — bash исполнит команду ПОСЛЕ heredoc;
+            # разрез этого не моделирует — вне envelope (checker env-r2).
+            q2 = ""
+            k = 0
+            while k < len(line_rest):
+                c2 = line_rest[k]
+                if q2:
+                    if c2 == q2:
+                        q2 = ""
+                    elif c2 == "\\" and q2 == '"':
+                        k += 1
+                elif c2 == "\\":
+                    k += 1
+                elif c2 in "'\"":
+                    q2 = c2
+                elif c2 in "&;|":
+                    raise _UncertainShellParse(line_rest[:40])
+                k += 1
+            if not delims or nl == -1:
+                # `<<` есть, а делимитер не распознан или тела нет — граница
+                # envelope: не гадаем, объявляем разбор неуверенным.
+                raise _UncertainShellParse(command[i:i + 40])
+            cur.append(line_rest)
+            j = nl
+            unterminated = False
+            for dash, delim in delims:
+                terminated = False
+                while True:
+                    line_end = command.find("\n", j + 1)
+                    line = command[j + 1:line_end if line_end != -1 else n]
+                    matched = (line.lstrip("\t") == delim) if dash else (line == delim)
+                    cur.append(command[j:line_end if line_end != -1 else n])
+                    if line_end == -1:
+                        j = n
+                        terminated = matched  # терминатор последней строкой без \n
+                        break
+                    j = line_end
+                    if matched:
+                        terminated = True
+                        break
+                if j >= n:
+                    unterminated = not terminated
+                    break
+            i = j
+            if unterminated:
+                # Терминатор так и не встретился — вне envelope.
+                raise _UncertainShellParse(command[i:i + 40])
+            if i >= n:
+                i = n
+                break
+            continue
+        else:
+            cur.append(ch)
+        i += 1
+    if statements and quote:
+        # Кавычка не закрыта — разбор неуверенный (envelope).
+        raise _UncertainShellParse("unterminated quote")
+    segments.append("".join(cur))
+    return segments
+
+
+def _split_pipeline(command: str) -> list[str]:
+    return _split_top(command, statements=False)
+
+
+def _shell_words(segment: str) -> list[str]:
+    # Quote-aware разбиение на слова (находка PUB5: whitespace-split ломался
+    # на `NOTE="a b" cat` — «b"» становился головой сегмента).
+    words: list[str] = []
+    cur: list[str] = []
+    quote = ""
+    i, n = 0, len(segment)
+    while i < n:
+        ch = segment[i]
+        if ch == "\\" and quote != "'" and i + 1 < n:
+            cur.append(segment[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+            cur.append(ch)
+        elif ch.isspace():
+            if cur:
+                words.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    if cur:
+        words.append("".join(cur))
+    return words
+
+
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _segment_head_token(segment: str) -> str:
+    skip_operand = False
+    for tok in _shell_words(segment.strip()):
+        if skip_operand:
+            skip_operand = False
+            continue  # операнд опции обёртки (`env -u CI`, `time -f '%E'`)
+        if _ASSIGNMENT_RE.match(tok):
+            continue  # префиксные VAR=val (значение может быть в кавычках)
+        if tok in {"env", "command", "nohup", "time"}:
+            continue
+        if tok.startswith("-"):
+            # Опция обёртки (`env -i`, `time -p`) — не голова команды
+            # (находка PUB6); опции с отдельным аргументом тянут за собой
+            # операнд (находка PUB7): env -u/-C/-S, time -f/-o.
+            if tok in {"-u", "-C", "-S", "-f", "-o"}:
+                skip_operand = True
+            continue
+        return tok.rsplit("/", 1)[-1].lower()
+    return ""
+
+
+def _display_segment(segment: str) -> bool:
+    head = _segment_head_token(segment)
+    if head not in DISPLAY_TOKENS:
+        return False
+    # Длинные опции display-инструментов — неперечислимая поверхность
+    # argv-исполнителей (env-r6: sort --compress-program=PROG, rg --pre CMD;
+    # не-GNU варианты не перечислить). Любой токен `--...` (кроме голого
+    # `--`, завершающего разбор опций) снимает display-гарантию.
+    for w in _shell_words(segment.strip()):
+        if w.startswith("--") and w != "--":
+            return False
+    return True
+
+
+def display_only_command(command: str) -> bool:
+    """True, когда КАЖДЫЙ стейтмент (&&, ||, ;, новая строка) и каждый
+    сегмент его пайпа — display/write-инструмент."""
+    segments: list[str] = []
+    try:
+        statements = _split_top(command, statements=True)
+    except _UncertainShellParse:
+        return False  # envelope: неуверенный разбор никогда не display
+    for statement in statements:
+        segments.extend(_split_pipeline(statement))
+    checked = []
+    for seg in segments:
+        if _segment_head_token(seg):
+            checked.append(seg)
+        elif _shell_words(seg.strip()):
+            return False  # слова есть, голова не распознана — не гадаем (env-r3)
+    return bool(checked) and all(_display_segment(seg) for seg in checked)
+
+
+def normalize_command_key(command: str) -> str:
+    """Идентичность команды для «latest-на-команду».
+
+    Display-хвосты пайпа (`| tail -2`, `| grep FAIL`) и хвостовые редиректы
+    не меняют того, ЧТО исполнялось, — без нормализации зелёный повтор
+    `cmd | tail` не вытеснял красный `cmd | grep` (долг A2: красный жил вечно,
+    каждый коммит шёл через COMPLETION_BYPASS).
+    """
+    segments = _split_pipeline(command)
+    while len(segments) > 1 and _display_segment(segments[-1]):
+        segments.pop()
+    key = "|".join(segments).strip()
+    while True:
+        m = _TRAILING_REDIRECT_RE.search(key)
+        if not m:
+            break
+        prefix = key[:m.start()]
+        # Редирект отрезается только ВНЕ кавычек: '>' внутри аргумента
+        # (pytest -k "x>5") — часть команды, а не редирект (находка чекера r1;
+        # r3: чётность считается СКАНЕРОМ с escape-обработкой — наивный
+        # счётчик считал \" и сливал разные команды в один ключ).
+        if _inside_quotes(prefix):
+            break
+        key = key[:m.start()]
+    return key.strip().rstrip(";").strip()
+
+
+def _inside_quotes(prefix: str) -> bool:
+    """True, если конец prefix находится внутри открытой кавычки (escape-aware)."""
+    quote = ""
+    i, n = 0, len(prefix)
+    while i < n:
+        ch = prefix[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        i += 1
+    return bool(quote)
+
+
+def _git_head(cwd: Path | None) -> str:
+    """Текущий HEAD (короткий) — сигнал привязывается к дереву, на котором
+    получен: красный от ЧУЖОГО HEAD — стейл-улика, а не вечное вето (A2)."""
+    if cwd is None:
+        return ""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(cwd),
+            capture_output=True, text=True, timeout=4)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# COMPLETION-FALSE-RED-1: объявленный ожидаемый код выхода чек-команды.
+# `scripts/itd_stop_rule.py --check-binding` выходит 2, когда привязка не
+# выровнена или активного юнита нет, - это ответ проверки, а не провал теста.
+# Форма намеренно одна и литеральная (решение владельца после стоп-правила
+# REDESIGN_OR_DISCARD: разбор произвольного shell ломался на каждом раунде):
+#   <литерал чек-команды>; echo "EXIT: $?"[; ...]
+# и сам скрипт доказывает, что исполнился: ровно одна строка `BINDING <STATE>`
+# в выводе стоит до единственной строки `EXIT: N`, и хук сам пересчитывает
+# ответ (тот же код и та же строка BINDING); остаток без строки `EXIT`
+# обязан сам дать явный pass (иначе молча упавший хвост стал бы unknown), а
+# хвост - не больше одного стейтмента: префикс никогда не делает вердикт
+# зеленее, чем тот же хвост, запущенный отдельно.
+# Любая другая форма судится как до фикса.
+# ---------------------------------------------------------------------------
+
+DECLARED_CHECKS = {
+    "sh skills/_shared/itd_py.sh scripts/itd_stop_rule.py --check-binding": (
+        "scripts/itd_stop_rule.py", frozenset({2}), re.compile(r"^BINDING\s+[A-Z_]+$")),
+}
+_EXIT_ECHO_LITERAL = 'echo "EXIT: $?"'
+_EXIT_LINE_RE = re.compile(r"^EXIT: (\d+)$")
+
+
+def strip_expected_exit(command: str, text: str, cwd: Path | None = None):
+    """(текст, [{"script", "code"}]): строка `EXIT: N` объявленной чек-команды
+    вырезается до вычисления исхода, только в литеральной форме (см. выше);
+    иначе текст возвращается без изменений."""
+    if not text or cwd is None:
+        return text, []
+    if "\n" in command or not any(
+            command == lit + "; " + _EXIT_ECHO_LITERAL
+            or command.startswith(lit + "; " + _EXIT_ECHO_LITERAL + "; ")
+            for lit in DECLARED_CHECKS):
+        return text, []  # литерал побайтно, включая разделители (Sol p2)
+    try:
+        statements = [s.strip() for s in _split_top(command, statements=True) if s.strip()]
+    except _UncertainShellParse:
+        return text, []
+    if len(statements) > 3:
+        return text, []  # хвост - один стейтмент (`&&`/`||` тоже делят): исход = хвост отдельно (Sol p1)
+    entry = DECLARED_CHECKS.get(statements[0])
+    if not entry or sum(1 for st in statements if "$?" in st) != 1:
+        return text, []
+    script, codes, marker = entry
+    lines = text.split("\n")
+    exits = [i for i, line in enumerate(lines) if _EXIT_ECHO_RE.search(line)]
+    if len(exits) != 1:
+        return text, []
+    match = _EXIT_LINE_RE.match(lines[exits[0]].strip())
+    if not match or int(match.group(1)) not in codes:
+        return text, []
+    marks = [i for i, line in enumerate(lines) if marker.match(line.strip())]
+    if len(marks) != 1 or marks[0] > exits[0]:
+        return text, []  # нет доказательства, что ответил сам скрипт
+    binding = lines[marks[0]].strip()
+    del lines[exits[0]]
+    stripped = "\n".join(lines)
+    if outcome_from(stripped, None) != "pass":
+        return text, []  # хвост без явного зелёного - код остаётся (находка /review n1)
+    code = int(match.group(1))
+    if _recompute_check(Path(cwd) / script, Path(cwd)) != (code, binding):
+        return text, []  # ответ не подтверждён пересчётом (Sol n5: шим вместо скрипта)
+    return stripped, [{"script": script, "code": code}]
+
+
+def _recompute_check(script: Path, root: Path):
+    """(код, строка BINDING) настоящего ответа чек-команды: хук сам запускает
+    скрипт своим интерпретатором (не через PATH оболочки) в корне проекта.
+    Шим вместо скрипта может разве что повторить правдивый ответ. Любой сбой
+    пересчёта - None (снятия нет)."""
+    import sys
+    try:
+        proc = subprocess.run([sys.executable, str(script), "--check-binding"], cwd=str(root),
+                              capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    marks = [line.strip() for line in (proc.stdout or "").splitlines()
+             if line.startswith("BINDING")]
+    return (proc.returncode, marks[0]) if len(marks) == 1 else None
+
+
+# ---------------------------------------------------------------------------
+# COMPLETION-SUPERSEDE-1: запись прогона раннером вместо разбора текста команды.
+# `ITD_RUN_RECORD=1 sh skills/_shared/itd_py.sh <script>` пишет запись
+# {id, script, args, cwd, rc, isolated, python, lines} и строку `ITD-RUN <id>`
+# в stderr. Запись привязывается к сигналу, только если ВЕСЬ вывод, который хук
+# наблюдал сам, принадлежит этому прогону, и расходуется первым таким вызовом.
+# Красный с записью снимается, когда ПОСЛЕДНЯЯ запись того же вызова — зелёный
+# прогон из корня проекта; снятие только убирает красный, pass не создаёт.
+# ---------------------------------------------------------------------------
+RUN_LINE_RE = re.compile(r"^ITD-RUN ([0-9a-f]{32})$")
+# Только литерал `echo "EXIT: $?"`; код выхода - не больше трех цифр (0..255 у шелла):
+# длинная цифровая строка не доходит до int() и не роняет классификацию.
+_RUN_EXIT_ECHO_RE = re.compile(r"^EXIT: ([0-9]{1,3})$")
+
+
+def run_records_dir() -> Path:
+    override = os.environ.get("ITD_RUN_RECORD_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "state" / "itd" / "runs"
+
+
+def _run_fields_ok(run) -> bool:
+    return (isinstance(run, dict)
+            and isinstance(run.get("id"), str) and bool(run["id"])
+            and isinstance(run.get("script"), str) and bool(run["script"])
+            and isinstance(run.get("args"), list)
+            and all(isinstance(a, str) for a in run["args"])
+            and isinstance(run.get("cwd"), str) and bool(run["cwd"])
+            and type(run.get("rc")) is int
+            and type(run.get("isolated")) is bool
+            and isinstance(run.get("python"), str) and bool(run["python"]))
+
+
+def match_run_record(text: str) -> dict | None:
+    """Запись прогона, которому принадлежит весь наблюдённый вывод, или None.
+
+    Fail-closed: ровно одна строка `ITD-RUN <id>`; запись существует и
+    корректна; каждая непустая строка вывода — посимвольно строка самого
+    прогона (не чаще, чем прогон её напечатал) либо одно эхо кода выхода,
+    равное записанному. Порядок строк не важен: stdout и stderr вызова приходят
+    раздельно. Вывод любой другой команды того же вызова (до или после прогона)
+    отвязывает запись. Запись расходуется первым вызовом, показавшим её id, —
+    даже если привязка не состоялась: повтор того же id её уже не найдёт.
+    """
+    # Пустые строки не сравниваются: хост склеивает stdout и stderr вызова через
+    # перевод строки, и пустая строка на стыке ничья. Команда, печатающая только
+    # пустые строки, для гейта равна молчащей (граница в docs/completion-gate.md).
+    lines = [ln for ln in (text or "").splitlines() if ln]
+    ids = [ln.split(" ", 1)[1] for ln in lines if RUN_LINE_RE.match(ln)]
+    shown: dict = {}
+    for run_id in set(ids):
+        path = run_records_dir() / (run_id + ".json")
+        try:
+            raw = path.read_text(encoding="utf-8")
+            path.unlink()
+        except OSError:
+            continue
+        shown[run_id] = raw
+    if len(ids) != 1 or ids[0] not in shown:
+        return None
+    run_id = ids[0]
+    try:
+        rec = json.loads(shown[run_id])
+    except ValueError:
+        return None
+    if not (_run_fields_ok(rec) and rec["id"] == run_id
+            and isinstance(rec.get("lines"), list)
+            and all(isinstance(ln, str) for ln in rec["lines"])):
+        return None
+    budget: dict = {}
+    for ln in rec["lines"]:
+        budget[ln] = budget.get(ln, 0) + 1
+    echoes = 0
+    for ln in lines:
+        if RUN_LINE_RE.match(ln):
+            continue
+        if budget.get(ln, 0) > 0:
+            budget[ln] -= 1
+            continue
+        m = _RUN_EXIT_ECHO_RE.match(ln)
+        if m is None or echoes or int(m.group(1)) != rec["rc"]:
+            return None
+        echoes += 1
+    return {k: rec[k] for k in ("id", "script", "args", "cwd", "rc", "isolated", "python")}
+
+
+def _real(path) -> str:
+    return os.path.normcase(os.path.realpath(str(path)))
+
+
+def _run_key(sig) -> tuple | None:
+    """Идентичность вызова: скрипт, аргументы, режим, интерпретатор, слой."""
+    run = sig.get("run") if isinstance(sig, dict) else None
+    if not _run_fields_ok(run):
+        return None
+    return (run["script"], tuple(run["args"]), run["isolated"], run["python"],
+            sig.get("layer"))
+
+
+def counted_signals(cwd: Path, signals: list) -> list:
+    """Сигналы без красных, которые вытеснила более поздняя зелёная запись."""
+    head = _git_head(cwd)
+    root = _real(cwd)
+    seen: set = set()
+    recorded: dict = {}  # индекс сигнала -> ключ вызова
+    latest: dict = {}    # ключ вызова -> зелёная ли его последняя запись
+    for i, s in enumerate(signals):
+        key = _run_key(s)
+        if key is None or s["run"]["id"] in seen:
+            continue
+        seen.add(s["run"]["id"])
+        recorded[i] = key
+        green = (s.get("outcome") == "pass"
+                 and s["run"]["rc"] == 0
+                 and _real(s["run"]["cwd"]) == root
+                 and bool(head) and s.get("head") == head)
+        latest[key] = green
+    out = []
+    for i, s in enumerate(signals):
+        key = recorded.get(i)
+        if (key is not None and s.get("outcome") == "fail"
+                and s["run"]["rc"] != 0
+                and latest[key]):  # последняя запись зелёная => она позже красного
+            continue
+        out.append(s)
+    return out
+
+
+def classify_bash(command: str, tool_response, cwd: Path | None = None) -> dict | None:
+    """Одна Bash/PowerShell-команда -> один runtime-сигнал (или None).
+
+    v1.88.0: применяется и к PowerShell-tool (раннеры npm/pytest/dotnet — те же
+    строки; PS-специфика: Invoke-Pester -> L2, Invoke-ScriptAnalyzer -> L1,
+    Invoke-WebRequest/irm на localhost -> L3). Эхо `EXIT: $LASTEXITCODE`
+    матчится _EXIT_ECHO_RE после подстановки — конвенция общая для обоих шеллов.
+
+    v1.89.0 (GO-002): снимаем shell-обёртки перед классификацией (wsl/sh -c);
+    подавляем команды над тест-корпусом/фикстурами (их вывод — данные, не
+    сигнал); сигнал несёт `unit` активной цели.
+
+    cwd (опц.) включает проектные L2-паттерны из .claude/completion/config.json —
+    доказательство поведения для проектов без юнит-тестов.
+    """
+    if not command:
+        return None
+    # Развернуть обёртки: классификация идёт по внутренней команде.
+    effective = unwrap_shell(command)
+    # Тест-корпус/фикстуры — их «FAILED»/«out of memory» это данные проверки.
+    if SUPPRESS_PATH_RE.search(effective):
+        return None
+    # VCS/сдача — не runtime-доказательство (см. VCS_LEAD_RE). Коммит и его
+    # многострочное тело часто случайно матчат L2-паттерны; сбрасываем до
+    # классификации, чтобы акт сдачи не считался проверкой.
+    if VCS_LEAD_RE.search(effective):
+        return None
+    # Проба окружения — не сигнал слоя (retro 2026-07-11 P5, live FP):
+    # `python -c "import pytest" || echo NO_PYTEST` проверяет НАЛИЧИЕ модуля,
+    # её ModuleNotFoundError — ожидаемый ответ «нет», а не провал тестов.
+    # Матчится только голый import в -c (import с вызовами/`;` — реальный
+    # смоук, он сигналом остаётся).
+    if ENV_PROBE_RE.search(effective):
+        return None
+    # Display/write-команда не исполняет проверку — её текст и вывод не
+    # являются runtime-сигналом, каким бы паттернам они ни матчились (A2).
+    if display_only_command(effective):
+        return None
+    command = effective  # дальше классифицируем и храним развёрнутую команду
+    text, code = _extract_output(tool_response)
+    # Объявленный ожидаемый код чек-команды - ответ, а не провал (FALSE-RED-1).
+    text, expected_exit = strip_expected_exit(command, text, cwd)
+    outcome = outcome_from(text, code)
+
+    anomaly = RESOURCE_ANOMALY_RE.search(text) if text else None
+
+    if TEST_RE.search(command) or any(rx.search(command) for rx in _project_l2_patterns(cwd)):
+        kind, layer = "test_run", 2
+    elif STATIC_RE.search(command):
+        kind, layer = "static", 1
+    elif APP_RE.search(command):
+        kind, layer = "app_start", 3
+    elif SIDE_EFFECT_RE.search(command):
+        kind, layer = "side_effect", 0
+    elif CLEANUP_RE.search(command):
+        kind, layer = "cleanup", 0
+    elif anomaly:
+        # Команда сама не классифицируется, но вывод несёт ресурсную аномалию
+        # (OOM и т.п.) — фиксируем как resource-сигнал учёта (layer 0).
+        kind, layer = "resource", 0
+    else:
+        return None
+
+    # короткая выжимка доказательства (последняя значимая строка)
+    ev = ""
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if s and not RUN_LINE_RE.match(s):
+            ev = s[:200]
+            break
+
+    sig = {
+        "ts": now_iso(),
+        "kind": kind,
+        "layer": layer,
+        "class": KIND_CLASS.get(kind, "verification"),
+        "command": command[:300],
+        "outcome": outcome,
+        "evidence": ev,
+    }
+    head = _git_head(cwd)
+    if head:
+        sig["head"] = head
+
+    # Фаза жизненного цикла приложения — по маркерам вывода запуска.
+    if kind == "app_start":
+        if LIFECYCLE_SHUTDOWN_RE.search(text or ""):
+            sig["phase"] = "shutdown"
+        elif LIFECYCLE_READY_RE.search(text or ""):
+            sig["phase"] = "ready"
+        else:
+            sig["phase"] = "startup"
+
+    # Ресурсная аномалия — АННОТАЦИЯ, не мутация outcome (ревью v1.88.0):
+    # реальный OOM даёт exit != 0 -> fail и так; зелёный прогон, чей вывод лишь
+    # УПОМИНАЕТ «out of memory», не должен становиться ложно-красным слоем.
+    if anomaly:
+        sig["anomaly"] = "memory"
+    if expected_exit:
+        sig["expected_exit"] = expected_exit
+    # Запись прогона раннером (SUPERSEDE-1): исход сигнала не меняется, запись
+    # лишь даёт идентичность вызова для counted_signals.
+    run = match_run_record(text)
+    if run:
+        sig["run"] = run
+
+    # Полный контекст ошибки (пункт 1 статьи: «не просто сообщение»): команда
+    # уже в сигнале, добавляем хвост вывода (stderr/stdout смешаны в text).
+    if sig["outcome"] == "fail" and text:
+        sig["error_tail"] = "\n".join(text.splitlines()[-8:])[:600]
+
+    return sig
+
+
+# ---------------------------------------------------------------------------
+# v1.89.0 (GO-003): наблюдаемость делегирования — пустой финал субагента и
+# зависший фон. Оба — неразличимые состояния сет-4 («субагент вернул результат
+# ↔ умер молча», «фон завис ↔ долго работает»). Детекторы чистые (без сайд-
+# эффектов), сигнал пишет вызывающий хук через append_signal.
+# ---------------------------------------------------------------------------
+
+def agent_result_signal(subagent_type: str, tool_response) -> dict:
+    """Сигнал по завершению субагента: outcome empty|ok|fail (class delegation,
+    layer 0 — учёт, не слой завершения). Пустой финал = известный дефект."""
+    text, code = _extract_output(tool_response)
+    if code not in (None, 0):
+        outcome = "fail"
+    elif not (text or "").strip():
+        outcome = "empty"
+    else:
+        outcome = "ok"
+    return {
+        "ts": now_iso(),
+        "kind": "agent",
+        "layer": 0,
+        "class": "delegation",
+        "command": f"agent:{subagent_type or '?'}",
+        "outcome": outcome,
+        "evidence": (text or "").strip().splitlines()[0][:200] if (text or "").strip() else "пустой финал субагента",
+    }
+
+
+def find_stalls(trace_rows: list, threshold_s: int = 600) -> list:
+    """Зависшие вызовы: pre-строка без парной post-строки того же tool в
+    threshold_s (по ts трейса). Пост-хок детектор для /session-save и отчётов
+    (сет-4: фоновые wsl висели ~22 мин без сигнала). Возвращает [(tool,gap_s)]."""
+    from datetime import datetime
+
+    def ts(r):
+        v = r.get("ts") or ""
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    rows = [r for r in trace_rows if isinstance(r, dict)]
+    # last_ts — самый поздний ВАЛИДНЫЙ ts (не строго из хвоста: последняя строка
+    # может быть повреждена/дозаписываться; ревью v1.89.0 #5).
+    valid_ts = [ts(r) for r in rows if ts(r)]
+    last_ts = max(valid_ts) if valid_ts else None
+    stalls = []
+    # Ключ (tool, target) — иначе post одного параллельного same-tool вызова
+    # стёр бы открытый pre другого, маскируя реальный stall (ревью v1.89.0 #3).
+    open_pre = {}  # (tool, target) -> (idx, ts)
+    for i, r in enumerate(rows):
+        key = (r.get("tool"), r.get("target", ""))
+        phase = r.get("phase", "pre")
+        t = ts(r)
+        if phase == "pre":
+            open_pre[key] = (i, t)
+        elif phase == "post":
+            open_pre.pop(key, None)
+    for (tool, _target), (i, t) in open_pre.items():
+        if t and last_ts:
+            gap = (last_ts - t).total_seconds()
+            if gap >= threshold_s:
+                stalls.append((tool, int(gap)))
+    return stalls
+
+
+_LOCK_FAIL_LOGGED = False  # once-per-process: не спамить errors.log на каждый append
+
+
+def append_signal(cwd: Path, session_id: str, sig: dict) -> None:
+    sig = dict(sig)
+    sig["session"] = str(session_id or "unknown")
+    # Атрибуция сигнала к юниту активной цели (GO-002): экспортёр цепляет
+    # sub-span к span юнита по этому полю, а не по времени (устраняет orphan).
+    if "unit" not in sig:
+        u = _current_unit(cwd)
+        if u:
+            sig["unit"] = u
+    p = signals_path(cwd)
+    # v1.75.0 (audit fix #2): append+trim are serialized through a DEDICATED
+    # lock file. Locking the ledger itself would not survive the trim — the
+    # atomic os.replace swaps the inode, and a concurrent writer holding the
+    # old fd would append into the unlinked file (lost lines — exactly the
+    # cross-session race the audit flagged). The lock file is never replaced.
+    # Best-effort: if locking is unavailable, proceed unlocked as before —
+    # but v1.76.0: the degradation is LOGGED (once per process), не молчит.
+    global _LOCK_FAIL_LOGGED
+    lock_f = None
+    try:
+        lock_f = (completion_dir(cwd) / (SIGNALS_FILE + ".lock")).open("a+", encoding="utf-8")
+        if not _lock_file(lock_f) and not _LOCK_FAIL_LOGGED:
+            _LOCK_FAIL_LOGGED = True
+            log_persist_error(cwd, "append_signal.lock", RuntimeError(
+                "advisory lock unavailable — append/trim proceeding unlocked"))
+    except Exception:
+        lock_f = None
+    try:
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(sig, ensure_ascii=False) + "\n")
+        # Amortized bound: keep the ledger from growing without limit. The size
+        # gate keeps this O(1) per append — a full read+rewrite fires only once
+        # the file crosses the soft cap (~every MAX_LEDGER_LINES appends), so
+        # read_signals / the gate never parse an unbounded file. The rewrite is
+        # atomic (audit fix #1): a crash mid-trim can no longer truncate the
+        # ledger, and a failed trim is logged, not swallowed (audit fix #3).
+        try:
+            if p.stat().st_size > LEDGER_SOFT_BYTES:
+                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+                if len(lines) > MAX_LEDGER_LINES:
+                    atomic_write_text(p, "\n".join(lines[-MAX_LEDGER_LINES:]) + "\n")
+        except Exception as exc:
+            log_persist_error(cwd, "append_signal.trim", exc)
+    finally:
+        if lock_f is not None:
+            try:
+                _unlock_file(lock_f)
+                lock_f.close()
+            except Exception:
+                pass
+
+
+def read_signals(cwd: Path, session_id: str | None) -> list:
+    """Сигналы текущей сессии (или свежие в пределах SESSION_WINDOW_SEC)."""
+    p = signals_path(cwd)
+    if not p.exists():
+        return []
+    sid = str(session_id) if session_id else None
+    cutoff = time.time() - SESSION_WINDOW_SEC
+    out = []
+    try:
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if sid is not None and rec.get("session") == sid:
+                out.append(rec)
+            elif sid is None:
+                ts = rec.get("ts", "")
+                try:
+                    when = datetime.fromisoformat(ts).timestamp()
+                except Exception:
+                    when = 0
+                if when >= cutoff:
+                    out.append(rec)
+    except Exception:
+        return out
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Пункт 3 — «красные пометки» с инструкцией по исправлению
+# ---------------------------------------------------------------------------
+
+# (regex по тексту сбоя) -> конкретная инструкция «как чинить».
+FIX_HINTS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"econnrefused|connection refused", re.I),
+     "сервис/БД не подняты — запусти зависимость (docker compose up / dev-сервер) перед прогоном"),
+    (re.compile(r"relation\s+\S+\s+does not exist|no such table", re.I),
+     "нет таблицы — примени миграцию (prisma migrate / alembic upgrade) на тестовую БД"),
+    (re.compile(r"cannot find module|module_not_found|modulenotfound", re.I),
+     "не установлена зависимость — выполни npm install / pip install и повтори"),
+    (re.compile(r"\berror\s+ts\d+", re.I),
+     "ошибка типов TypeScript — проверь сигнатуры/импорты, затем tsc заново"),
+    # v1.86.0 — классы из реального инцидент-корпуса (retro 2026-07-11 +
+    # прод-инциденты OneOfS). Специфичные паттерны стоят ДО generic-хвоста
+    # (5xx/timeout): fix_for берёт первый матч, и «P1001 … timed out» должен
+    # получить подсказку про БД, а не про таймаут.
+    (re.compile(r"unicodeencodeerror|charmap.*codec|cp1251", re.I),
+     "консоль не UTF-8 (Windows cp1251) — выставь PYTHONIOENCODING=utf-8; "
+     "python запускай только через skills/_shared/itd_py.sh"),
+    (re.compile(r"can.?t reach database server|\bP1001\b", re.I),
+     "БД недоступна для клиента — проверь DATABASE_URL и что Postgres/туннель подняты"),
+    (re.compile(r"unique constraint|duplicate key value", re.I),
+     "нарушение уникальности — дубль данных: очисти прошлый прогон или сделай "
+     "запись идемпотентной (upsert / ON CONFLICT)"),
+    (re.compile(r"foreign key constraint|\bP2003\b", re.I),
+     "FK-нарушение — ссылка на несуществующую запись: проверь резолв id и порядок вставки"),
+    (re.compile(r"column .{1,80} does not exist|\b42703\b", re.I),
+     "SQL ссылается на несуществующую колонку — сверь имя с реальной схемой "
+     "(information_schema), а не с предположением"),
+    (re.compile(r"could not determine data type|\b42P08\b", re.I),
+     "NULL-параметр без типа — добавь explicit cast $N::type в биндинг параметров"),
+    (re.compile(r"heap out of memory|allocation failed", re.I),
+     "процессу не хватило памяти — уменьши батч или подними лимит "
+     "(NODE_OPTIONS=--max-old-space-size / pm2 max_memory_restart)"),
+    (re.compile(r"econnreset|epipe|socket hang up", re.I),
+     "соединение оборвано на середине — обычно таймаут прокси/сервера по пути: "
+     "ретрай и проверь таймауты, прежде чем менять код"),
+    (re.compile(r"\b413\b|payload too large|request entity too large", re.I),
+     "тело запроса больше лимита — дроби на части или подними client_max_body_size "
+     "у ближайшего прокси"),
+    (re.compile(r"\b5\d\d\b|internal server error", re.I),
+     "5xx от сервиса — проверь переменные окружения и конфиг сервиса (env, шаблоны, ключи)"),
+    (re.compile(r"\b401\b|\b403\b|unauthorized|forbidden", re.I),
+     "отказ авторизации — проверь токен/сессию/ключ доступа в конфиге теста"),
+    (re.compile(r"timeout|timed out", re.I),
+     "таймаут — увеличь ожидание готовности или дождись readiness-пробы перед проверкой"),
+    (re.compile(r"assertionerror|expected .* (received|to be|but got)", re.I),
+     "тест-ассерт не сошёлся — сверь ожидаемое/фактическое, поправь код или ожидание"),
+    (re.compile(r"eaddrinuse|address already in use", re.I),
+     "порт занят — освободи порт или укажи другой перед запуском приложения"),
+    (re.compile(r"permission denied|eacces", re.I),
+     "нет прав — проверь права на файл/каталог или запуск от нужного пользователя"),
+]
+
+
+def fix_for(text: str) -> str:
+    for rx, hint in FIX_HINTS:
+        if rx.search(text or ""):
+            return hint
+    return "прочитай последнюю строку вывода, определи корневую причину и устрани её, затем перезапусти проверку"
+
+
+def red_mark(what: str, why: str, fix: str, path: str | None = None) -> str:
+    """Формат «красной пометки учителя»: не просто крест, а как чинить."""
+    tail = f" | FILE: {path}" if path else ""
+    return f"FAILED: {what} | WHY: {why} | FIX: {fix}{tail}"
+
+
+# ---------------------------------------------------------------------------
+# Пункт 2 — трёхслойная валидация (L1 -> L2 -> L3, с блокировкой перехода)
+# ---------------------------------------------------------------------------
+
+def repo_has_tests(cwd: Path) -> bool:
+    """Есть ли в репо тест-файлы (git ls-files, быстро, с таймаутом)."""
+    try:
+        res = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(cwd), capture_output=True, text=True, timeout=4,
+        )
+        if res.returncode != 0:
+            return False
+        rx = re.compile(
+            r"(^|/)(tests?|spec|__tests__)/|\.(test|spec)\.[jt]sx?$|"
+            r"(^|/)test_[^/]+\.py$|[^/]+_test\.(py|go)$|_spec\.rb$",
+            re.I,
+        )
+        for line in res.stdout.splitlines():
+            if rx.search(line):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _layer_status(signals: list, layer: int,
+                  current_head: str = "") -> tuple[str, str]:
+    """(status, evidence) для слоя: pass | fail | unknown.
+
+    Латест-на-команду: для каждой уникальной команды берём её ПОСЛЕДНИЙ прогон
+    (сигналы дописываются по порядку). Так «фикс → повторный зелёный прогон той
+    же команды» вытесняет прежний красный, но другой всё ещё падающий сьют
+    сохраняет fail. Затем: любой fail среди latest -> fail; иначе pass если есть
+    хоть один pass; иначе unknown.
+    """
+    rows = [s for s in signals if s.get("layer") == layer]
+    if not rows:
+        return "unknown", ""
+    if current_head:
+        # Сигнал, привязанный к ЧУЖОМУ HEAD, — стейл ЦЕЛИКОМ: дерева, на
+        # котором он получен, больше нет — ни красный не блокирует, ни
+        # зелёный не доказывает (находка чекера r5: асимметричный фильтр
+        # давал false-green из стейл-pass). Сигнал БЕЗ head консервативен:
+        # красный блокирует, зелёный засчитывается (legacy-семантика).
+        # Фильтр стоит ДО выбора latest-на-команду (находка PUB8B): иначе
+        # чужой стейл-прогон вытеснял действующий красный своей команды и
+        # слой становился unknown вместо fail.
+        rows = [s for s in rows
+                if not s.get("head") or s.get("head") == current_head]
+    if not rows:
+        return "unknown", ""
+    latest: dict = {}
+    for s in rows:
+        # Идентичность — нормализованная команда: display-хвост пайпа не делает
+        # повтор «другой командой», иначе красный не вытесняется никогда (A2).
+        latest[normalize_command_key(s.get("command", ""))] = s
+    vals = list(latest.values())
+    fails = [s for s in vals if s.get("outcome") == "fail"]
+    if fails:
+        last = fails[-1]
+        return "fail", f'{last.get("command","")} -> {last.get("evidence","")}'
+    passes = [s for s in vals if s.get("outcome") == "pass"]
+    if passes:
+        return "pass", passes[-1].get("evidence", "")
+    # только unknown-исходы — исполнялось, но результат неоднозначен
+    return "unknown", vals[-1].get("evidence", "")
+
+
+def compute_verdict(cwd: Path, signals: list) -> dict:
+    """
+    Трёхслойный вердикт с блокировкой перехода. Суждение выносится из
+    ЗАПИСАННЫХ runtime-сигналов (экстернализация, пункт 1), а не из слов агента.
+
+    Возвращает dict:
+      {
+        "ts", "layers": {"1":{status,evidence}, "2":{...}, "3":{...}},
+        "has_tests": bool, "blocked": bool, "reason": str,
+        "degraded": bool  # True => нет данных для суждения (best-effort деградация)
+      }
+    """
+    # Проект, объявивший l2_evidence_patterns (compare-registers/репост в
+    # config.json), ЗАЯВЛЯЕТ об отсутствии юнит-тестов — доказательство даёт
+    # ручная сверка. Инцидентный матч generic-скана (случайный .spec./test-путь)
+    # для него ложный, поэтому источник истины — декларация: real_tests подавляем.
+    declared_l2 = bool(_project_l2_patterns(cwd))
+    real_tests = False if declared_l2 else repo_has_tests(cwd)
+    has_tests = real_tests or declared_l2
+    head = _git_head(cwd)
+    signals = counted_signals(cwd, signals)
+    l1s, l1e = _layer_status(signals, 1, head)
+    l2s, l2e = _layer_status(signals, 2, head)
+    l3s, l3e = _layer_status(signals, 3, head)
+
+    verdict = {
+        "ts": now_iso(),
+        "has_tests": has_tests,
+        "layers": {
+            "1": {"name": "Синтаксис/статика", "status": l1s, "evidence": l1e},
+            "2": {"name": "Runtime-поведение (тесты)", "status": l2s, "evidence": l2e},
+            "3": {"name": "Системное подтверждение (e2e/smoke)", "status": l3s, "evidence": l3e},
+        },
+        "blocked": False,
+        "degraded": False,
+        "reason": "",
+    }
+
+    any_signal = bool(signals)
+
+    # L1: если статика прогонялась и упала — блок (нельзя переходить к L2).
+    if l1s == "fail":
+        verdict["blocked"] = True
+        verdict["reason"] = red_mark(
+            "Слой 1 (статика) не пройден",
+            l1e or "линт/сборка/типы вернули ошибку",
+            fix_for(l1e),
+        )
+        return verdict
+
+    # L2: тесты — основное доказательство завершения.
+    if l2s == "fail":
+        verdict["blocked"] = True
+        verdict["reason"] = red_mark(
+            "Слой 2 (тесты) не пройден",
+            l2e or "прогон тестов завершился провалом",
+            fix_for(l2e),
+        )
+        return verdict
+
+    if has_tests and l2s == "unknown":
+        if real_tests:
+            # реальные юнит-тесты в репо есть, но в этой сессии не прогнаны —
+            # классический признак преждевременной сдачи → жёсткий блок.
+            verdict["blocked"] = True
+            verdict["reason"] = red_mark(
+                "Слой 2 (тесты) не подтверждён",
+                "в репозитории есть тесты, но в этой сессии не зафиксирован их успешный прогон",
+                "прогони тесты (npm test / pytest / go test …) — «код написан» ≠ «работает»",
+            )
+            return verdict
+        # только объявленный L2 (compare-registers/репост) — ручная, привязанная
+        # к конкретному диффу сверка. Знать, нужна ли она ИМЕННО этому диффу,
+        # автоматически нельзя → advisory, а не false-блок каждого коммита
+        # (в т.ч. docs/reports). Реальный провал L2 (l2s=="fail") перехвачен выше.
+        verdict["degraded"] = True
+        verdict["reason"] = (
+            "Слой 2 для этого проекта — ручная сверка (compare-registers/"
+            "репост). Если изменение затрагивает проведение документов — "
+            "прогони сверку регистров с 1С; иначе обход осознанный."
+        )
+        return verdict
+
+    # Нет ни одного runtime-сигнала за сессию — судить не на чем.
+    # Best-effort invariant: деградируем в advisory, НЕ блокируем и НЕ зеленим.
+    if not any_signal:
+        verdict["degraded"] = True
+        verdict["reason"] = (
+            "Нет runtime-сигналов за сессию — завершение не подтверждено "
+            "объективно. Прогони сборку/тесты/smoke, либо это тривиальное "
+            "изменение (тогда обход осознанный)."
+        )
+        return verdict
+
+    # Сигналы есть, ни один слой не в fail, L2 либо pass, либо тестов в репо нет.
+    verdict["reason"] = "Слои пройдены по зафиксированным сигналам."
+    # v1.66.0 (retro-2026-07-08 P2, advisory-only): зелёный L2 доказывает
+    # happy-path, но не негативные ветки — A/B-эксперимент 2026-07-08 дал
+    # правдивое «6/6 готово, тесты зелёные» при непроверенных error-ветках
+    # (branch coverage 87% против 94% у дисциплинированного прогона).
+    # Подсказка, не вето (best-effort invariant): гейт её только показывает.
+    if l2s == "pass":
+        verdict["advisory"] = (
+            "L2 зелёный по прогнанным тестам. Advisory: у затронутых "
+            "поведений есть ПРОГНАННЫЕ негативные сценарии (ошибки/битый "
+            "вход)? Где есть coverage-тулинг — глянь branch coverage."
+        )
+    return verdict
+
+
+def write_verdict(cwd: Path, verdict: dict) -> None:
+    # v1.75.0 (audit fixes #1+#3): atomic replace — the gate can never read a
+    # half-written verdict; a failed persist is logged, not swallowed.
+    try:
+        atomic_write_text(
+            verdict_path(cwd), json.dumps(verdict, ensure_ascii=False, indent=2)
+        )
+    except Exception as exc:
+        log_persist_error(cwd, "write_verdict", exc)

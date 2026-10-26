@@ -1,0 +1,163 @@
+# ADR-011: The target-project default risk tier is `low`; five classes are `high` by construction
+
+- **Status:** accepted (G-001 RISK-TIER-1, goal "proportionality by default", 2026-09-22)
+- **Supersedes:** the `defaultRiskTier: medium` template default introduced with the
+  calibrated completion policy (v1.51.0); does not touch ADR-003/ADR-005 (evidence-first
+  review) or `.itd/STOP_RULE_POLICY.json`.
+
+## Context
+
+The advisor audit of 2026-09-22 (three perspectives: measurements, business-analyst,
+devils-advocate) found that the proportionality machinery already exists -
+`skills/_shared/PROPORTIONALITY_POLICY.json` risk routes, the risk table in
+`docs/VERIFICATION_LOOP.md` (for `low` the independent checker is "forbidden as unnecessary
+cost"), the calibrated mode of `hooks/completion-gate.sh` - but is not applied: the ledgers
+carry 30 high / 21 medium / 5 low units, the project template shipped `defaultRiskTier:
+medium`, and nothing forced `high` where it is non-negotiable. The methodology's own A/B
+(`docs/retros/RETRO-2026-07-08.md`) measured x3.5 wall-clock and x7 tool calls for the
+strict route at an identical verified-completion rate on an ordinary unit. Hooks were
+measured at 1.44% of active wall (devils-advocate, 30 746 tool calls) and are not the
+lever; the route is.
+
+## Decision
+
+1. `docs/templates/itd/COMPLETION_POLICY.json` - what `/adopt` and `/project` install into
+   a target project - carries **`defaultRiskTier: low`**. The methodology repository keeps
+   no `.itd/COMPLETION_POLICY.json` (the oracle asserts its absence); its completion gate runs on the built-in `medium`
+   defaults in `hooks/completion-gate.sh` and `docs/templates/itd/itd_hygiene.py`, which
+   stay `medium` as the fail-closed fallback for any project without a policy file.
+2. `PROPORTIONALITY_POLICY.json` gains a machine-readable **`strictClasses`** object with
+   exactly five classes - `money`, `prod-config`, `db-schema`, `auth`, `secrets` - each
+   with `keywords`, `paths` and `tier: high`. `skills/_shared/itd_risk_classes.py` is the
+   only reader; a missing or malformed block is a fail-closed error.
+3. `skills/task/scripts/itd_unit_log.py activate` (the /task writer of
+   `STATE.currentUnit.riskTier`; `/goal --activate` projects the owner-approved tier from
+   `GOAL.json` and does not run the matcher) matches the unit goal and the Allowed Change Areas of
+   `.itd/SCOPE_LOCK.md` against `strictClasses`; on a hit it prints the class and pattern
+   and records `riskTierMatch{class,match}` in STATE whatever the declared tier; when the
+   declared tier is below `high` it also **forces `riskTier=high`** and records
+   `riskTierForced{declared,class,match}`. `--risk-tier` stays mandatory (unchanged since
+   LPD-002 R4c). An existing but unreadable SCOPE_LOCK fails the activation closed.
+
+## Consequences
+
+- The template default is the FALLBACK tier: `active_risk_tier` reads
+  `STATE.currentUnit.riskTier` first (which `/task` makes mandatory at activation) and
+  the goal unit tier next, and only then `defaultRiskTier`; in `calibrated` mode the
+  completion gate treats `low` and `medium` alike. The flip therefore changes the intent
+  a target project starts from - an unclassified unit is `low`, not `medium` - and the
+  documented default in `/adopt`; the route cost itself is decided by the declared tier
+  and the forced strict classes (checker c5). The expensive reviewer contour is spent
+  where the A/B showed it pays - tails and the five strict classes.
+- The matcher is a lexical floor, not a classifier: a goal that hides its money/auth
+  nature is not detected. The reviewer contour on high units and the human gate on
+  irreversible actions remain the backstop; this ADR lowers the default, not the ceiling.
+- The Allowed Change Areas are read from `.itd/SCOPE_LOCK.md` at activation time and are
+  not bound to the unit: in the `/task` flow the routed skill may rewrite SCOPE_LOCK after
+  activation, so a stale scope can force a tier and a fresh one is not re-matched. The goal
+  text is the primary input; SCOPE_LOCK is a second net, not a contract (checker c3).
+- Accepted false positives (raise review cost, never lower safety): `*.env.*` on the JS
+  expression `process.env.NODE_ENV`, `*production*` on docs such as
+  `production-checklist.md`, `авториз*` on `авторизованном`, `migration` on "route
+  migration", `касс*` on "кассета", `*checkout*` on the git hook name `hooks/post-checkout`,
+  `*/migrate/*` on `skills/migrate/`, `authoriz*` on "user-authorized", `*/signin*` on
+  "signing", `*auth*.ts` on `useAuthorStore.ts`; measured by checker rounds c5-c7 on the 61
+  unit goals recoverable from `events.jsonl` + `GOAL*.json`, 5 would be forced to high
+  (G-001, G-005, HDX-009, HDX-010, RSI-DEBT-1).
+- No CLI escape hatch: to change a class the owner edits the policy file, which the oracle
+  `tests/verify_risk_tier_default.py` pins (shape, exact class set, tier high, wiring,
+  four lethal mutations).
+- `/goal --activate` writes `riskTier` from `GOAL.json` through the same STATE writer but
+  does not run the matcher (goal units carry an owner-approved tier at decomposition);
+  recorded as a follow-up in BACKLOG, not claimed here.
+- Rejected: merging hooks into one process (1.44% of wall; single timeout, single point of
+  failure), a review-round budget (forbidden by `STOP_RULE_POLICY.json`, measured S04b/R6),
+  new lite/strict profiles (duplicate of the existing risk table).
+
+## Amendment 2026-09-26 - TIER-SOURCE-1: tests-only scope
+
+Pilot PILOT-LOW-1 (`docs/retros/RETRO-PILOT-LOW-1.md`, observations 1-2) measured the tier of a
+tests-only unit depending on goal wording: the same module went `low` from its docstring and
+`high` from a detailed description with "payment". Owner decision 2026-09-26 (`.itd/DECISIONS.md`):
+
+- When every non-blank line of the Allowed Change Areas is one list item (`-`, `*`, `+`, `1.` or
+  `1)`, indented by at most 12 spaces or tabs, separated by spaces or tabs) holding exactly one
+  path, optionally in a code
+  span, and optionally ` (new)` or ` (updated)` in any letter case, and the first line of the Current
+  Task opens with the unit being activated, the goal text (keywords and paths) is not a source.
+  A test path is a `tests/`, `test/` or `__tests__/` directory, or a `test_*.py`, `*_test.*`,
+  `*.test.*`, `*.spec.*`, `conftest.py` code file (`api.spec.yaml` is not one), written in
+  ASCII `[A-Za-z0-9_./*?-]` (no `\`) without a `..` segment (a Unicode letter such as the invisible U+3164
+  could make one path read as two). The grammar is a whitelist: the owner chose it on
+  2026-09-26 after the stop rule ended a review series of a blacklist lexer (REDESIGN_OR_DISCARD
+  at round c2). The set-aside goal hit is printed and recorded as
+  `riskTierExempt{class,match,reason}`; the tier is not raised. When a strict path or keyword of
+  the areas forces `high`, the set-aside goal hit is still printed and recorded next to
+  `riskTierForced` (next to `riskTierMatch` when `high` was declared).
+- Strict paths and keywords inside the Allowed Change Areas still force `high`. Any line outside
+  the grammar (prose, a continuation line, two paths, markup, a sub-heading, a fence, a non-test
+  path), no SCOPE_LOCK and a Current Task that does not open with the unit keep the goal as the
+  primary input described above. What the grammar does not admit keeps the floor: the exemption
+  lowers it, so its false negatives only cost review.
+- The unit binding keeps the stale-scope limitation above one-directional: a SCOPE_LOCK left over
+  from the previous unit may still raise a tier, but it cannot lower one, even when it mentions the
+  new unit elsewhere (a title, Forbidden, "follow-up of U-3"). `activate` prints a hint when a
+  tests-only scope does not open its Current Task with the unit.
+- Rejected: a tier by paths only for every unit (a change to payment logic in a file without a
+  money path would go `low`). Oracle: `tests/verify_tier_source.py`.
+
+## Amendment 2026-10-01 - TIER-WORDING-2: path-list scope
+
+BACKLOG P1 2026-09-25 stayed open for a scope with a non-test path: the same change over the same
+files went `low` or `high` by the words of its goal, and the pilot rule "goal = template + first
+docstring line" was a workaround. Owner decision 2026-10-01 (variant A, `.itd/DECISIONS.md`); it
+supersedes two lines of the 2026-09-26 amendment - "a non-test path keeps the goal as the primary
+input" and the rejection of a tier by paths:
+
+- The exemption now holds for a path list: every non-blank line of the Allowed Change Areas is one
+  list item of the 2026-09-26 grammar holding exactly one path that is a test path or one concrete
+  file, and the first line of the Current Task opens with the unit being activated. A concrete
+  file is written in the same ASCII set, has no `*` or `?`, no `..` anywhere in the token, and its
+  last segment has a non-empty stem and an extension of the closed set `_FILE_EXTS` of
+  `skills/_shared/itd_risk_classes.py` (code, documentation, configuration and script extensions).
+- A directory (`src/`, `src/fx`), a glob (`src/*`), an extensionless name (`Dockerfile`; a dotfile
+  without an extension such as `.gitignore` or `.github`) and any other extension are not concrete
+  files: such an item may hold files the matcher never saw, so the scope keeps the goal as a
+  source. A dotfile with an admitted extension (`.eslintrc.json`) is a file. Test directories and
+  test globs stay admitted as on 2026-09-26. Everything else that kept the goal on 2026-09-26
+  still does: prose, two paths, a continuation line, markup, a sub-heading, a fence, no SCOPE_LOCK
+  and a Current Task that does not open with the unit (`activate` prints the hint for a path list
+  too).
+- The exemption (tests-only scopes included) also requires the plain layout of the SCOPE_LOCK
+  (`plain_scope_layout`), in two rules. Containment: every item line that `hooks/wip-gate.sh`
+  reads as allowed scope is a line of the section the strict reader read. The hook opens a
+  section on any stripped line that starts with `## allowed change areas` (any case), closes it
+  only on another `## ` line and knows no fences; `gate_items` mirrors exactly that reader, and
+  the oracle pins the three hook lines it mirrors. So a suffixed heading
+  (`## Allowed Change Areas (continued)`), a `# Notes` after the areas, a scope heading indented
+  by four spaces or placed inside a fence cannot hide an item from the matcher (review r1 and
+  checker c1; the matcher side of BACKLOG P2 2026-09-26). Titles: an ATX heading whose title only
+  starts with a scope title (`### In scope for the backend`) and a setext heading with such a
+  title keep the goal too - no reader opens them, but a person reads them as scope; fences are
+  not tracked for this second rule, so such a line inside a fence only keeps the goal. A section
+  under any other title (`## Notes`, `## Also allowed`, `## 2. Allowed Change Areas`,
+  `## Additional allowed change areas`) is not scope for either reader and does not affect the
+  exemption. The title rule covers the commonest spelling only and is not a guarantee about how
+  a person reads the file (checker c2, accepted): the guarantee is containment for the two
+  machine readers.
+- Strict paths and keywords inside the Allowed Change Areas still force `high`. The set-aside goal
+  hit is printed and recorded as `riskTierExempt` with the reason "Allowed Change Areas are a list
+  of paths" (a tests-only scope keeps its 2026-09-26 reason), next to `riskTierForced` or
+  `riskTierMatch` when the areas hit.
+- Accepted cost: a change to money or auth logic inside a file whose path carries no strict
+  pattern or keyword takes the declared tier even when its goal says "payment"; the admitted
+  extensions include the usual carriers of configuration and credentials (`scripts/release.sh`,
+  `config/app.yaml`, `service-account.json`), so the agent has to declare `high` itself when the
+  change is in a strict class. For such a scope
+  the floor is the list of files, and the list is declared, not measured: `hooks/wip-gate.sh`
+  gives a soft, rate-limited hint on an edit outside the Allowed Change Areas and `/review` checks
+  the diff against the scope; neither blocks. Binding the tier to the real diff at `verified`
+  (variant B) is a separate unit.
+
+Oracle: `tests/verify_tier_wording.py`; `tests/verify_tier_source.py` pins that five former floor
+cases (a mixed scope and four one-file look-alikes) are path lists now.

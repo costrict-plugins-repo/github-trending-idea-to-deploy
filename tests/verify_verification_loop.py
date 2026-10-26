@@ -1,0 +1,1783 @@
+#!/usr/bin/env python3
+"""Behavioural/adversarial oracle for Verification Loop v1."""
+from __future__ import annotations
+
+import base64
+import importlib.util
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "skills" / "_shared" / "itd_verification_loop.py"
+POLICY = ROOT / "skills" / "_shared" / "VERIFICATION_LOOP_POLICY.json"
+FREE_PRODUCER = ROOT / "skills" / "_shared" / "itd_free_reviewer_producer.py"
+CACHE = ROOT / "skills" / "review" / "scripts" / "itd_review_cache.py"
+PASSED = 0
+FAILED = 0
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    global PASSED, FAILED
+    if condition:
+        PASSED += 1
+        print(f"PASS  {name}")
+    else:
+        FAILED += 1
+        print(f"FAIL  {name}: {detail}")
+
+
+def run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd,
+                          text=True, capture_output=True, encoding="utf-8",
+                          errors="replace", env=env, timeout=30)
+
+
+def interpreter_oracle(executable: str | None = None, label: str = "ok") -> str:
+    r"""Oracle command that runs the given interpreter with a no-op.
+
+    WIN-TESTQUOTE-1: the command travels through the loop's native shell
+    transport (``sh -c`` / ``cmd.exe /d /c``) as text. json.dumps() looked like
+    a quoting shortcut but escapes every non-ASCII character of the path
+    (C:\Users\Дмитрий -> \u0414...), and no shell un-escapes that, so the
+    oracle exited 1 on every host whose interpreter lives under a non-ASCII
+    directory. Plain double quotes are what both shells actually read.
+    """
+    return f'{label}="{executable or sys.executable}" -c "pass"'
+
+
+def git(root: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=root, check=True,
+                   text=True, capture_output=True)
+
+
+def fixture() -> Path:
+    # resolve(): on Windows mkdtemp returns the 8.3 short form
+    # (C:\Users\RUNNER~1\...) while the Verification Loop prints and stores
+    # the long one, so containment checks like Path.relative_to reject a path
+    # that is in fact inside the fixture. Resolved once here rather than at
+    # each call site: the same defect appeared twice in this unit, first in the
+    # goal-tools fixture and then here, and only the Windows leg catches it.
+    root = Path(tempfile.mkdtemp(prefix="verification-loop-")).resolve()
+    git(root, "init", "-q")
+    git(root, "config", "user.name", "Verification Loop")
+    git(root, "config", "user.email", "loop@example.test")
+    (root / ".gitignore").write_text(".itd-memory/\n", encoding="utf-8")
+    (root / ".itd").mkdir()
+    (root / ".itd" / "SCOPE_LOCK.md").write_text("# Scope\n", encoding="utf-8")
+    (root / ".itd" / "ACCEPTANCE_CONTRACT.json").write_text(
+        '{"criteria":[{"id":"AC-1","status":"pending"}]}\n', encoding="utf-8")
+    git(root, "commit", "--allow-empty", "-qm", "seed")
+    (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "baseline")
+    (root / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    git(root, "add", "app.py")
+    return root
+
+
+def last_path(proc: subprocess.CompletedProcess[str]) -> Path:
+    return Path(proc.stdout.strip().splitlines()[-1])
+
+
+def artifacts(
+    root: Path, verdict: str = "PASSED", artifact_id: str = "U-loop"
+) -> tuple[Path, Path]:
+    base = root / ".itd-memory" / "verification-loop"
+    prompt = base / "prompts" / f"{artifact_id}.md"
+    report = base / "reports" / f"{artifact_id}.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    # Match the producer's byte-exact cross-platform artifact writer.  Native
+    # Windows text mode would otherwise rewrite LF to CRLF after phase one had
+    # signed the normalized prompt string.
+    prompt.write_bytes(
+        b"Review exact candidate; do not inherit maker reasoning.\n"
+    )
+    report.write_bytes((
+        "# Review\n\n```json\n" + json.dumps({
+            "verdict": verdict, "findings": [], "unverified": []
+        }) + "\n```\n"
+    ).encode("utf-8"))
+    return prompt, report
+
+
+def load_free_producer():
+    spec = importlib.util.spec_from_file_location(
+        "itd_verification_loop_free_fixture", FREE_PRODUCER
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_loop_module():
+    spec = importlib.util.spec_from_file_location(
+        "itd_verification_loop_fixture", SCRIPT
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def mandatory_checker(
+    root: Path, risk: str, mode: str, machine_path: Path,
+    *, expected_head: str = "a" * 40, phase_base: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    free = load_free_producer()
+    phase_identity = (phase_base or "current")[:12]
+    prompt, report = artifacts(
+        root, artifact_id=f"U-loop-route-{phase_identity}"
+    )
+    clean_report = {"verdict": "PASSED", "findings": [], "unverified": []}
+    machine_value = json.loads(machine_path.read_text(encoding="utf-8"))
+    context = machine_value["candidate"]
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--binary", "--full-index",
+         "--no-ext-diff", context["baseCommit"], "--"],
+        cwd=root, check=True, capture_output=True,
+    ).stdout
+    packet = {
+        "version": 1,
+        "kind": "itd-free-review-packet",
+        "target": {
+            "repository": "hihol-labs/verification-loop-fixture",
+            "pullRequest": 7,
+            "expectedHeadSha": expected_head,
+        },
+        "candidate": {
+            "baseCommit": phase_base or context["baseCommit"],
+            "parentCommit": context["baseCommit"],
+            "tree": context["reviewedTree"],
+            "diffSha256": hashlib.sha256(diff).hexdigest(),
+            "diffBytes": len(diff),
+        },
+        "scope": {
+            "sha256": context["scopeContractHash"],
+            "text": "# Verification Loop fixture scope\n",
+        },
+        "acceptance": {
+            "sha256": context["acceptanceContractHash"],
+            "value": {"version": 1, "criteria": ["exact fixture review"]},
+        },
+        "machineEvidence": {
+            "sha256": hashlib.sha256(machine_path.read_bytes()).hexdigest(),
+            "kind": "machine-verification",
+            "outcome": "PASSED",
+        },
+        "reviewRepresentation": {
+            "algorithm": "git-binary-full-index-v1",
+            "reviewDiffSha256": hashlib.sha256(diff).hexdigest(),
+            "reviewDiffBytes": len(diff),
+            "transparentFileCount": 0,
+        },
+        "diff": diff.decode("utf-8"),
+    }
+    prompt_value = free.review_prompt(packet)
+    primary_reviewer = {
+        "provider": "openai-subscription", "model": "gpt-5.6-terra",
+        "session": "checker-session", "transportExecutableSha256": "5" * 64,
+    }
+    reviewers = None
+    attempts = [{"provider": "openai-subscription", "status": "PASSED"}]
+    prompt.write_bytes(prompt_value.encode("utf-8"))
+    private_key = Ed25519PrivateKey.generate()
+    private = private_key.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    public = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    phase_one = free.phase_one_receipt(
+        packet=packet, prompt=prompt_value,
+        report=clean_report,
+        maker={"provider": "openai", "model": "gpt-5.6-sol",
+               "session": "maker-session"},
+        reviewer=primary_reviewer, reviewers=reviewers, attempts=attempts,
+        isolation=free.required_isolation(), key_id="fixture-producer",
+        private_key=private,
+    )
+    evidence = root / ".itd-memory" / "verification-loop"
+    phase_path = evidence / "receipts" / f"phase-one-route-{phase_identity}.json"
+    keyring_path = evidence / "keys" / f"producer-keyring-{phase_identity}.json"
+    phase_path.parent.mkdir(parents=True, exist_ok=True)
+    keyring_path.parent.mkdir(parents=True, exist_ok=True)
+    phase_path.write_text(json.dumps(phase_one), encoding="utf-8")
+    keyring_path.write_text(json.dumps({
+        "fixture-producer": base64.urlsafe_b64encode(public).rstrip(b"=").decode("ascii")
+    }), encoding="utf-8")
+    return run([
+        "checker", "--root", str(root), "--unit-id", "U-loop",
+        "--risk-tier", risk, "--mode", mode,
+        "--report", str(report), "--prompt-file", str(prompt),
+        "--maker-provider", "openai", "--maker-model", "gpt-5.6-sol",
+        "--maker-session", "maker-session",
+        "--checker-provider", "openai-subscription",
+        "--checker-model", "gpt-5.6-terra",
+        "--checker-session", "checker-session",
+        "--phase-one-receipt", str(phase_path),
+        "--producer-keyring", str(keyring_path),
+    ], root)
+
+
+def machine(root: Path, risk: str, command: str | None = None,
+            inputs: list[str] | None = None,
+            candidate_mode: str = "staged"):
+    oracle = command or f'"{sys.executable}" -c "print(123)"'
+    args = ["machine", "--root", str(root), "--unit-id", "U-loop",
+            "--risk-tier", risk, "--candidate-mode", candidate_mode,
+            "--command", "oracle=" + oracle,
+            "--timeout", "10"]
+    for path in inputs or []:
+        args += ["--input", path]
+    return run(args, root)
+
+
+def checker(root: Path, risk: str, mode: str, *, same_session: bool = False,
+            same_model: bool = False, missing_maker: bool = False,
+            report: Path | None = None,
+            candidate_mode: str = "staged"):
+    prompt, default_report = artifacts(root)
+    return run([
+        "checker", "--root", str(root), "--unit-id", "U-loop",
+        "--risk-tier", risk, "--candidate-mode", candidate_mode,
+        "--mode", mode,
+        "--report", str(report or default_report), "--prompt-file", str(prompt),
+        "--maker-provider", "" if missing_maker else "openai",
+        "--maker-model", "" if missing_maker else "gpt-maker",
+        "--maker-session", "" if missing_maker else "maker-session",
+        "--checker-provider", "openai",
+        "--checker-model", "gpt-maker" if same_model else "gpt-checker",
+        "--checker-session", "maker-session" if same_session else "checker-session",
+    ], root)
+
+
+def adjudicate(root: Path, risk: str, machine_path: Path,
+               checker_path: Path | None = None, attempt: int | None = None,
+               candidate_mode: str = "staged"):
+    args = ["adjudicate", "--root", str(root), "--unit-id", "U-loop",
+            "--risk-tier", risk, "--candidate-mode", candidate_mode,
+            "--machine", str(machine_path)]
+    if attempt is not None:
+        args += ["--attempt", str(attempt)]
+    if checker_path:
+        args += ["--checker", str(checker_path)]
+    return run(args, root)
+
+
+quiet = run([], ROOT)
+check("no arguments is a quiet no-op", quiet.returncode == 0 and not quiet.stdout)
+
+loop_module = load_loop_module()
+try:
+    loop_module._phase_one_public_keys([])
+except loop_module.LoopError as exc:
+    keyring_closed = "phase-one producer keyring is malformed" in str(exc)
+except Exception:
+    keyring_closed = False
+else:
+    keyring_closed = False
+check("non-object producer keyring fails closed at helper boundary", keyring_closed)
+
+policy = json.loads(POLICY.read_text(encoding="utf-8"))
+source = SCRIPT.read_text(encoding="utf-8")
+check("checkout probes tolerate native Windows access to WSL UNC worktrees",
+      "CHECKOUT_PROBE_TIMEOUT_SECONDS = 60" in source)
+if os.name == "nt":
+    with tempfile.TemporaryDirectory(prefix="verification-loop-юникод-") as raw:
+        unicode_repo = Path(raw)
+        git(unicode_repo, "init", "-q")
+        cache_spec = importlib.util.spec_from_file_location("route_cache_utf8", CACHE)
+        assert cache_spec and cache_spec.loader
+        cache_module = importlib.util.module_from_spec(cache_spec)
+        cache_spec.loader.exec_module(cache_module)
+        try:
+            decoded_root = cache_module.repository_root(unicode_repo)
+            utf8_root_ok = decoded_root.samefile(unicode_repo)
+        except Exception as exc:
+            utf8_root_ok = False
+            decoded_root = str(exc)
+        check("native Windows cache decodes a Unicode Git root as UTF-8",
+              utf8_root_ok, str(decoded_root))
+check("machine producer selects a hash-bound host-owned shell transport",
+      "GetSystemDirectoryW" in source
+      and "pushd" in source and "{repo}" in source
+      and "keeping shell=False" in source
+      and '[str(shell), "-c", command]' in source
+      and '"shellSha256": shell_digest' in source
+      and 'shutil.which("sh")' not in source
+      and 'os.environ.get("COMSPEC"' not in source)
+check("immutable receipt publication has a Windows UNC-safe no-replace path",
+      "os.rename(tmp, path)" in source and "os.link(tmp, path)" in source)
+check("machine oracle is materialized from the staged tree in isolation",
+      '"clone", "--shared", "--no-checkout"' in source
+      and '"executionMode": "isolated-staged-tree"' in source)
+check("each machine command receives a fresh isolated checkout",
+      "for ident, command in commands:\n            with isolated_candidate(repo, context)" in source)
+check("adjudication bounds and contains dependency JSON before reading",
+      "JSON_INPUT_MAX_BYTES = 4 * 1024 * 1024" in source
+      and "secure_dependency_path(repo, root, args.machine" in source)
+check("all evidence producers use exclusive publication",
+      "write_json_atomic" not in source
+      and source.count("write_json_exclusive(output, receipt)") == 3)
+check("policy makes low machine-only and medium/high checker-backed",
+      policy["riskRoutes"]["low"] == {"checkerMode": "machine_only", "checkerRequired": False}
+      and policy["riskRoutes"]["medium"]["checkerMode"] == "targeted"
+      and policy["riskRoutes"]["high"]["checkerMode"] == "full")
+check("plain-text checker evidence is forbidden",
+      policy["invariants"]["plainTextCheckerEvidenceAccepted"] is False)
+check("policy freezes isolated execution and immutable evidence history",
+      policy["invariants"]["machineExecutionMode"] == "isolated-staged-tree"
+      and policy["invariants"]["machineOutputRetention"] == "hashes-only"
+      and policy["invariants"]["undeclaredIgnoredInputsEnterMachineOracle"] is False
+      and policy["invariants"]["immutableReceiptPublicationRequired"] is True)
+check("threat model does not overclaim same-principal authentication",
+      policy["threatModel"]["trustRoot"] == "honest-host-orchestrator"
+      and "malicious-same-os-principal" in policy["threatModel"]["nonGuarantees"]
+      and policy["invariants"]["samePrincipalByzantineResistanceClaimed"] is False)
+
+# Low risk: harness executes the command and can adjudicate without an LLM tax.
+low = fixture()
+low_machine = machine(low, "low")
+check("low-risk machine oracle executes", low_machine.returncode == 0, low_machine.stderr + low_machine.stdout)
+low_machine_path = last_path(low_machine)
+low_machine_value = json.loads(low_machine_path.read_text(encoding="utf-8"))
+check("machine receipt binds a trusted absolute shell digest",
+      Path(low_machine_value["runs"][0]["shell"]).is_absolute()
+      and len(low_machine_value["runs"][0]["shellSha256"]) == 64
+      and low_machine_value["runs"][0]["shellSha256"]
+      == hashlib.sha256(Path(low_machine_value["runs"][0]["shell"]).read_bytes()).hexdigest())
+impossible_chronology = json.loads(low_machine_path.read_text(encoding="utf-8"))
+impossible_chronology["runs"][0]["startedAt"] = "2026-08-01T16:24:16Z"
+impossible_chronology["runs"][0]["completedAt"] = "2026-08-01T16:24:13Z"
+impossible_chronology.pop("receiptSha256", None)
+impossible_chronology["receiptSha256"] = hashlib.sha256(json.dumps(
+    impossible_chronology, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+impossible_chronology_path = low_machine_path.with_name("impossible-chronology.json")
+impossible_chronology_path.write_text(
+    json.dumps(impossible_chronology), encoding="utf-8")
+impossible_chronology_adjudication = adjudicate(
+    low, "low", impossible_chronology_path)
+check("consumer rejects impossible machine-run chronology",
+      impossible_chronology_adjudication.returncode != 0
+      and "chronology" in impossible_chronology_adjudication.stdout,
+      impossible_chronology_adjudication.stdout)
+missing_chronology = json.loads(low_machine_path.read_text(encoding="utf-8"))
+del missing_chronology["runs"][0]["startedAt"]
+missing_chronology.pop("receiptSha256", None)
+missing_chronology["receiptSha256"] = hashlib.sha256(json.dumps(
+    missing_chronology, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+missing_chronology_path = low_machine_path.with_name("missing-chronology.json")
+missing_chronology_path.write_text(json.dumps(missing_chronology), encoding="utf-8")
+missing_chronology_adjudication = adjudicate(low, "low", missing_chronology_path)
+check("consumer rejects missing machine-run chronology",
+      missing_chronology_adjudication.returncode != 0
+      and "timestamp is invalid" in missing_chronology_adjudication.stdout,
+      missing_chronology_adjudication.stdout)
+invalid_chronology = json.loads(low_machine_path.read_text(encoding="utf-8"))
+invalid_chronology["runs"][0]["completedAt"] = "not-a-timestamp"
+invalid_chronology.pop("receiptSha256", None)
+invalid_chronology["receiptSha256"] = hashlib.sha256(json.dumps(
+    invalid_chronology, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+invalid_chronology_path = low_machine_path.with_name("invalid-chronology.json")
+invalid_chronology_path.write_text(json.dumps(invalid_chronology), encoding="utf-8")
+invalid_chronology_adjudication = adjudicate(low, "low", invalid_chronology_path)
+check("consumer rejects unparseable machine-run chronology",
+      invalid_chronology_adjudication.returncode != 0
+      and "timestamp is invalid" in invalid_chronology_adjudication.stdout,
+      invalid_chronology_adjudication.stdout)
+cross_run_chronology = json.loads(low_machine_path.read_text(encoding="utf-8"))
+earlier_run = dict(cross_run_chronology["runs"][0])
+earlier_run["id"] = "chronology-replay"
+earlier_run["startedAt"] = "2000-01-01T00:00:00Z"
+earlier_run["completedAt"] = "2000-01-01T00:00:01Z"
+cross_run_chronology["runs"].append(earlier_run)
+cross_run_chronology.pop("receiptSha256", None)
+cross_run_chronology["receiptSha256"] = hashlib.sha256(json.dumps(
+    cross_run_chronology, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+cross_run_chronology_path = low_machine_path.with_name("cross-run-chronology.json")
+cross_run_chronology_path.write_text(
+    json.dumps(cross_run_chronology), encoding="utf-8")
+cross_run_chronology_adjudication = adjudicate(
+    low, "low", cross_run_chronology_path)
+check("consumer rejects cross-run non-monotonic chronology",
+      cross_run_chronology_adjudication.returncode != 0
+      and "chronology" in cross_run_chronology_adjudication.stdout,
+      cross_run_chronology_adjudication.stdout)
+post_receipt_chronology = json.loads(low_machine_path.read_text(encoding="utf-8"))
+receipt_created = dt.datetime.fromisoformat(
+    post_receipt_chronology["createdAt"].replace("Z", "+00:00"))
+post_receipt_chronology["runs"][0]["startedAt"] = (
+    receipt_created.isoformat().replace("+00:00", "Z"))
+post_receipt_chronology["runs"][0]["completedAt"] = (
+    (receipt_created + dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z"))
+post_receipt_chronology.pop("receiptSha256", None)
+post_receipt_chronology["receiptSha256"] = hashlib.sha256(json.dumps(
+    post_receipt_chronology, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+post_receipt_chronology_path = low_machine_path.with_name("post-receipt-chronology.json")
+post_receipt_chronology_path.write_text(
+    json.dumps(post_receipt_chronology), encoding="utf-8")
+post_receipt_chronology_adjudication = adjudicate(
+    low, "low", post_receipt_chronology_path)
+check("consumer rejects a run completed after receipt creation",
+      post_receipt_chronology_adjudication.returncode != 0
+      and "chronology" in post_receipt_chronology_adjudication.stdout,
+      post_receipt_chronology_adjudication.stdout)
+fake_shell_dir = Path(tempfile.mkdtemp(prefix="forged-verification-shell-"))
+fake_shell = fake_shell_dir / ("cmd.exe" if os.name == "nt" else "sh")
+fake_shell.write_text("@exit /b 0\n" if os.name == "nt" else "#!/bin/sh\nexit 0\n",
+                      encoding="utf-8")
+fake_shell.chmod(0o755)
+old_path = os.environ.get("PATH", "")
+old_comspec = os.environ.get("COMSPEC")
+try:
+    os.environ["PATH"] = str(fake_shell_dir) + os.pathsep + old_path
+    os.environ["COMSPEC"] = str(fake_shell)
+    forged_shell = machine(low, "low", "exit /b 9" if os.name == "nt" else "exit 9")
+finally:
+    os.environ["PATH"] = old_path
+    if old_comspec is None:
+        os.environ.pop("COMSPEC", None)
+    else:
+        os.environ["COMSPEC"] = old_comspec
+forged_shell_value = json.loads(last_path(forged_shell).read_text(encoding="utf-8"))
+check("inherited PATH and COMSPEC cannot substitute the verification shell",
+      forged_shell.returncode != 0
+      and forged_shell_value["runs"][0]["exitCode"] == 9
+      and Path(forged_shell_value["runs"][0]["shell"]).resolve() != fake_shell.resolve())
+secret_output = machine(
+    low, "low",
+    f'"{sys.executable}" -c "print(bytes([83,69,78,83,73,84,73,86,69,45,79,82,65,67,76,69,45,79,85,84,80,85,84]).decode())"',
+)
+secret_receipt = last_path(secret_output).read_text(encoding="utf-8")
+check("machine receipt retains output hashes without raw sensitive tails",
+      secret_output.returncode == 0
+      and "SENSITIVE-ORACLE-OUTPUT" not in secret_receipt
+      and "stdoutSha256" in secret_receipt
+      and "stdoutTail" not in secret_receipt
+      and "stderrTail" not in secret_receipt,
+      secret_receipt)
+unsafe_receipt = json.loads(secret_receipt)
+unsafe_receipt["runs"][0]["stdoutTail"] = "SENSITIVE-ORACLE-OUTPUT"
+unsafe_receipt.pop("receiptSha256", None)
+unsafe_receipt["receiptSha256"] = hashlib.sha256(json.dumps(
+    unsafe_receipt, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+unsafe_path = last_path(secret_output).with_name("unsafe-machine-tail.json")
+unsafe_path.write_text(json.dumps(unsafe_receipt), encoding="utf-8")
+unsafe_adjudication = adjudicate(low, "low", unsafe_path)
+check("consumer rejects a digest-valid receipt containing raw output tails",
+      unsafe_adjudication.returncode != 0
+      and "non-schema fields" in unsafe_adjudication.stdout,
+      unsafe_adjudication.stdout)
+alternate_tail_receipt = json.loads(secret_receipt)
+alternate_tail_receipt["runs"][0]["outputTail"] = "SENSITIVE-ALTERNATE-FIELD"
+alternate_tail_receipt.pop("receiptSha256", None)
+alternate_tail_receipt["receiptSha256"] = hashlib.sha256(json.dumps(
+    alternate_tail_receipt, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+alternate_tail_path = last_path(secret_output).with_name("unsafe-alternate-tail.json")
+alternate_tail_path.write_text(json.dumps(alternate_tail_receipt), encoding="utf-8")
+alternate_tail_adjudication = adjudicate(low, "low", alternate_tail_path)
+check("closed machine-run schema rejects alternate raw output fields",
+      alternate_tail_adjudication.returncode != 0
+      and "non-schema fields" in alternate_tail_adjudication.stdout,
+      alternate_tail_adjudication.stdout)
+oversized_path = low_machine_path.with_name("oversized-machine.json")
+oversized_path.write_bytes(b" " * (4 * 1024 * 1024 + 1))
+oversized_adjudication = adjudicate(low, "low", oversized_path)
+check("oversized dependency JSON is rejected before parsing",
+      oversized_adjudication.returncode != 0
+      and "exceeds the 4194304-byte limit" in oversized_adjudication.stdout,
+      oversized_adjudication.stdout)
+low_machine_bytes = low_machine_path.read_bytes()
+low_machine_repeat = machine(low, "low")
+low_machine_repeat_path = last_path(low_machine_repeat)
+check("repeated machine producers append immutable receipts",
+      low_machine_repeat.returncode == 0
+      and low_machine_repeat_path != low_machine_path
+      and low_machine_path.read_bytes() == low_machine_bytes,
+      low_machine_repeat.stdout)
+low_adj = adjudicate(low, "low", low_machine_path)
+check("low-risk machine-only adjudication passes", low_adj.returncode == 0, low_adj.stdout)
+low_adj_path = last_path(low_adj)
+low_check = run(["check", "--root", str(low), "--unit-id", "U-loop",
+                 "--risk-tier", "low", "--receipt", str(low_adj_path)], low)
+check("adjudication receipt is reusable on the exact candidate", low_check.returncode == 0)
+wrong_unit = run(["check", "--root", str(low), "--unit-id", "U-other",
+                  "--risk-tier", "low", "--receipt", str(low_adj_path)], low)
+check("receipt cannot cross unit boundaries",
+      wrong_unit.returncode != 0 and "another unit" in wrong_unit.stdout,
+      wrong_unit.stdout)
+wrong_risk = run(["check", "--root", str(low), "--unit-id", "U-loop",
+                  "--risk-tier", "medium", "--receipt", str(low_adj_path)], low)
+check("receipt cannot cross risk routes",
+      wrong_risk.returncode != 0 and "risk tier" in wrong_risk.stdout,
+      wrong_risk.stdout)
+
+# One normal commit may wrap the exact staged candidate without invalidating
+# its independent review. The committed-head context is the same parent/tree/
+# diff tuple, while the default staged context intentionally remains strict.
+bridge = fixture()
+bridge_machine = machine(bridge, "low")
+bridge_machine_path = last_path(bridge_machine)
+bridge_adjudication = adjudicate(bridge, "low", bridge_machine_path)
+bridge_receipt = last_path(bridge_adjudication)
+bridge_candidate = json.loads(
+    bridge_machine_path.read_text(encoding="utf-8"))["candidate"]
+git(bridge, "commit", "-qm", "wrap reviewed candidate")
+strict_after_commit = run([
+    "check", "--root", str(bridge), "--unit-id", "U-loop",
+    "--risk-tier", "low", "--receipt", str(bridge_receipt),
+], bridge)
+check("default staged check does not weaken after commit",
+      strict_after_commit.returncode != 0
+      and "exact current candidate" in strict_after_commit.stdout,
+      strict_after_commit.stdout)
+committed_check = run([
+    "check", "--root", str(bridge), "--unit-id", "U-loop",
+    "--risk-tier", "low", "--candidate-mode", "committed-head",
+    "--receipt", str(bridge_receipt),
+], bridge)
+check("single-parent commit preserves the exact reviewed candidate",
+      committed_check.returncode == 0, committed_check.stdout)
+committed_machine = machine(
+    bridge, "low", candidate_mode="committed-head")
+committed_machine_value = json.loads(
+    last_path(committed_machine).read_text(encoding="utf-8"))
+check("committed-head can refresh evidence for the same candidate",
+      committed_machine.returncode == 0
+      and committed_machine_value["candidate"] == bridge_candidate,
+      committed_machine.stdout)
+git(bridge, "commit", "--allow-empty", "-qm", "unreviewed wrapper")
+wrapped_again = run([
+    "check", "--root", str(bridge), "--unit-id", "U-loop",
+    "--risk-tier", "low", "--candidate-mode", "committed-head",
+    "--receipt", str(bridge_receipt),
+], bridge)
+check("a second commit cannot borrow the earlier candidate review",
+      wrapped_again.returncode != 0
+      and "exact current candidate" in wrapped_again.stdout,
+      wrapped_again.stdout)
+
+# An ignored source overlay must never enter the machine execution checkout.
+ignored_overlay = fixture()
+(ignored_overlay / ".git" / "info" / "exclude").write_text("ignored/\n", encoding="utf-8")
+(ignored_overlay / "ignored").mkdir()
+(ignored_overlay / "ignored" / "proof").write_text("false pass\n", encoding="utf-8")
+ignored_command = (f'"{sys.executable}" -c "from pathlib import Path; '
+                   "raise SystemExit(0 if Path('ignored/proof').exists() else 9)\"")
+ignored_machine = machine(ignored_overlay, "low", ignored_command)
+ignored_receipt = json.loads(last_path(ignored_machine).read_text(encoding="utf-8"))
+check("ignored source overlay cannot create a false machine PASS",
+      ignored_machine.returncode != 0
+      and ignored_receipt["runs"][0]["exitCode"] == 9
+      and ignored_receipt["runs"][0]["executionMode"] == "isolated-staged-tree",
+      ignored_machine.stdout)
+
+# One command must not be able to feed an undeclared overlay to a later
+# command in the same machine receipt.
+cross_command = fixture()
+writer = (f'"{sys.executable}" -c "from pathlib import Path; '
+          "Path('oracle-overlay.tmp').write_text('poison')\"")
+reader = (f'"{sys.executable}" -c "from pathlib import Path; '
+          "raise SystemExit(9 if Path('oracle-overlay.tmp').exists() else 0)\"")
+cross_machine = run([
+    "machine", "--root", str(cross_command), "--unit-id", "U-loop",
+    "--risk-tier", "low", "--command", "writer=" + writer,
+    "--command", "reader=" + reader, "--timeout", "10",
+], cross_command)
+cross_receipt = json.loads(last_path(cross_machine).read_text(encoding="utf-8"))
+check("machine commands cannot share undeclared overlays",
+      cross_machine.returncode == 0
+      and [item["exitCode"] for item in cross_receipt["runs"]] == [0, 0],
+      cross_machine.stdout + cross_machine.stderr)
+
+# A genuinely required non-Git oracle input must be explicit, snapshotted and
+# revalidated instead of reopening the whole ignored workspace.
+declared_root = fixture()
+(declared_root / ".git" / "info" / "exclude").write_text("result.txt\n", encoding="utf-8")
+(declared_root / "result.txt").write_text("pass\n", encoding="utf-8")
+declared_command = (f'"{sys.executable}" -c "from pathlib import Path; '
+                    "raise SystemExit(0 if Path('result.txt').read_text().strip()=='pass' else 8)\"")
+declared_machine = machine(declared_root, "low", declared_command, inputs=["result.txt"])
+declared_path = last_path(declared_machine)
+check("declared ignored input is copied and hash-bound",
+      declared_machine.returncode == 0
+      and json.loads(declared_path.read_text(encoding="utf-8"))["declaredInputs"][0]["path"] == "result.txt",
+      declared_machine.stdout)
+(declared_root / "result.txt").write_text("changed\n", encoding="utf-8")
+declared_stale = adjudicate(declared_root, "low", declared_path)
+check("changed declared input invalidates machine evidence",
+      declared_stale.returncode != 0
+      and "declared machine input is missing or changed" in declared_stale.stdout,
+      declared_stale.stdout)
+
+# The oracle must execute the staged candidate, never an unstaged overlay.
+mismatch = fixture()
+(mismatch / "app.py").write_text("VALUE = 999\n", encoding="utf-8")
+mismatch_machine = machine(mismatch, "low")
+check("unstaged checkout overlay is rejected before command execution",
+      mismatch_machine.returncode != 0
+      and "working tree differs from the staged candidate" in mismatch_machine.stdout,
+      mismatch_machine.stdout)
+
+# Any staged candidate change invalidates the whole evidence chain.
+(low / "app.py").write_text("VALUE = 3\n", encoding="utf-8")
+git(low, "add", "app.py")
+stale = run(["check", "--root", str(low), "--unit-id", "U-loop",
+             "--risk-tier", "low", "--receipt", str(low_adj_path)], low)
+check("candidate change invalidates prior receipts",
+      stale.returncode != 0 and "exact current candidate" in stale.stdout, stale.stdout)
+
+# Medium: a targeted, fresh-session checker is mandatory.
+medium = fixture()
+medium_machine = machine(medium, "medium")
+missing_checker = adjudicate(medium, "medium", last_path(medium_machine))
+check("medium risk without checker stays UNVERIFIED",
+      missing_checker.returncode != 0 and "required checker" in missing_checker.stdout,
+      missing_checker.stdout)
+
+prompt, report = artifacts(medium)
+plain_report = report.with_name("U-loop-plain.md")
+plain_report.write_text("PASSED\n", encoding="utf-8")
+plain = checker(medium, "medium", "targeted", report=plain_report)
+check("plain PASSED string cannot mint checker evidence",
+      plain.returncode != 0 and "no valid verdict" in plain.stdout, plain.stdout)
+
+open_report = report.with_name("U-loop-open-schema.json")
+open_report.write_text(json.dumps({
+    "verdict": "PASSED", "findings": []
+}), encoding="utf-8")
+open_schema = checker(medium, "medium", "targeted", report=open_report)
+check("checker report cannot default a missing unverified field",
+      open_schema.returncode != 0 and "no valid verdict" in open_schema.stdout,
+      open_schema.stdout)
+
+same_session = checker(medium, "medium", "targeted", same_session=True)
+check("checker must use a fresh session",
+      same_session.returncode != 0 and "reused the maker session" in same_session.stdout,
+      same_session.stdout)
+
+medium_checker = checker(medium, "medium", "targeted", same_model=True)
+check("targeted checker may use same model in a fresh context",
+      medium_checker.returncode == 0, medium_checker.stdout)
+medium_checker_path = last_path(medium_checker)
+medium_checker_bytes = medium_checker_path.read_bytes()
+medium_checker_repeat = checker(medium, "medium", "targeted", same_model=True)
+check("repeated checker producers append immutable receipts",
+      medium_checker_repeat.returncode == 0
+      and last_path(medium_checker_repeat) != medium_checker_path
+      and medium_checker_path.read_bytes() == medium_checker_bytes,
+      medium_checker_repeat.stdout)
+medium_adj = adjudicate(medium, "medium", last_path(medium_machine), last_path(medium_checker))
+check("medium targeted evidence adjudicates", medium_adj.returncode == 0, medium_adj.stdout)
+
+# Dirty overlays introduced after machine evidence must block both semantic
+# evidence minting and final adjudication, even though the staged hash is unchanged.
+dirty_checker_root = fixture()
+dirty_checker_machine = machine(dirty_checker_root, "medium")
+(dirty_checker_root / "app.py").write_text("VALUE = 999\n", encoding="utf-8")
+dirty_checker = checker(dirty_checker_root, "medium", "targeted")
+check("checker rejects an unstaged overlay introduced after machine evidence",
+      dirty_checker.returncode != 0
+      and "working tree differs from the staged candidate" in dirty_checker.stdout,
+      dirty_checker.stdout)
+
+dirty_adj_root = fixture()
+dirty_adj_machine = machine(dirty_adj_root, "medium")
+dirty_adj_checker = checker(dirty_adj_root, "medium", "targeted")
+(dirty_adj_root / "app.py").write_text("VALUE = 999\n", encoding="utf-8")
+dirty_adj = adjudicate(dirty_adj_root, "medium", last_path(dirty_adj_machine),
+                       last_path(dirty_adj_checker))
+check("adjudicator rejects an unstaged overlay introduced after checker evidence",
+      dirty_adj.returncode != 0
+      and "working tree differs from the staged candidate" in dirty_adj.stdout,
+      dirty_adj.stdout)
+
+# LPD002-A3: чекер-квитанция с подделанным inspectedTree (чекер «наблюдал»
+# другое дерево, чем кандидат) отвергается на adjudicate — validate-сторона
+# гварда, парная к bind-стороне «working tree differs».
+import json as _a3json
+a3_root = fixture()
+a3_machine = machine(a3_root, "medium")
+a3_checker = checker(a3_root, "medium", "targeted")
+a3_checker_path = last_path(a3_checker)
+a3_doc = _a3json.loads(a3_checker_path.read_text(encoding="utf-8"))
+a3_doc["inspectedTree"] = "f" * 40
+_a3loop = load_loop_module()
+a3_doc.pop("receiptSha256", None)
+a3_doc["receiptSha256"] = _a3loop.sha256_bytes(_a3loop.canonical(a3_doc))
+a3_forged = a3_checker_path.with_name("a3-forged-checker.json")
+a3_forged.write_text(_a3json.dumps(a3_doc), encoding="utf-8")
+a3_adj = adjudicate(a3_root, "medium", last_path(a3_machine), a3_forged)
+check("adjudicator rejects a checker receipt observed on a foreign tree",
+      a3_adj.returncode != 0
+      and "not observed on the exact reviewed tree" in a3_adj.stdout,
+      a3_adj.stdout)
+
+# High/unknown: full checker must differ by model or provider.
+high = fixture()
+high_machine = machine(high, "high")
+same_model_full = checker(high, "high", "full", same_model=True)
+check("full checker rejects same provider/model pair",
+      same_model_full.returncode != 0 and "not model/provider-independent" in same_model_full.stdout,
+      same_model_full.stdout)
+missing_maker_full = checker(high, "high", "full", missing_maker=True)
+check("full checker rejects missing maker provenance",
+      missing_maker_full.returncode != 0 and "identity is incomplete" in missing_maker_full.stdout,
+      missing_maker_full.stdout)
+high_checker = checker(high, "high", "full")
+check("full checker receipt binds different model and session",
+      high_checker.returncode == 0, high_checker.stdout)
+high_checker_path = last_path(high_checker)
+whitespace_checker_receipt = json.loads(high_checker_path.read_text(encoding="utf-8"))
+whitespace_checker_receipt["provenance"]["checker"]["model"] = " gpt-maker "
+whitespace_checker_receipt.pop("receiptSha256", None)
+whitespace_checker_receipt["receiptSha256"] = hashlib.sha256(json.dumps(
+    whitespace_checker_receipt, ensure_ascii=False, sort_keys=True,
+    separators=(",", ":")).encode("utf-8")).hexdigest()
+whitespace_checker_path = high_checker_path.with_name("forged-whitespace-model.json")
+whitespace_checker_path.write_text(json.dumps(whitespace_checker_receipt), encoding="utf-8")
+whitespace_adj = adjudicate(high, "high", last_path(high_machine), whitespace_checker_path)
+check("normalized provenance comparison rejects whitespace independence bypass",
+      whitespace_adj.returncode != 0
+      and "not model/provider-independent" in whitespace_adj.stdout,
+      whitespace_adj.stdout)
+high_adj = adjudicate(high, "high", last_path(high_machine), high_checker_path)
+check("high-risk full evidence adjudicates", high_adj.returncode == 0, high_adj.stdout)
+high_adj_path = last_path(high_adj)
+generic_publication = run([
+    "check", "--root", str(high), "--unit-id", "U-loop",
+    "--risk-tier", "high", "--require-mandatory-route",
+    "--expected-repository", "hihol-labs/verification-loop-fixture",
+    "--receipt", str(high_adj_path),
+], high)
+check("generic checker cannot satisfy mandatory publication review",
+      generic_publication.returncode != 0
+      and "mandatory keyless route evidence is missing" in generic_publication.stdout,
+      generic_publication.stdout)
+
+route_root = fixture()
+route_machine = machine(route_root, "high")
+route_machine_path = last_path(route_machine)
+route_checker = mandatory_checker(
+    route_root, "high", "full", route_machine_path
+)
+check("signed phase-one route can mint a bound checker",
+      route_checker.returncode == 0, route_checker.stdout)
+route_checker_path = last_path(route_checker)
+foreign_phase_base = subprocess.run(
+    ["git", "rev-parse", "HEAD^"], cwd=route_root, check=True,
+    text=True, capture_output=True,
+).stdout.strip()
+foreign_phase = mandatory_checker(
+    route_root, "high", "full", route_machine_path,
+    phase_base=foreign_phase_base,
+)
+check("signed route cannot substitute a foreign base diff",
+      foreign_phase.returncode != 0
+      and "diff binding is foreign" in foreign_phase.stdout,
+      foreign_phase.stdout)
+foreign_machine = machine(route_root, "high")
+foreign_machine_adj = adjudicate(
+    route_root, "high", last_path(foreign_machine), route_checker_path
+)
+check("route-bound checker cannot borrow another machine receipt",
+      foreign_machine_adj.returncode != 0
+      and "binds another machine receipt" in foreign_machine_adj.stdout,
+      foreign_machine_adj.stdout)
+route_adj = adjudicate(
+    route_root, "high", route_machine_path, route_checker_path
+)
+check("route-bound high-risk evidence adjudicates",
+      route_adj.returncode == 0, route_adj.stdout)
+route_checker_receipt = json.loads(route_checker_path.read_text(encoding="utf-8"))
+route_keyring_sha = route_checker_receipt["mandatoryRoute"]["producerKeyring"][
+    "sha256"
+]
+route_publication = run([
+    "check", "--root", str(route_root), "--unit-id", "U-loop",
+    "--risk-tier", "high", "--require-mandatory-route",
+    "--expected-repository", "hihol-labs/verification-loop-fixture",
+    "--expected-producer-keyring-sha256", route_keyring_sha,
+    "--receipt", str(last_path(route_adj)),
+], route_root)
+check("mandatory publication check accepts only route-bound adjudication",
+      route_publication.returncode == 0, route_publication.stdout)
+foreign_keyring_publication = run([
+    "check", "--root", str(route_root), "--unit-id", "U-loop",
+    "--risk-tier", "high", "--require-mandatory-route",
+    "--expected-repository", "hihol-labs/verification-loop-fixture",
+    "--expected-producer-keyring-sha256", "b" * 64,
+    "--receipt", str(last_path(route_adj)),
+], route_root)
+check("candidate-supplied producer keyring needs host authorization",
+      foreign_keyring_publication.returncode != 0
+      and "not authorized by the host registry" in foreign_keyring_publication.stdout,
+      foreign_keyring_publication.stdout)
+foreign_repository_publication = run([
+    "check", "--root", str(route_root), "--unit-id", "U-loop",
+    "--risk-tier", "high", "--require-mandatory-route",
+    "--expected-repository", "foreign-owner/foreign-repository",
+    "--receipt", str(last_path(route_adj)),
+], route_root)
+check("mandatory route cannot cross repository identities",
+      foreign_repository_publication.returncode != 0
+      and "names another repository" in foreign_repository_publication.stdout,
+      foreign_repository_publication.stdout)
+
+# Editing the durable report breaks the dependency chain even if receipt JSON is unchanged.
+_, high_report = artifacts(high)
+high_report.write_text(high_report.read_text(encoding="utf-8") + "tamper\n", encoding="utf-8")
+tampered_report = run(["check", "--root", str(high), "--unit-id", "U-loop",
+                       "--risk-tier", "high", "--receipt", str(high_adj_path)], high)
+check("changed checker report invalidates adjudication",
+      tampered_report.returncode != 0 and "artifact is missing or changed" in tampered_report.stdout,
+      tampered_report.stdout)
+
+# Self-edited receipts and attempt inflation fail closed.
+forged = json.loads(high_adj_path.read_text(encoding="utf-8"))
+forged["outcome"] = "FAILED"
+high_adj_path.write_text(json.dumps(forged), encoding="utf-8")
+forged_check = run(["check", "--root", str(high), "--unit-id", "U-loop",
+                    "--risk-tier", "high", "--receipt", str(high_adj_path)], high)
+check("edited receipt digest is rejected",
+      forged_check.returncode != 0 and "digest is invalid" in forged_check.stdout,
+      forged_check.stdout)
+
+attempt_root = fixture()
+attempt_machine = machine(attempt_root, "low")
+attempt_machine_path = last_path(attempt_machine)
+attempt_one = adjudicate(attempt_root, "low", attempt_machine_path, attempt=1)
+check("first explicit attempt is durably allocated", attempt_one.returncode == 0, attempt_one.stdout)
+replayed_one = adjudicate(attempt_root, "low", attempt_machine_path, attempt=1)
+check("replaying --attempt 1 cannot reset the durable budget",
+      replayed_one.returncode != 0 and "non-monotonic attempt" in replayed_one.stdout,
+      replayed_one.stdout)
+attempt_two = adjudicate(attempt_root, "low", attempt_machine_path)
+attempt_three = adjudicate(attempt_root, "low", attempt_machine_path)
+check("automatic attempt allocation is monotonic",
+      attempt_two.returncode == 0 and attempt_three.returncode == 0,
+      attempt_two.stdout + attempt_three.stdout)
+over_attempt = adjudicate(attempt_root, "low", attempt_machine_path)
+check("repair/adjudication attempts are durably bounded",
+      over_attempt.returncode != 0 and "attempt budget exhausted" in over_attempt.stdout,
+      over_attempt.stdout)
+attempt_one_path = last_path(attempt_one)
+attempt_one_check = run(["check", "--root", str(attempt_root), "--unit-id", "U-loop",
+                         "--risk-tier", "low", "--receipt", str(attempt_one_path)], attempt_root)
+check("earlier immutable attempt remains independently verifiable",
+      attempt_one_check.returncode == 0, attempt_one_check.stdout)
+
+# A host crash can leave a complete linked receipt immediately before its
+# ledger entry and can leave the allocation lock behind. The retry must
+# reconcile that exact transaction, not overwrite or spend another attempt.
+crash_root = fixture()
+crash_machine = machine(crash_root, "low")
+crash_machine_path = last_path(crash_machine)
+before_crash = adjudicate(crash_root, "low", crash_machine_path)
+before_crash_path = last_path(before_crash)
+before_crash_receipt = json.loads(before_crash_path.read_text(encoding="utf-8"))
+crash_entry = crash_root / before_crash_receipt["attemptLedger"]["entryPath"]
+crash_entry.unlink()
+(crash_entry.parent / ".allocate.lock").write_text("99999999\n", encoding="ascii")
+recovered = adjudicate(crash_root, "low", crash_machine_path)
+check("dead lock and complete orphan receipt are crash-recovered",
+      recovered.returncode == 0 and last_path(recovered) == before_crash_path
+      and crash_entry.is_file(), recovered.stdout)
+recovered_check = run(["check", "--root", str(crash_root), "--unit-id", "U-loop",
+                       "--risk-tier", "low", "--receipt", str(before_crash_path)], crash_root)
+check("crash-reconciled receipt remains independently verifiable",
+      recovered_check.returncode == 0, recovered_check.stdout)
+
+failed_root = fixture()
+failed_machine = machine(failed_root, "low", "false")
+check("failing oracle writes FAILED evidence and exits nonzero", failed_machine.returncode != 0)
+failed_adj = adjudicate(failed_root, "low", last_path(failed_machine))
+check("FAILED machine receipt cannot adjudicate PASSED",
+      failed_adj.returncode != 0 and "machine verification failed" in failed_adj.stdout,
+      failed_adj.stdout)
+
+# Policy mutation: the executable consumer rejects a weakened trust model.
+spec = importlib.util.spec_from_file_location("verification_loop_under_test", SCRIPT)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with tempfile.TemporaryDirectory(prefix="declared-input-link-") as td:
+    link_root = Path(td)
+    source_root = link_root / "source"
+    isolated = link_root / "isolated"
+    outside = link_root / "outside"
+    (source_root / "nested").mkdir(parents=True)
+    isolated.mkdir()
+    outside.mkdir()
+    (source_root / "nested" / "proof.txt").write_text("sealed\n", encoding="utf-8")
+    try:
+        (isolated / "nested").symlink_to(outside, target_is_directory=True)
+        link_supported = True
+    except OSError:
+        link_supported = False
+    if link_supported:
+        manifest = module.input_snapshot(
+            source_root / "nested" / "proof.txt", "nested/proof.txt")
+        try:
+            module.copy_declared_inputs(source_root, isolated, [manifest])
+            link_rejected = False
+        except module.LoopError:
+            link_rejected = True
+        check("declared input copy rejects a symlinked checkout ancestor",
+              link_rejected and not (outside / "proof.txt").exists())
+        source_link = link_root / "source-link"
+        sealed_root = link_root / "sealed-source"
+        source_link.mkdir()
+        sealed_root.mkdir()
+        (outside / "proof.txt").write_text("outside\n", encoding="utf-8")
+        (source_link / "nested").symlink_to(outside, target_is_directory=True)
+        sealed_destination = module.secure_destination(
+            sealed_root, "nested/proof.txt")
+        try:
+            module.secure_copy_declared_source(
+                source_link, "nested/proof.txt", sealed_destination)
+            source_link_rejected = False
+        except module.LoopError:
+            source_link_rejected = True
+        check("declared input snapshot rejects a symlinked source ancestor",
+              source_link_rejected and not sealed_destination.exists())
+    else:
+        check("declared input copy has a no-follow ancestor guard on this host",
+              "follow_symlinks=False" in SCRIPT.read_text(encoding="utf-8"))
+with tempfile.TemporaryDirectory(prefix="declared-input-alias-") as td:
+    alias_root = Path(td)
+    canonical_repo = alias_root / "repo"
+    alias_hop = alias_root / "alias-hop"
+    snapshot_root = alias_root / "snapshot"
+    (canonical_repo / "nested").mkdir(parents=True)
+    alias_hop.mkdir()
+    snapshot_root.mkdir()
+    (canonical_repo / "nested" / "proof.txt").write_text(
+        "sealed\n", encoding="utf-8")
+    # A lexical alias with the same canonical target deterministically models
+    # the Windows 8.3/long-name mismatch that triggered the no-dir_fd fallback
+    # failure on GitHub-hosted runners.
+    aliased_repo = alias_hop / ".." / canonical_repo.name
+    destination = module.secure_destination(
+        snapshot_root, "nested/proof.txt")
+    disabled_dir_fd = {
+        function for function in (os.open, os.stat)
+        if function in os.supports_dir_fd
+    }
+    os.supports_dir_fd.difference_update(disabled_dir_fd)
+    try:
+        try:
+            module.secure_copy_declared_source(
+                aliased_repo, "nested/proof.txt", destination)
+            alias_copy_ok = destination.read_text(encoding="utf-8") == "sealed\n"
+        except (module.LoopError, OSError):
+            alias_copy_ok = False
+        check("guarded fallback canonicalizes equivalent repo spellings",
+              alias_copy_ok)
+
+        outside = alias_root / "outside"
+        outside.mkdir()
+        (outside / "escape.txt").write_text("outside\n", encoding="utf-8")
+        try:
+            (canonical_repo / "linked").symlink_to(
+                outside, target_is_directory=True)
+            fallback_link_supported = True
+        except OSError:
+            fallback_link_supported = False
+        if fallback_link_supported:
+            linked_snapshot = alias_root / "linked-snapshot"
+            linked_snapshot.mkdir()
+            linked_destination = module.secure_destination(
+                linked_snapshot, "linked/escape.txt")
+            try:
+                module.secure_copy_declared_source(
+                    aliased_repo, "linked/escape.txt", linked_destination)
+                fallback_link_rejected = False
+            except module.LoopError:
+                fallback_link_rejected = True
+            check("guarded fallback still rejects a linked source ancestor",
+                  fallback_link_rejected and not linked_destination.exists())
+        else:
+            check("guarded fallback retains the reparse-point rejection",
+                  "_is_link_or_reparse(current)" in
+                  SCRIPT.read_text(encoding="utf-8"))
+    finally:
+        os.supports_dir_fd.update(disabled_dir_fd)
+# NTFS does not report a stable st_size for a *directory*: the index moves
+# between resident (in the MFT record) and non-resident storage, so two
+# consecutive scans of an unchanged tree disagree.  Measured 2026-08-10 on a
+# real 1.1 GB node_modules tree: 1964/1964 changed entries, every one of them
+# a directory, every one differing only in st_size (4096|8192|12288|32768 ->
+# 0); the other five identity fields were stable.  Binding directory size in
+# the guarded no-dir_fd fallback therefore made a declared *directory* input
+# impossible on Windows — secure_copy_declared_source compares before/after
+# identities and rejected an input nobody had touched.
+#
+# The flip is invisible on a tree small enough for a test (a small directory
+# index stays resident and its size does not move), so the mechanism is
+# modelled deterministically through Path.lstat rather than left to the real
+# filesystem.
+with tempfile.TemporaryDirectory(prefix="declared-input-dir-size-") as td:
+    size_root = Path(td)
+    size_repo = size_root / "repo"
+    (size_repo / "pkg" / "nested").mkdir(parents=True)
+    (size_repo / "pkg" / "keep.txt").write_text("payload\n", encoding="utf-8")
+    (size_repo / "pkg" / "nested" / "deep.txt").write_text(
+        "deep\n", encoding="utf-8")
+    canonical_size_repo = size_repo.resolve()
+    dir_snapshot_root = size_root / "snapshot-dir"
+    file_snapshot_root = size_root / "snapshot-file"
+    dir_snapshot_root.mkdir()
+    file_snapshot_root.mkdir()
+    dir_destination = module.secure_destination(dir_snapshot_root, "pkg/nested")
+    file_destination = module.secure_destination(
+        file_snapshot_root, "pkg/keep.txt")
+
+    class _ResizedStat:
+        """os.stat_result proxy that overrides st_size and nothing else."""
+
+        def __init__(self, real: os.stat_result, size: int) -> None:
+            self._real = real
+            self.st_size = size
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    real_lstat = Path.lstat
+    # None = report the true size for that kind of entry.
+    reported: dict[str, int | None] = {"directory": 4096, "file": None}
+
+    def resized_lstat(self, *args, **kwargs):
+        info = real_lstat(self, *args, **kwargs)
+        size = reported["directory" if stat.S_ISDIR(info.st_mode) else "file"]
+        return info if size is None else _ResizedStat(info, size)
+
+    real_copytree, real_copy2 = module.shutil.copytree, module.shutil.copy2
+
+    def flip_size_after(inner, kind: str):
+        # The harness copy only *reads* the source, so the filesystem is free
+        # to re-report the size underneath it.  Flipping exactly between the
+        # before and the after pass keeps the test independent of how many
+        # times a single pass happens to stat each path.
+        def wrapper(*args, **kwargs):
+            result = inner(*args, **kwargs)
+            reported[kind] = 0 if kind == "directory" else 9
+            return result
+        return wrapper
+
+    size_disabled_dir_fd = {
+        function for function in (os.open, os.stat)
+        if function in os.supports_dir_fd
+    }
+    os.supports_dir_fd.difference_update(size_disabled_dir_fd)
+    Path.lstat = resized_lstat
+    try:
+        reported["directory"] = 4096
+        before_dir = module._plain_source_identities(
+            size_repo / "pkg", canonical_size_repo, "pkg")
+        reported["directory"] = 0
+        after_dir = module._plain_source_identities(
+            size_repo / "pkg", canonical_size_repo, "pkg")
+        check("directory st_size flip keeps _plain_source_identities stable",
+              before_dir == after_dir,
+              "unstable NTFS directory size leaked into the source identity")
+
+        reported["directory"] = 4096
+        before_ancestors_size = module._plain_ancestor_identities(
+            canonical_size_repo, ("pkg", "nested"), "pkg/nested")
+        reported["directory"] = 0
+        after_ancestors_size = module._plain_ancestor_identities(
+            canonical_size_repo, ("pkg", "nested"), "pkg/nested")
+        check("directory st_size flip keeps _plain_ancestor_identities stable",
+              before_ancestors_size == after_ancestors_size,
+              "unstable NTFS directory size leaked into the ancestor identity")
+
+        # Control: a regular file that really changes size is still a change.
+        reported["directory"], reported["file"] = None, 7
+        before_file = module._plain_source_identities(
+            size_repo / "pkg" / "keep.txt", canonical_size_repo, "pkg/keep.txt")
+        reported["file"] = 9
+        after_file = module._plain_source_identities(
+            size_repo / "pkg" / "keep.txt", canonical_size_repo, "pkg/keep.txt")
+        check("file st_size stays bound in the guarded fallback identity",
+              before_file != after_file,
+              "the fallback stopped noticing a resized regular file")
+
+        reported["directory"], reported["file"] = 4096, None
+        module.shutil.copytree = flip_size_after(real_copytree, "directory")
+        try:
+            module.secure_copy_declared_source(
+                size_repo, "pkg/nested", dir_destination)
+            dir_copy_detail = ""
+            dir_copy_ok = (dir_destination / "deep.txt").read_text(
+                encoding="utf-8") == "deep\n"
+        except module.LoopError as exc:
+            dir_copy_ok, dir_copy_detail = False, str(exc)
+        check("guarded fallback accepts an unchanged declared directory input",
+              dir_copy_ok, dir_copy_detail)
+
+        # Control: the same end-to-end path still rejects a resized file.
+        reported["directory"], reported["file"] = None, 7
+        module.shutil.copy2 = flip_size_after(real_copy2, "file")
+        try:
+            module.secure_copy_declared_source(
+                size_repo, "pkg/keep.txt", file_destination)
+            file_copy_rejected = False
+        except module.LoopError:
+            file_copy_rejected = True
+        check("guarded fallback still rejects a resized declared file input",
+              file_copy_rejected,
+              "a declared file changed under the copy without being noticed")
+    finally:
+        Path.lstat = real_lstat
+        module.shutil.copytree, module.shutil.copy2 = real_copytree, real_copy2
+        os.supports_dir_fd.update(size_disabled_dir_fd)
+with tempfile.TemporaryDirectory(prefix="weak-loop-policy-") as td:
+    weak_path = Path(td) / "policy.json"
+    weak = json.loads(POLICY.read_text(encoding="utf-8"))
+    weak["invariants"]["plainTextCheckerEvidenceAccepted"] = True
+    weak_path.write_text(json.dumps(weak), encoding="utf-8")
+    original = module.POLICY_PATH
+    module.POLICY_PATH = weak_path
+    try:
+        rejected = False
+        try:
+            module.load_policy()
+        except module.LoopError:
+            rejected = True
+        check("weakened policy mutation is rejected", rejected)
+    finally:
+        module.POLICY_PATH = original
+
+# --- checker prompt template (LPD-002 R4d) ---------------------------------
+# Incident E8 (retro 2026-08-18): a fresh checker wrote "PASS" instead of
+# "PASSED", the receipt became UNVERIFIED and the whole review was re-run. The
+# template is the single place that hands the checker the literal verdict
+# block, so it is validated by the SAME parser the loop uses — a template that
+# drifts from ALLOWED_VERDICTS is a red oracle, not a documentation nit.
+TEMPLATE = ROOT / "docs" / "templates" / "CHECKER_PROMPT.md"
+check("checker prompt template exists", TEMPLATE.is_file(), str(TEMPLATE))
+if TEMPLATE.is_file():
+    template_text = TEMPLATE.read_text(encoding="utf-8")
+    parsed = None
+    try:
+        parsed = module.parse_report(template_text)
+    except module.LoopError as exc:
+        parsed = {"error": str(exc)}
+    check("checker prompt template ends with the canonical verdict block",
+          parsed == {"verdict": "PASSED", "findings": [], "unverified": []},
+          repr(parsed))
+    check("checker prompt template names every allowed verdict",
+          all(verdict in template_text for verdict in module.ALLOWED_VERDICTS),
+          repr(sorted(v for v in module.ALLOWED_VERDICTS
+                      if v not in template_text)))
+    # The template deliberately shows the rejected form ("PASS"). It must stay
+    # rejected: if the parser ever accepted it, the counter-example would teach
+    # the exact defect it warns about.
+    rejected_only = template_text.split('That block above is the')[0]
+    refused = False
+    try:
+        module.parse_report(rejected_only)
+    except module.LoopError:
+        refused = True
+    check("checker prompt counter-example stays a rejected verdict", refused)
+
+
+# --- GENG-S04B D2: checker pre-flight reports every violation at once ---
+# Measured incident (GENG-S03 2026-08-22): three wasted checker runs, one
+# UNVERIFIED per run (report path, then prompt path, then provenance).
+pre_root = fixture()
+pre_machine = machine(pre_root, "medium")
+stray_report = pre_root / ".itd-memory" / "verification-loop" / "stray-report.md"
+stray_prompt = pre_root / ".itd-memory" / "verification-loop" / "stray-prompt.md"
+stray_report.parent.mkdir(parents=True, exist_ok=True)
+stray_report.write_text("# stray\n", encoding="utf-8")
+stray_prompt.write_text("stray\n", encoding="utf-8")
+pre_flight = run([
+    "checker", "--root", str(pre_root), "--unit-id", "U-loop",
+    "--risk-tier", "medium", "--mode", "targeted",
+    "--report", str(stray_report), "--prompt-file", str(stray_prompt),
+    "--maker-provider", "openai", "--maker-model", "gpt-maker",
+    "--maker-session", "maker-session",
+    "--checker-provider", "openai", "--checker-model", "gpt-checker",
+    "--checker-session", "checker-session",
+], pre_root)
+check("checker pre-flight names every violation in one run (D2)",
+      pre_flight.returncode != 0
+      and "checker report escapes" in pre_flight.stdout
+      and "checker prompt escapes" in pre_flight.stdout,
+      pre_flight.stdout + pre_flight.stderr)
+
+# Reviewer finding PUB1 (medium): a bad artifact path must not hide route
+# violations — they belong to the same run, not the next one.
+route_gap_root = fixture()
+route_gap_machine = machine(route_gap_root, "medium")
+gap_evidence = route_gap_root / ".itd-memory" / "verification-loop"
+gap_stray = gap_evidence / "stray-report.md"
+gap_stray.parent.mkdir(parents=True, exist_ok=True)
+gap_stray.write_text("# stray\n", encoding="utf-8")
+gap_prompt, _gap_report = artifacts(route_gap_root)
+gap_phase = gap_evidence / "receipts" / "gap-phase-one.json"
+gap_keyring = gap_evidence / "keys" / "gap-keyring.json"
+gap_phase.parent.mkdir(parents=True, exist_ok=True)
+gap_keyring.parent.mkdir(parents=True, exist_ok=True)
+gap_phase.write_text(json.dumps({"kind": "not-a-route"}), encoding="utf-8")
+gap_keyring.write_text(json.dumps({}), encoding="utf-8")
+route_gap = run([
+    "checker", "--root", str(route_gap_root), "--unit-id", "U-loop",
+    "--risk-tier", "medium", "--mode", "targeted",
+    "--report", str(gap_stray), "--prompt-file", str(gap_prompt),
+    "--maker-provider", "openai", "--maker-model", "gpt-maker",
+    "--maker-session", "maker-session",
+    "--checker-provider", "openai", "--checker-model", "gpt-checker",
+    "--checker-session", "checker-session",
+    "--phase-one-receipt", str(gap_phase),
+    "--producer-keyring", str(gap_keyring),
+], route_gap_root)
+check("bad artifact path never hides a route violation (PUB1)",
+      route_gap.returncode != 0
+      and "pre-flight found 2 violations" in route_gap.stdout
+      and "checker report escapes" in route_gap.stdout
+      and "keyring is malformed" in route_gap.stdout,
+      route_gap.stdout + route_gap.stderr)
+
+# Reviewer finding PUB2 (medium x2): phase-one and keyring are independent
+# inputs, and a malformed report is its own violation — neither may wait for
+# another run.
+indep_root = fixture()
+machine(indep_root, "medium")
+indep_evidence = indep_root / ".itd-memory" / "verification-loop"
+indep_prompt, indep_report = artifacts(indep_root)
+indep_stray_phase = indep_evidence.parent / "outside-phase.json"
+indep_stray_keyring = indep_evidence.parent / "outside-keyring.json"
+indep_stray_phase.write_text("{}", encoding="utf-8")
+indep_stray_keyring.write_text("{}", encoding="utf-8")
+indep_flight = run([
+    "checker", "--root", str(indep_root), "--unit-id", "U-loop",
+    "--risk-tier", "medium", "--mode", "targeted",
+    "--report", str(indep_report), "--prompt-file", str(indep_prompt),
+    "--maker-provider", "openai", "--maker-model", "gpt-maker",
+    "--maker-session", "maker-session",
+    "--checker-provider", "openai", "--checker-model", "gpt-checker",
+    "--checker-session", "checker-session",
+    "--phase-one-receipt", str(indep_stray_phase),
+    "--producer-keyring", str(indep_stray_keyring),
+], indep_root)
+check("phase-one and keyring violations surface together (PUB2)",
+      indep_flight.returncode != 0
+      and "pre-flight found 2 violations" in indep_flight.stdout
+      and indep_flight.stdout.count("escapes the Verification Loop") == 2,
+      indep_flight.stdout + indep_flight.stderr)
+
+malformed_root = fixture()
+machine(malformed_root, "medium")
+malformed_prompt, malformed_report = artifacts(malformed_root)
+malformed_report.write_text("# Review\n\nno verdict block\n", encoding="utf-8")
+malformed_stray_prompt = (
+    malformed_root / ".itd-memory" / "verification-loop" / "stray-prompt.md")
+malformed_stray_prompt.write_text("stray\n", encoding="utf-8")
+malformed_flight = run([
+    "checker", "--root", str(malformed_root), "--unit-id", "U-loop",
+    "--risk-tier", "medium", "--mode", "targeted",
+    "--report", str(malformed_report),
+    "--prompt-file", str(malformed_stray_prompt),
+    "--maker-provider", "openai", "--maker-model", "gpt-maker",
+    "--maker-session", "maker-session",
+    "--checker-provider", "openai", "--checker-model", "gpt-checker",
+    "--checker-session", "checker-session",
+], malformed_root)
+check("malformed report is named alongside a bad prompt path (PUB2)",
+      malformed_flight.returncode != 0
+      and "pre-flight found 2 violations" in malformed_flight.stdout
+      and "checker prompt escapes" in malformed_flight.stdout,
+      malformed_flight.stdout + malformed_flight.stderr)
+
+# Reviewer finding PUB6 (medium): a broken reference must not hide a malformed
+# resolved counterpart — each route input is shape-checked independently.
+shape_root = fixture()
+machine(shape_root, "medium")
+shape_prompt, shape_report = artifacts(shape_root)
+shape_evidence = shape_root / ".itd-memory" / "verification-loop"
+shape_bad_keyring = shape_evidence / "keys" / "bad-keyring.json"
+shape_bad_keyring.parent.mkdir(parents=True, exist_ok=True)
+shape_bad_keyring.write_text(json.dumps({"k": 7}), encoding="utf-8")
+shape_outside_phase = shape_evidence.parent / "outside-phase.json"
+shape_outside_phase.write_text("{}", encoding="utf-8")
+shape_flight = run([
+    "checker", "--root", str(shape_root), "--unit-id", "U-loop",
+    "--risk-tier", "medium", "--mode", "targeted",
+    "--report", str(shape_report), "--prompt-file", str(shape_prompt),
+    "--maker-provider", "openai", "--maker-model", "gpt-maker",
+    "--maker-session", "maker-session",
+    "--checker-provider", "openai", "--checker-model", "gpt-checker",
+    "--checker-session", "checker-session",
+    "--phase-one-receipt", str(shape_outside_phase),
+    "--producer-keyring", str(shape_bad_keyring),
+], shape_root)
+check("a broken reference never hides a malformed counterpart (PUB6)",
+      shape_flight.returncode != 0
+      and "pre-flight found 2 violations" in shape_flight.stdout
+      and "escapes the Verification Loop" in shape_flight.stdout
+      and "key" in shape_flight.stdout,
+      shape_flight.stdout + shape_flight.stderr)
+
+check("aggregate names its dependency-ordered guarantee (PUB6)",
+      "depend on a failed input" in shape_flight.stdout,
+      shape_flight.stdout)
+
+# Single violation keeps the exact historical message.
+single_root = fixture()
+machine(single_root, "medium")
+single_prompt, _single_report = artifacts(single_root)
+single_flight = run([
+    "checker", "--root", str(single_root), "--unit-id", "U-loop",
+    "--risk-tier", "medium", "--mode", "targeted",
+    "--report", str(stray_report), "--prompt-file", str(single_prompt),
+    "--maker-provider", "openai", "--maker-model", "gpt-maker",
+    "--maker-session", "maker-session",
+    "--checker-provider", "openai", "--checker-model", "gpt-checker",
+    "--checker-session", "checker-session",
+], single_root)
+check("single pre-flight violation keeps the historical message",
+      single_flight.returncode != 0
+      and "checker report escapes" in single_flight.stdout
+      and "checker prompt escapes" not in single_flight.stdout,
+      single_flight.stdout)
+
+# --- ROUTE-REPAIR-2: an empty candidate binds nothing and must be refused ---
+#
+# Measured on merged main 1a31fea: candidate_context(repo, "low", "staged")
+# returned the sha256 of the empty string while committed-head returned a real
+# digest. A staged receipt minted after a merge therefore did not fail; it
+# succeeded and attested to an empty diff. Both mint and validation must refuse
+# it, because a receipt over nothing is worse than a missing receipt: it looks
+# like evidence.
+#
+# The refusal also runs on the validation side, after a receipt is proven to
+# describe THIS candidate. An earlier version of this block DECLARED that
+# branch untestable, reasoning that once minting refuses an empty candidate no
+# such receipt can exist. That was wrong and independent review caught it: the
+# receipt digest is a self-consistency hash over public fields, so a fixture
+# can build a matching receipt by hand without the CLI and reach the branch.
+# It is exercised below rather than excused.
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+empty_root = fixture()
+git(empty_root, "commit", "-qm", "candidate")          # nothing left staged
+empty_mint = run([
+    "machine", "--root", str(empty_root), "--unit-id", "U-loop",
+    "--risk-tier", "low", "--candidate-mode", "staged",
+    "--command", interpreter_oracle(),
+], empty_root)
+check("staged mint refuses an empty candidate (RR2)",
+      empty_mint.returncode != 0 and "empty" in empty_mint.stdout.lower(),
+      empty_mint.stdout + empty_mint.stderr)
+
+# EVERY mint site, not just `machine`. The guard is called at four entry
+# points; an earlier version tested one of them and one mutation deleted all
+# four at once, so its lethality proved only the tested site. Each command is
+# now driven on the empty-candidate fixture with the arguments it needs to get
+# as far as the guard; a per-site mutation is what kills each of these.
+EMPTY_MINT_SITES = {
+    "checker": [
+        "checker", "--root", str(empty_root), "--unit-id", "U-loop",
+        "--risk-tier", "medium", "--mode", "targeted",
+        "--report", str(empty_root / "r.md"), "--prompt-file", str(empty_root / "p.md"),
+        "--maker-provider", "openai", "--maker-model", "m",
+        "--maker-session", "s",
+        "--checker-provider", "openai", "--checker-model", "c",
+        "--checker-session", "s2",
+    ],
+    "adjudicate": [
+        "adjudicate", "--root", str(empty_root), "--unit-id", "U-loop",
+        "--risk-tier", "low", "--machine", str(empty_root / "m.json"),
+    ],
+    # The fourth site. A per-site mutation SURVIVED while only the first three
+    # were driven, which is precisely what the all-sites mutation had been
+    # hiding: it deleted four guards at once and read as lethal on the one
+    # site a check happened to cover.
+    "prepare-adjudication": [
+        "prepare-adjudication", "--root", str(empty_root), "--unit-id", "U-loop",
+        "--risk-tier", "low", "--checker", str(empty_root / "c.json"),
+        "--dispositions", str(empty_root / "d.json"), "--claim", "U-loop",
+    ],
+}
+for site, argv in EMPTY_MINT_SITES.items():
+    proc = run(argv, empty_root)
+    check(f"{site} refuses an empty candidate (RR2)",
+          proc.returncode != 0 and "empty" in proc.stdout.lower(),
+          (proc.stdout + proc.stderr)[:300])
+
+loop_module = load_loop_module()
+# The refusal deliberately does NOT live inside candidate_context: there it
+# fired before the historical "does not match the exact current candidate"
+# refusal and rewrote its reason. It runs at every mint site and, on the
+# validation side, only after the receipt is proven to describe THIS candidate,
+# so a matching receipt over nothing is the case it catches.
+empty_raised = ""
+try:
+    loop_module.assert_candidate_not_empty(
+        {"diffHash": loop_module.EMPTY_DIFF_SHA256}, "staged")
+except loop_module.LoopError as exc:
+    empty_raised = exc.why
+check("an empty candidate is refused as binding nothing (RR2)",
+      "empty" in empty_raised.lower() and "binds nothing" in empty_raised,
+      empty_raised or "no LoopError raised")
+
+nonempty_ok = True
+try:
+    loop_module.assert_candidate_not_empty({"diffHash": "a" * 64}, "staged")
+except loop_module.LoopError as exc:
+    nonempty_ok = False
+check("a non-empty candidate is not refused by the same guard (RR2)",
+      nonempty_ok, "the guard rejects real candidates too")
+
+# Pin the PRODUCTION constant, not a local literal: comparing two expressions
+# in this file would exercise no code under test.
+check("the guard's empty digest is the sha256 of the empty string (RR2)",
+      load_loop_module().EMPTY_DIFF_SHA256 == EMPTY_SHA256
+      == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      load_loop_module().EMPTY_DIFF_SHA256)
+
+# The validation-side branch, reached by a hand-built receipt. The receipt
+# digest is a self-consistency hash over public fields, so a fixture can build
+# a receipt that MATCHES the current (empty) candidate without the CLI, which
+# is exactly the shape of a receipt minted before this change. The refusal must
+# still fire there, after the candidate-equality check has already passed.
+empty_context = loop_module.candidate_context(empty_root, "low", "staged")
+check("the fixture really holds an empty staged candidate (RR2)",
+      empty_context["diffHash"] == EMPTY_SHA256, empty_context["diffHash"])
+legacy = loop_module.seal_receipt({
+    "version": loop_module.RECEIPT_VERSION,
+    "kind": "adjudication",
+    "createdAt": "2026-09-13T00:00:00Z",
+    "unitId": "U-loop",
+    "riskTier": "low",
+    "candidate": empty_context,
+    "candidateDigest": loop_module.candidate_digest(empty_context),
+    "policySha256": loop_module.load_policy()[1],
+    "outcome": "PASSED",
+})
+legacy_path = (empty_root / ".itd-memory" / "verification-loop"
+               / "legacy-empty-adjudication.json")
+legacy_path.parent.mkdir(parents=True, exist_ok=True)
+legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+legacy_why = ""
+try:
+    loop_module.validate_adjudication(empty_root, legacy_path, "low", "U-loop")
+except loop_module.LoopError as exc:
+    legacy_why = exc.why
+check("a legacy receipt matching an empty candidate is still refused (RR2)",
+      "empty" in legacy_why.lower() and "binds nothing" in legacy_why,
+      legacy_why or "the receipt was accepted")
+
+# committed-head on the same tree still yields a real candidate, so the refusal
+# narrows exactly the mode that could not be honest.
+head_context = loop_module.candidate_context(empty_root, "low", "committed-head")
+check("committed-head still binds a non-empty candidate on the same tree (RR2)",
+      head_context["diffHash"] != EMPTY_SHA256, head_context["diffHash"])
+
+# --- ROUTE-REPAIR-2: the review claim chain is a documented route ---
+#
+# itd_review_cache validates against `<UNIT>:general-review`. Minting the whole
+# chain under that claim id already works; nothing in the route said so, so the
+# discovery was paid for once per session.
+claim_root = fixture()
+claim_machine = last_path(run([
+    "machine", "--root", str(claim_root), "--unit-id", "U-loop:general-review",
+    "--risk-tier", "low", "--candidate-mode", "staged",
+    "--command", interpreter_oracle(),
+], claim_root))
+claim_adj = last_path(run([
+    "adjudicate", "--root", str(claim_root), "--unit-id", "U-loop:general-review",
+    "--risk-tier", "low", "--machine", str(claim_machine),
+], claim_root))
+claim_bound = ""
+try:
+    loop_module.validate_adjudication(
+        claim_root, claim_adj, "low", "U-loop:general-review")
+    claim_bound = "bound"
+except loop_module.LoopError as exc:
+    claim_bound = f"UNVERIFIED: {exc.why}"
+check("the review subclaim chain validates under the cache's claim id (RR2)",
+      claim_bound == "bound", claim_bound)
+
+claim_wrong = ""
+try:
+    loop_module.validate_adjudication(claim_root, claim_adj, "low", "U-loop")
+    claim_wrong = "accepted"
+except loop_module.LoopError as exc:
+    claim_wrong = exc.why
+check("a subclaim receipt does not unlock the bare unit (RR2)",
+      claim_wrong != "accepted", claim_wrong)
+
+# The criterion names the review CACHE as the consumer, so the proof must run
+# through it and not stop at validate_adjudication: an earlier version of this
+# block only called the loop directly, and independent review pointed out the
+# unit could be marked verified without ever exercising the consumer it names.
+cache_spec = importlib.util.spec_from_file_location(
+    "itd_review_cache_fixture", CACHE)
+assert cache_spec and cache_spec.loader
+cache_module = importlib.util.module_from_spec(cache_spec)
+cache_spec.loader.exec_module(cache_module)
+
+(claim_root / ".itd-memory").mkdir(parents=True, exist_ok=True)
+(claim_root / ".itd-memory" / "GOAL.json").write_text(json.dumps({
+    "version": 1, "goal": "claim chain fixture", "status": "active",
+    "createdAt": "2026-09-13T00:00:00Z", "updatedAt": "2026-09-13T00:00:00Z",
+    "currentUnitId": "U-loop",
+    "units": [{"id": "U-loop", "riskTier": "low", "status": "in_progress",
+               "criterion": "c", "verificationCommand": "true",
+               "verifiedAt": "", "evidence": "", "skippedReason": "",
+               "blockedReason": ""}],
+}), encoding="utf-8")
+check("the cache derives the subclaim id from the active unit (RR2)",
+      cache_module.review_claim_id(claim_root, "general") == "U-loop:general-review",
+      cache_module.review_claim_id(claim_root, "general"))
+
+cache_bound = ""
+try:
+    accepted = cache_module.validate_review_receipt(
+        claim_root, claim_adj, "low", "general")
+    cache_bound = str(accepted.get("claimId") or "")
+except cache_module.CacheError as exc:
+    cache_bound = f"UNVERIFIED: {exc}"
+check("the review cache accepts the subclaim chain with no workaround (RR2)",
+      cache_bound == "U-loop:general-review", cache_bound)
+
+cache_security = ""
+try:
+    cache_module.validate_review_receipt(claim_root, claim_adj, "low", "security")
+    cache_security = "accepted"
+except cache_module.CacheError as exc:
+    cache_security = str(exc)
+check("a general-review receipt does not unlock the security claim (RR2)",
+      cache_security != "accepted", cache_security)
+
+# The criterion says the CACHE refuses a chain minted under the BARE unit id.
+# An earlier version of this block proved only the two neighbouring cases - a
+# suffixed receipt validated as a bare unit, and a suffixed chain accepted by
+# the cache - and independent review pointed out that neither is the stated
+# one. A whole chain is therefore minted under "U-loop" and handed to the
+# cache, which is exactly the shape every earlier session produced by default.
+bare_machine = last_path(run([
+    "machine", "--root", str(claim_root), "--unit-id", "U-loop",
+    "--risk-tier", "low", "--candidate-mode", "staged",
+    "--command", interpreter_oracle(),
+], claim_root))
+bare_adj = last_path(run([
+    "adjudicate", "--root", str(claim_root), "--unit-id", "U-loop",
+    "--risk-tier", "low", "--machine", str(bare_machine),
+], claim_root))
+bare_cache = ""
+try:
+    cache_module.validate_review_receipt(claim_root, bare_adj, "low", "general")
+    bare_cache = "accepted"
+except cache_module.CacheError as exc:
+    bare_cache = str(exc)
+check("the cache refuses a chain minted under the bare unit id (RR2)",
+      bare_cache != "accepted" and "another unit" in bare_cache, bare_cache)
+
+# --- ROUTE-REPAIR-2: the mirror attribution must DERIVE, not be asserted ---
+#
+# Round 2 caught this row claiming `passed` while naming the full mirror, which
+# is red. The first repair swapped in the sealed command - and round 3 called
+# that laundering, correctly: the new command did not verify the row's claim
+# either. The claim is not "the mirror is green" but "the attribution follows
+# from the two recorded lines", and THAT is executable: the suites red on this
+# candidate minus the suites red on pristine main must equal exactly the one
+# regression the row names as its own. If either line is edited or the named
+# regression stops matching, this check fails.
+attribution_row = next(
+    item for item in json.loads(
+        (ROOT / ".itd" / "ACCEPTANCE_CONTRACT.json").read_text(encoding="utf-8")
+    )["criteria"] if item["id"] == "ROUTE-REPAIR-2-4"
+)
+
+
+def mirror_reds(text: str) -> list[set[str]]:
+    """Every quoted `DONE fails: ...` RESULT line, as a set of suite names.
+
+    Prose that merely mentions the marker is not a result line: this evidence
+    explains what it parses, and an earlier version of this parser counted that
+    sentence as a third mirror run. A result line either names suites or says
+    `none`; anything else is skipped rather than silently returned as empty.
+    """
+    found = []
+    for chunk in text.split("DONE fails:")[1:]:
+        names = []
+        tokens = chunk.replace("`", " ").split()
+        if tokens[:1] == ["none"]:
+            found.append(set())
+            continue
+        for token in tokens:
+            if token.startswith("verify_"):
+                names.append(token)
+            elif token == "blocked:":
+                continue
+            else:
+                break
+        if names:
+            found.append(set(names))
+    return found
+
+
+quoted = mirror_reds(attribution_row["evidence"])
+check("the row quotes exactly two mirror result lines (RR2)",
+      len(quoted) == 2, f"found {len(quoted)} DONE-fails lines")
+if len(quoted) == 2:
+    candidate_reds, main_reds = quoted
+    own = candidate_reds - main_reds
+    check("the candidate's own regression derives from the two lines (RR2)",
+          own == {"verify_goal_bounded_autonomy"}, sorted(own))
+    check("every other red is present on pristine main too (RR2)",
+          candidate_reds - own <= main_reds,
+          sorted(candidate_reds - own - main_reds))
+    # The named regression is built FROM the derived set, so naming a
+    # different suite cannot satisfy this. Collect EVERY such claim rather than
+    # searching for the expected one: an earlier version only asserted that the
+    # right suite was named and would have passed with a second, false
+    # attribution sitting beside it, which is what its own name promised to
+    # reject.
+    claimed = set(re.findall(
+        r"(verify_[A-Za-z0-9_]+),? WAS caused by it",
+        attribution_row["evidence"]))
+    check("the row names the derived regression and no other (RR2)",
+          claimed == own, f"claimed={sorted(claimed)} derived={sorted(own)}")
+check("the row does not claim the mirror is green (RR2)",
+      "THE MIRROR IS NOT GREEN" in attribution_row["evidence"],
+      attribution_row["evidence"][:120])
+
+loop_doc = (ROOT / "docs" / "VERIFICATION_LOOP.md").read_text(encoding="utf-8")
+# Substring presence is not a guarantee: `:general-review` and the cache path
+# both already appeared elsewhere in this document while the duty they belong
+# to was unstated, and a mutation that deleted the duty survived a presence
+# test. Each duty is therefore matched as a whole clause.
+# The claim-chain duty is matched as ONE normalized block, not as independent
+# fragments. An earlier version listed short phrases like "is the consumer of a
+# review receipt" and searched each anywhere in the document; independent review
+# showed unrelated or rearranged text could satisfy every fragment after the
+# canonical explanation was gone. The whole paragraph is normalized (newlines
+# collapsed) and required verbatim, so a rearrangement fails.
+CLAIM_CHAIN_BLOCK = (
+    "One claim id runs through the whole chain. "
+    "`skills/review/scripts/itd_review_cache.py` is the consumer of a review "
+    "receipt, and `review_claim_id` builds the id it validates against as "
+    "`<active-unit>:general-review` (or `:security-review`), so a chain minted "
+    "under the bare unit id is refused with `review receipt is UNVERIFIED: "
+    "receipt belongs to another unit`. The machine receipt, the checker receipt "
+    "and the adjudication must all carry that same `--unit-id`, and the two "
+    "failure modes surface at different moments. MIXING ids breaks at the MINT: "
+    "an adjudication validates its machine and checker dependencies against its "
+    "own unit id, so a chain whose links disagree is refused while it is being "
+    "built. A chain minted CONSISTENTLY under the bare unit id mints cleanly "
+    "and is refused later, by the cache, which is why that failure surfaces "
+    "late and why every session that defaulted to the bare id paid for the "
+    "discovery at the gate rather than at the producer. `v2_primary_unit` "
+    "derives the root unit from the exact `:general-review` suffix, so the "
+    "subclaim keeps the general and security claims separate while still "
+    "resolving to one primary unit - a receipt minted under one claim never "
+    "unlocks the other."
+)
+normalised_doc = " ".join(loop_doc.split())
+check("the route states the claim chain as one canonical block (RR2)",
+      CLAIM_CHAIN_BLOCK in normalised_doc,
+      "docs/VERIFICATION_LOOP.md does not contain the canonical claim-chain block")
+
+# DECLARED LIMIT, replacing a check that pretended to more than it did.
+# An earlier version rejected two literal strings and called itself a polarity
+# check on "the route never licenses a bare-unit chain". Independent review
+# pointed out that any other wording escapes it - and ROUTE-REPAIR-1 already
+# measured that widening such a pattern list never converges, four times over.
+# The semantic claim "no sentence anywhere licenses the opposite" is not
+# decidable by pattern matching, so it is NOT claimed here.
+#
+# What IS established, behaviourally rather than textually: the cache refuses a
+# chain minted under the bare unit id. That is proved above by "a subclaim
+# receipt does not unlock the bare unit" and by "the review cache accepts the
+# subclaim chain with no workaround", and M12 - which strips the suffix from
+# the cache's own claim id - kills both. Documentation cannot license what the
+# code refuses, so the duty rests on the executable proof plus the positive
+# clauses of the canonical block, not on scanning prose for its negation.
+
+# --- WIN-TESTQUOTE-1: oracle commands survive a non-ASCII interpreter path ---
+#
+# The three machine oracles above quoted the interpreter with json.dumps(),
+# which ASCII-escapes the path. The native Windows canary of REL-1.105.0 ran
+# them under C:\Users\Дмитрий\...\python.exe: the oracle exited 1, the
+# machine verdict was FAILED, `adjudicate` refused, and last_path() turned the
+# refusal JSON into a path that inside() reported as escaping the receipt root.
+# CI runners have ASCII paths, so only a real host could see it. The alias below
+# reproduces the host on every platform that can link the interpreter; the old
+# quoting must stay red on it and the fixed quoting green.
+quote_root = fixture()
+alias_dir = Path(tempfile.mkdtemp(prefix="itd-quote-")).resolve() / "Дмитрий"
+alias_dir.mkdir()
+alias = alias_dir / Path(sys.executable).name
+alias_note = ""
+try:
+    os.symlink(sys.executable, alias)
+except (OSError, NotImplementedError) as exc:
+    alias_note = f"symlink unavailable ({exc.__class__.__name__}); using the host interpreter path"
+    alias = Path(sys.executable)
+alias_is_non_ascii = any(ord(ch) > 127 for ch in str(alias))
+
+
+def oracle_verdict(command: str) -> str:
+    proc = run([
+        "machine", "--root", str(quote_root), "--unit-id", "U-quote",
+        "--risk-tier", "low", "--candidate-mode", "staged", "--command", command,
+    ], quote_root)
+    receipt = last_path(proc)
+    if not receipt.is_file():
+        return f"no receipt: {proc.stdout.strip()[-200:]}"
+    return str(json.loads(receipt.read_text(encoding="utf-8")).get("verdict"))
+
+
+fixed_verdict = oracle_verdict(interpreter_oracle(str(alias)))
+check("the fixed interpreter quoting passes through the shell transport (WIN-TESTQUOTE-1)",
+      fixed_verdict == "PASSED", f"{fixed_verdict}; {alias_note}")
+old_verdict = oracle_verdict("ok=" + json.dumps(str(alias)) + " -c \"pass\"")
+if alias_is_non_ascii:
+    check("the old json.dumps quoting fails on a non-ASCII interpreter path (WIN-TESTQUOTE-1)",
+          old_verdict == "FAILED", f"{old_verdict}; alias {alias}")
+else:
+    check("the old json.dumps quoting is exercised on the only interpreter path available (WIN-TESTQUOTE-1)",
+          old_verdict in {"PASSED", "FAILED"},
+          f"{old_verdict}; {alias_note}; ASCII path cannot show the RED leg - the POSIX mirror does")
+check("the alias really lives under a non-ASCII directory when a link is possible (WIN-TESTQUOTE-1)",
+      alias_is_non_ascii or bool(alias_note), f"alias {alias}; {alias_note}")
+check("no oracle in this suite quotes the interpreter through json.dumps any more (WIN-TESTQUOTE-1)",
+      not re.search(r"json\.dumps\(\s*sys\.executable\s*\)", Path(__file__).read_text(encoding="utf-8")),
+      "an ASCII-escaping interpreter quoting site is still present")
+import shutil as _shutil
+_shutil.rmtree(alias_dir.parent, ignore_errors=True)   # the alias fixture is evidence only while the checks run
+
+print(f"\n{PASSED} passed, {FAILED} failed")
+raise SystemExit(1 if FAILED else 0)

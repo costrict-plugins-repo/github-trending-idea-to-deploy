@@ -1,0 +1,275 @@
+---
+name: retro
+description: 'Self-proposing improvement cycle for the methodology itself — FACTS from the harness (itd_retro_scan.py aggregates VCR, regressions, active goals, SKILL_BYPASS ledger, cost), PROPOSALS from the model (ranked, every one cites evidence from the scan; anti-Goodhart: external signals only), MERGE stays with the human via the ordinary release pipeline. Never edits the methodology itself; not a gate.'
+argument-hint: 'optional — workspace root(s) to scan (default: current dir) and/or period note'
+license: MIT
+allowed-tools: Read Write Glob Grep Bash
+metadata:
+  effort: medium
+  side_effect: memory-write
+  explicit_invocation: false
+  author: HiH-DimaN
+  version: 1.83.0
+  category: methodology
+  tags: [retro, self-improvement, telemetry, vcr, backlog, evidence]
+---
+
+# Retro
+
+## Trigger phrases
+
+- ретроспектива методологии, методологическое ретро, ретро методологии
+- что улучшить в методологии, предложи улучшения методологии
+- methodology retro, itd retro
+- self-improvement cycle, self-improvement loop
+
+## Recommended model
+
+**Opus/default** — интерпретация телеметрии и ранжирование предложений с
+оценкой effort/риска — это рассуждение. Сам сбор фактов модели не касается
+(скрипт).
+
+## Instructions
+
+Цикл самоулучшения методологии, разделённый натрое — чтобы автономия не
+съела merge-гейт:
+
+| Роль | Кто | Артефакт |
+|---|---|---|
+| **FACTS** | харнес: `itd_retro_scan.py` | детерминированный скан телеметрии |
+| **PROPOSALS** | модель (этот скилл) | ранжированные предложения, каждое с evidence |
+| **MERGE** | человек | обычный конвейер: ветка → /review → PR → approve |
+
+> `/retro` НИКОГДА не правит методологию сам (скиллы/хуки/счётчики/доки) —
+> его выход это отчёт и кандидаты в бэклог. Реализация любого кандидата —
+> отдельный релиз через штатный конвейер. Не гейт: ничего не блокирует.
+
+### Step 1: FACTS — прогони скан (скрипт, не память)
+
+```bash
+RT="skills/retro/scripts"; [ -f "$RT/itd_retro_scan.py" ] || RT="$HOME/.claude/skills/retro/scripts"
+SHD="skills/_shared"; [ -f "$SHD/itd_py.sh" ] || SHD="$HOME/.claude/skills/_shared"
+# НЕ голый python3 (на Windows Git Bash это WindowsApps-шим) — через запускатель:
+sh "$SHD/itd_py.sh" "$RT/itd_retro_scan.py" <workspace-корни из $ARGUMENTS или .>
+```
+
+Скрипт собирает: VCR и регрессии из `*/.itd-memory/events.jsonl`, активные
+цели/давление/блокеры из `GOAL.json`, незакрытые гейты из `STATE.json`,
+SKILL_BYPASS-леджер и cost-леджеры из tempdir. Вставь вывод в отчёт **как
+есть** — факты приходят из харнеса, не из воспоминаний сессии.
+
+Когда среди workspace-корней есть сам репо методологии, скан дополнительно
+сверяет **lifecycle стоячих инструкций** (`docs/instruction-registry.json` ↔
+`docs/templates/global-claude-md.md`, v1.73.0): незарегистрированные секции,
+осиротевшие записи, битые `enforced_by`-пути, просроченные `review_by`.
+Каждая такая строка — готовый PROPOSAL-кандидат Step 2 с внешним сигналом
+«срок истёк / код исчез»: перечитать секцию против текущего кода и **обновить
+или удалить** (инструкции управляются как зависимости — неиспользуемые
+удаляются, а не копятся). Закрывая просрочку, ставь новый `review_by` в
+реестре — не снимай поле.
+
+Дополни скан внешними сигналами, если они есть под рукой (read-only): свежие
+находки code-reviewer по классам, ловли CI (windows-verify), false-positive
+триггеров из живых сессий, замечания пользователя из memory (`session_*.md`).
+
+### Step 1a-ext: Импорт внешних ревью в findings-леджер (опционально, v1.87.0)
+
+Леджер v1.86 питается только собственным /review — повторяющиеся классы из
+GitHub-ревью напарника для майнинга невидимы (боевой пример: конфликт номеров
+миграций жил в ≥2 PR OneOfS и ручном правиле CLAUDE.md, в леджер не попадал).
+Перед майнингом можно подтянуть внешние комментарии (read-only к GitHub,
+запись только в свой .itd-memory):
+
+```bash
+RT="skills/retro/scripts"; [ -f "$RT/itd_review_import.py" ] || RT="$HOME/.claude/skills/retro/scripts"
+SHD="skills/_shared"; [ -f "$SHD/itd_py.sh" ] || SHD="$HOME/.claude/skills/_shared"
+sh "$SHD/itd_py.sh" "$RT/itd_review_import.py" --repo owner/name --exclude-author <ты>
+```
+
+Дедуп по id комментария (`review-import.state.json`) — повторный прогон
+безопасен. Категории — грубая эвристика; уточнение классов — работа майнинга
+и человека, не импортёра. Нет gh / сети — шаг пропускается, ретро идёт дальше.
+
+### Step 1b: Ре-review абстенций реестра фич (только в репо методологии)
+
+Периодически пересматривай `abstain`-строки реестра харнесс-нативных фич — то,
+что методология сознательно НЕ взяла. Скрипт-FACTS поднимает их вместе с текущим
+fallback'ом:
+
+```bash
+RT="skills/retro/scripts"; [ -f "$RT/itd_ledger_abstentions.py" ] || RT="$HOME/.claude/skills/retro/scripts"
+SHD="skills/_shared"; [ -f "$SHD/itd_py.sh" ] || SHD="$HOME/.claude/skills/_shared"
+sh "$SHD/itd_py.sh" "$RT/itd_ledger_abstentions.py"
+```
+
+Источник — `docs/FABLE5_FEATURE_LEDGER.md`. По каждой абстенции спроси: **не
+появился ли безопасный юз?** Флип `abstain→adopt` — это обычный PROPOSAL Step 2 и
+подчиняется тому же анти-Гудхарту: нужен **внешний** safe-use сигнал (реальная
+безопасная адопция, изменившаяся threat-model, гарантия вендора), а не «кажется,
+было бы полезно». Нет сигнала — фича остаётся `abstain`. Вне репо методологии
+(реестра нет) скрипт печатает «SOURCE ABSENT» и шаг пропускается.
+
+**Опционально — scheduled read-only nudge (v1.61.0, Ось 3).** Чтобы «периодически»
+было настоящим, а не «когда вспомнил», ре-review абстенций можно повесить на
+харнесс-планировщик (`ScheduleWakeup` / `/schedule` / cron) как **read-only**
+напоминание, которое просто гоняет `itd_ledger_abstentions.py` и показывает
+абстенции. Это в границах инварианта: scheduled-агент — **read-only reporter**, он
+ничего не мержит и не мутирует; флип `abstain→adopt` всё равно проходит Step 2 +
+человека. Fallback (vendor-neutral): нет планировщика — запускай `/retro` вручную,
+как и раньше; пропуск пинга теряет напоминание, но не сам механизм.
+
+### Step 1c: Двухрежимная гигиена + абляция harness
+
+Периодическая гигиена — исполняемый контракт, не просьба «не забыть». Runner
+живёт в `.itd/` принятого проекта; в самом репо методологии используй шаблонный
+runner и активные контракты из `docs/`.
+
+**Weekly tracing cleanup** — полный read-only/cleanup scan: manifest-owned
+временные артефакты, freshness/валидность `QUALITY.json`, структурные проверки и
+benchmark drift. Операции cleanup безопасны для повторного запуска.
+
+```bash
+T="skills/_shared"; for d in "$HOME/.claude/skills/_shared" "${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-/nonexistent}}/skills/_shared"; do [ -f "$d/itd_tool.sh" ] && T="$d"; done
+[ "$T" = skills/_shared ] && C=$(ls -d "$HOME"/.codex/plugins/cache/*/idea-to-deploy/*/skills/_shared 2>/dev/null | awk -F/ '{print $(NF-2), $0}' | sort -k1,1V | tail -1 | cut -d" " -f2-) && [ -f "${C:-/}/itd_tool.sh" ] && T="$C"
+CONTRACT="$(sh "$T/itd_py.sh" "$T/itd_contract_dir.py" SESSION_EXIT_CONTRACT.json)/SESSION_EXIT_CONTRACT.json"
+sh "$T/itd_tool.sh" itd_hygiene.py periodic --mode weekly --root . --contract "$CONTRACT" --record
+```
+
+**Monthly component ablation** — выбрать ОДИН due-кандидат из
+`HARNESS_ABLATION.json`, прогнать тот же фиксированный benchmark сначала в
+baseline, затем с его reversible `disableEnv`, записать метрики и оставить
+`humanDecision: pending`. Runner никогда не удаляет компонент сам: regression →
+`restore`/exit 1; parity → `candidate_for_removal`, после чего человек решает
+удалить, облегчить или оставить.
+
+```bash
+T="skills/_shared"; for d in "$HOME/.claude/skills/_shared" "${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-/nonexistent}}/skills/_shared"; do [ -f "$d/itd_tool.sh" ] && T="$d"; done
+[ "$T" = skills/_shared ] && C=$(ls -d "$HOME"/.codex/plugins/cache/*/idea-to-deploy/*/skills/_shared 2>/dev/null | awk -F/ '{print $(NF-2), $0}' | sort -k1,1V | tail -1 | cut -d" " -f2-) && [ -f "${C:-/}/itd_tool.sh" ] && T="$C"
+ABL="$(sh "$T/itd_py.sh" "$T/itd_contract_dir.py" HARNESS_ABLATION.json)/HARNESS_ABLATION.json"
+sh "$T/itd_tool.sh" itd_hygiene.py periodic --mode monthly --component <id> --root . --ablation-contract "$ABL" --record
+```
+
+В репо методологии внешний transport уже материализован как
+`.github/workflows/hygiene-schedule.yml`: cron `17 3 * * 1` запускает weekly
+cleanup + objective `QUALITY_SCORECARD.json`, cron `29 4 1 * *` — monthly
+ablation. Оба job имеют только `contents: read` и выгружают records как Actions
+artifacts даже при красном гейте. Для принятого GitHub-проекта `/adopt` может с
+явного согласия скопировать `docs/templates/github/itd-hygiene.yml`; без согласия
+остаётся ручной vendor-neutral runner. Scheduled transport только
+показывает/записывает evidence; merge, изменение tracked grades, удаление
+компонента и иные мутации по-прежнему проходят человека и обычный release
+pipeline.
+
+### Step 2: PROPOSALS — интерпретация с обязательным evidence
+
+Для повторяемого и машиночитаемого цикла используй bundled runner после
+интерпретации FACTS (он пишет только proposal/experiment artifact, не
+методологию):
+
+```text
+sh skills/_shared/itd_py.sh skills/retro/scripts/itd_learning_loop.py propose \
+  --signals <durable.jsonl> --specs <human-authored-specs.json> --out <artifact.json>
+```
+
+Затем `experiment` исполняет две явно утверждённые argv-команды и фиксирует
+числовую метрику; `decide` требует `--actor-type human` и решение
+`keep|change|rollback`; `verify` fail-closed проверяет evidence и rollback.
+Runner отклоняет self-metrics, одиночные сигналы и повторения из одного
+источника. Обычный human merge/release gate после этого не меняется.
+
+Для каждого кандидата — строго четыре поля:
+
+1. **Сигнал** — цифра или цитата ИЗ Step 1 («триггер X: 7 false positives»,
+   «bypass /review ×5 с причиной "hotfix"», «VCR проекта Y = 0.6»).
+2. **Предложение** — конкретное изменение (файл/скилл/хук/регекс).
+3. **Effort** — S / M / L (S = <1 день, M = один релиз, L = несколько).
+4. **Риск** — что может деградировать и каким сьютом это прибьём.
+
+Правила отбора:
+- **Нет evidence — нет предложения.** «Кажется, было бы лучше» — не сигнал.
+- **Анти-Гудхарт:** сигнал должен быть внешним (боевые падения, false
+  positives, причины bypass, стоимость, находки ревью). Предложение, чьё
+  единственное обоснование — улучшить собственную метрику методологии
+  (VCR, проходимость meta_review), отклоняется.
+- **Signal-gated дисциплина (ROADMAP):** один слабый сигнал → заметка в
+  бэклог; релиз-кандидат — от двух сигналов или одного боевого инцидента.
+- **Пустой скан — сам по себе находка** («телеметрия не пишется — почему?»),
+  а не повод выдумывать сигналы.
+
+Ранжируй: боевые инциденты → повторяющиеся сигналы → одиночные.
+
+### Step 3: Отчёт + передача решения человеку
+
+- В репо методологии: запиши `docs/retros/RETRO-YYYY-MM-DD.md` (скан as-is +
+  таблица предложений). В другом проекте: заметка в память проекта.
+- Покажи пользователю топ-кандидатов и **остановись** — что попадает в бэклог
+  следующего релиза, решает он. Никакого самозапуска реализации.
+- Принятые кандидаты — в бэклог-файл памяти (или BACKLOG.md), с пометкой
+  «источник: retro YYYY-MM-DD».
+
+## Examples
+
+### Example 1: Плановое ретро в репо методологии
+User: «проведи ретроспективу методологии»
+
+Actions:
+1. Скан workspace → VCR 0.86 (12/14), 2 регрессии, bypass ×4 (Edit, причины
+   «быстрый docs-фикс — /test не нужен»), цель «Календарь Этап 1» 3/5, blocked G-004.
+2. Предложения: (a) сигнал «bypass ×4 с причиной docs-фикс» → сузить DoD-гейт
+   для docs-only диффов, S, риск нулевой — прибивается verify_dod_gate;
+   (b) «2 регрессии после verified» → включить `--recheck` в чеклист
+   session-save, S. Оба с цитатами из скана.
+3. Пишет `docs/retros/RETRO-2026-07-03.md`, показывает топ, ждёт решения.
+
+### Example 2: Пустая телеметрия
+User: «методологическое ретро» (в проекте без events.jsonl)
+
+Actions:
+1. Скан: 0 unit-событий, 0 целей, bypass-леджер пуст.
+2. Единственная честная находка: «unit-bookkeeping не ведётся — /task Step 3.5
+   не срабатывает или проект без .itd-memory». Предложений по коду НЕТ.
+
+### Example 3: Попытка Гудхарта
+Скан показывает VCR 0.7; соблазн — «смягчить критерий verified, VCR вырастет».
+
+Actions: отклонить с формулировкой «улучшает метрику, а не методологию»;
+вместо этого искать ПРИЧИНУ низкого VCR в регрессиях/провалах верификации.
+
+## Self-validation
+
+Перед выводом убедись:
+- [ ] Скан-вывод вставлен как есть (не пересказ), команда скана показана.
+- [ ] У КАЖДОГО предложения — evidence-цитата/цифра из Step 1 или внешний сигнал.
+- [ ] Ни одно предложение не обосновано только улучшением собственной метрики.
+- [ ] Методология не изменена (никаких правок skills/hooks/docs этим скиллом).
+- [ ] Отчёт записан; решение о бэклоге явно оставлено пользователю.
+
+## Troubleshooting
+
+### Телеметрии нет или она пуста
+Это находка, а не тупик: зафиксируй «телеметрия не пишется» с гипотезой
+(хуки не зарегистрированы? проект без .itd-memory?). Не выдумывай сигналы.
+
+### Скан-скрипт недоступен (нет python3)
+Скажи явно и ограничься внешними сигналами (находки ревью, CI, memory) — с
+пометкой, что количественная часть пропущена. Не восстанавливай цифры по памяти.
+
+### На Windows скан печатает мусор («Python» вместо отчёта)
+`python`/`python3` в Git Bash указывают на WindowsApps-шим (Store-заглушка).
+Используй сниппеты Step 1/1b как есть — `skills/_shared/itd_py.sh` обходит шим
+(порядок: `$ITD_WIN_PYTHON` → python вне WindowsApps → `py -3`). Live-инцидент
+2026-07-11.
+
+### Пользователь просит «сразу и реализуй»
+Реализация — отдельная задача через штатный конвейер (/task → ветка → /review
+→ PR). /retro заканчивается списком кандидатов; не смешивай роли в одном
+прогоне — иначе предложения начнут подгоняться под лёгкость реализации.
+
+## Rules
+
+- **Факты — из скрипта**, предложения — от модели, merge — у человека.
+- **Evidence обязателен** для каждого предложения.
+- **Анти-Гудхарт** — внешние сигналы, не собственные метрики.
+- **Самомержа нет** — /retro не правит методологию.
+- **Не гейт** — ничего не блокирует.
+- **Match the user's language** для всего вывода.

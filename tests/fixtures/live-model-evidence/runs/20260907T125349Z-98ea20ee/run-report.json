@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "itd-live-fixture-v1",
+  "evidencePurpose": "workflow-output-quality",
+  "independentReviewEvidence": false,
+  "status": "PASS",
+  "observedAt": "2026-09-07T12:53:49Z",
+  "provider": "openai",
+  "fixture": "fixture-03-cli-tool",
+  "candidateModelRequested": "provider-default",
+  "reason": "live candidate passed independent snapshot oracle",
+  "source": {
+    "revision": "c18628dc0487a6554b22f77b2765774a67b85d72",
+    "workingTreeDirty": false,
+    "workingTreeStatusSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "methodologyTreeSha256": "sha256:24b4d2907d6aa903fc575eba4a4a9da48d84f957dc29a8f06af6f181bf7ba706"
+  },
+  "runner": "tests/run-live-model-benchmark.py",
+  "runId": "20260907T125349Z-98ea20ee",
+  "runReport": "tests/fixtures/live-model-evidence/runs/20260907T125349Z-98ea20ee/run-report.json",
+  "runArtifactDir": "tests/fixtures/live-model-evidence/runs/20260907T125349Z-98ea20ee",
+  "candidate": {
+    "commandFamily": "codex exec --json --ephemeral --repository-local-itd",
+    "exitCode": 0,
+    "liveResultEvents": 1,
+    "resultSubtype": null,
+    "isError": false,
+    "durationMs": null,
+    "totalCostUsd": null,
+    "attemptCountBasis": "blueprint attempts only; attempts[] additionally carries phase entries (e.g. devils-advocate) for exact transcript segment coverage",
+    "attemptCount": 1,
+    "recoveryTriggered": false,
+    "attempts": [
+      {
+        "attempt": 1,
+        "exitCode": 0,
+        "timedOut": false,
+        "missingBefore": [
+          "STRATEGIC_PLAN.md",
+          "PROJECT_ARCHITECTURE.md",
+          "PRD.md",
+          "IMPLEMENTATION_PLAN.md",
+          "CLAUDE_CODE_GUIDE.md",
+          "CLAUDE.md"
+        ],
+        "missingAfter": [],
+        "liveResultEvents": 1,
+        "isError": false,
+        "captureLimitBytes": 8388608,
+        "transcriptRedactionCount": 18,
+        "transcriptBytes": 41006,
+        "transcriptSha256": "sha256:82b8c61900f6db4376f151be440ccd055ab19508dc75bb1502773b104103261d"
+      },
+      {
+        "attempt": 2,
+        "phase": "devils-advocate",
+        "exitCode": 0,
+        "timedOut": false,
+        "liveResultEvents": 1,
+        "isError": false,
+        "captureLimitBytes": 8347602,
+        "transcriptRedactionCount": 3,
+        "transcriptBytes": 92788,
+        "transcriptSha256": "sha256:19219af6388ac1ab9b073e5ad0efbe20b4d3cc0460333cbd67bf8b0accd9d6de"
+      }
+    ],
+    "workspaceTransport": "native-temp",
+    "approvalPolicy": "never-no-escalation",
+    "hookPolicy": "disabled",
+    "captureLimitBytes": 8388608,
+    "transcriptBytes": 133794,
+    "transcriptSanitized": true,
+    "transcriptRedactionCount": 21,
+    "transcriptSha256": "sha256:00763f4e9474efd527cb1ad41bb6c4b361579a54e5bb01d4a37f9d3898ea20ee",
+    "transcriptArtifact": "tests/fixtures/live-model-evidence/runs/20260907T125349Z-98ea20ee/transcript.jsonl.gz",
+    "transcriptGzipSha256": "sha256:256c469d6b89ef21ecc01beb0a5c8b8a86e40335b77f78ca0354f81a7e7bc772"
+  },
+  "harnessInvocation": {
+    "mode": "repository-local-adopted-project",
+    "skill": "$idea-to-deploy:blueprint",
+    "skillPath": ".itd-plugin/skills/blueprint/SKILL.md",
+    "referencePath": ".itd-plugin/skills/blueprint/references/document-templates.md",
+    "projectGuidance": "AGENTS.md",
+    "projectContracts": ".itd/",
+    "projectHooks": ".codex/hooks.json",
+    "transcriptProvesSkillLoad": true,
+    "hookExecution": "disabled-for-live-model-evidence",
+    "methodologyTreeSha256": "sha256:24b4d2907d6aa903fc575eba4a4a9da48d84f957dc29a8f06af6f181bf7ba706"
+  },
+  "artifacts": {
+    "outputDir": "tests/fixtures/live-model-evidence/runs/20260907T125349Z-98ea20ee/output",
+    "requiredFiles": [
+      "STRATEGIC_PLAN.md",
+      "PROJECT_ARCHITECTURE.md",
+      "PRD.md",
+      "IMPLEMENTATION_PLAN.md",
+      "CLAUDE_CODE_GUIDE.md",
+      "CLAUDE.md"
+    ],
+    "sha256": {
+      "STRATEGIC_PLAN.md": "sha256:0d8e4ee8815464c53306e3fa68b97b15b2cfda3d7c710cb6a09c958fc1d2b45e",
+      "PROJECT_ARCHITECTURE.md": "sha256:154db822a9626a260f2a0882bbe0ca67230a3928e2cb41cc18d3696331873cfd",
+      "PRD.md": "sha256:851499367028127e38ba3d3d5acb4dcd05e5ace0d714193ad3c80ecc54056b1f",
+      "IMPLEMENTATION_PLAN.md": "sha256:9858974ba6b027fc6b7cf604b6ad938cafeee7097374af958ab6a1e5e53c7c7c",
+      "CLAUDE_CODE_GUIDE.md": "sha256:6d2f01840c932e95b80d017fa2b0ffc12069285b572e8e7eb92e0380bff431c6",
+      "CLAUDE.md": "sha256:0571d61eb0d13289c9a0b975d4da6baf61860cbc0c1f7462ce2e4b415bd65a1b",
+      "DEVILS_ADVOCATE_REVIEW.md": "sha256:93e83785defcbbcb3c2078188ba48217ceb9e3123d1372a24eac13de3282b203"
+    }
+  },
+  "independentVerdict": {
+    "actor": "deterministic-external-oracle",
+    "oracle": "tests/verify_snapshot.py",
+    "exitCode": 0,
+    "status": "PASS",
+    "candidateSelfReportAccepted": false
+  },
+  "devilsAdvocate": {
+    "mode": "harness-orchestrated-fresh-session",
+    "agentPath": "agents/devils-advocate.md",
+    "agentSha256": "sha256:ee08e71de63ebcddcc8673ef6fa61d35789a9810d5ce8290f9da2ff72d05344f",
+    "artifact": "DEVILS_ADVOCATE_REVIEW.md",
+    "artifactSha256": "sha256:93e83785defcbbcb3c2078188ba48217ceb9e3123d1372a24eac13de3282b203",
+    "artifactBytes": 17265,
+    "exitCode": 0,
+    "resultSubtype": null,
+    "isError": false,
+    "liveResultEvents": 1,
+    "phase1ArtifactsUnchanged": true,
+    "sessionIsolation": "codex exec --ephemeral",
+    "inlineSelfCritiqueSubstitution": false
+  },
+  "sourcePins": {
+    "benchmarkRunner": "sha256:d43ec28f0b62582e79a6a942ae41e322dc3c4b846afb1eb76ab5cdba104edcbd",
+    "candidateAdapter": "sha256:d43ec28f0b62582e79a6a942ae41e322dc3c4b846afb1eb76ab5cdba104edcbd",
+    "oracle": "sha256:3cdfa961238e0010172633a1ad655cc9c005cc6885751a878a9538f92aa33a89",
+    "fixturePrompt": "sha256:8f0e4ff221cdace0f7fd6ad2689bdae2813700732b954fb8aca382ae2f4a6709",
+    "fixtureContract": "sha256:3f092bdf1d20065fa6acfe464262ab5bee16daadd561fbb8f32e0eb2a3ae65b7",
+    "codexAdapterTemplate": "sha256:5fd95566ad36468a43bb6ef4e35471c8aac4f133d37f017a952737a8746f9298",
+    "agentsTemplate": "sha256:af0b59d7a879d5c0a5e5b1218aa11141dab3312e7ed975b7bb39a07759df5c21",
+    "methodologyTree": "sha256:24b4d2907d6aa903fc575eba4a4a9da48d84f957dc29a8f06af6f181bf7ba706"
+  }
+}

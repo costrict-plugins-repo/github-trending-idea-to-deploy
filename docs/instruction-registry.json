@@ -1,0 +1,71 @@
+{
+  "_doc": [
+    "Lifecycle-реестр стоячих инструкций глобального CLAUDE.md-блока",
+    "(docs/templates/global-claude-md.md). У каждой инструкции: источник",
+    "(since — версия появления), исполнитель (enforced_by — код, который",
+    "её enforce'ит; [] = prose-only, watch-list) и срок пересмотра",
+    "(review_by: 'vX.Y' — пересмотреть начиная с этой версии, либо ISO-дата).",
+    "Метаданные живут ЗДЕСЬ, а не в entry-файле — по принципу чемодана entry",
+    "остаётся лёгким. Сканер skills/retro/scripts/itd_retro_scan.py сверяет",
+    "реестр с шаблоном на каждом /retro и выносит ФАКТЫ: незарегистрированные",
+    "секции, осиротевшие записи, битые enforced_by-пути, просроченные",
+    "review_by. Просроченный review_by = кандидат в proposals ретро:",
+    "перечитать секцию против текущего кода — обновить или удалить,",
+    "инструкции управляются как зависимости (неиспользуемое удаляется).",
+    "Блок переписан в сессии 4 программы ADR-016 (2026-10-22, не длиннее 60 строк):",
+    "минимальный маршрут ADR-012 стал штатным режимом, строка выбора скилла и",
+    "SKILL_BYPASS-ритуал удалены; прежние секции Core routing rule, Always,",
+    "Skill decision, Bypass и Project profiles & markers сняты вместе с текстом."
+  ],
+  "entries": [
+    {
+      "match": "Штатный режим",
+      "since": "ADR-012 (2026-10-06, личная секция владельца); в блоке - сессия 4 ADR-016 (2026-10-22)",
+      "enforced_by": ["hooks/wip-gate.sh"],
+      "review_by": "2027-01-31",
+      "notes": "минимальный маршрут - текст; WIP=1 enforce'ит wip-gate для проектов с активным юнитом"
+    },
+    {
+      "match": "Когда включается strict",
+      "since": "сессия 4 ADR-016 (2026-10-22); профиль data-sensitive - v1.35.0",
+      "enforced_by": [
+        "skills/_shared/itd_risk_classes.py",
+        "skills/_shared/PROPORTIONALITY_POLICY.json",
+        "hooks/check-predeploy-gate.sh",
+        "scripts/itd_pre_push.py",
+        "hooks/state-guard.sh"
+      ],
+      "review_by": "2027-01-31",
+      "notes": "классы strict (money, prod-config, db-schema, auth, secrets) - PROPORTIONALITY_POLICY; гейты strict-проекта - его .itd/"
+    },
+    {
+      "match": "Всегда обязательно",
+      "since": "≤v1.21 (тесты, подтверждение); grounded claims - v1.50.0; completion gate - v1.51.0; блок - сессия 4 ADR-016",
+      "enforced_by": [
+        "hooks/completion-gate.sh",
+        "hooks/completion-signals.sh",
+        "hooks/completion_lib.py",
+        "hooks/check-dod-before-commit.sh",
+        "hooks/careful.sh",
+        "hooks/pii-egress-guard.sh",
+        "docs/templates/itd/itd_hygiene.py"
+      ],
+      "review_by": "2027-01-31",
+      "notes": "механика completion gate - docs/completion-gate.md; подтверждение внешнего - external-write gate за pii-egress-guard"
+    },
+    {
+      "match": "Harness-native features",
+      "since": "v1.50.0",
+      "enforced_by": ["hooks/pii-egress-guard.sh"],
+      "review_by": "2027-01-31",
+      "notes": "пересмотрено retro 2026-07-10 (v1.74.0) и сессией 4 ADR-016 (2026-10-22): rationale - docs/harness-best-effort.md, в блоке - только поведенческие правила"
+    },
+    {
+      "match": "Где скиллы",
+      "since": "сессия 4 ADR-016 (2026-10-22); счетчик скиллов/агентов/хуков - с v1.35.0",
+      "enforced_by": ["scripts/sync-to-active.sh"],
+      "review_by": "2027-01-31",
+      "notes": "счетчик сверяет tests/verify_registration_and_counts.py"
+    }
+  ]
+}

@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""itd_unit_log.py — harness-писатель unit-бухгалтерии /task Step 3.5 (v1.85.0).
+
+Диагноз G-004 (retro 2026-07-11): Step 3.5 велел МОДЕЛИ вручную дописывать
+JSON в STATE.json/events.jsonl — модель теряла activation-события (live:
+4 юнита U-2..U-5 verified без activated → «Аномалия учёта» в retro-скане,
+VCR слеп). Ремонт слоя: инструкция → инструмент. Переходами unit-статусов
+/task управляет этот скрипт; пары activated/verified гарантированы fail-closed
+проверкой, verified без evidence не бывает.
+
+Использование (из корня проекта; --dir переопределяет .itd-memory):
+  itd_unit_log.py activate U-9 --goal "однострочная формулировка" --risk-tier low
+  itd_unit_log.py verified U-9 --evidence "вывод команды верификации"
+  itd_unit_log.py backfill-activation U-2 --note "почему активация дописывается задним числом"
+
+Семантика:
+  activate  — WIP=1 (откажет, пока текущий unit in_progress/verifying),
+              пишет STATE.currentUnit + событие activated (actor: harness).
+              `--risk-tier` обязателен: тир определяет цену маршрута ревью
+              (PROPORTIONALITY_POLICY), из имени юнита он не выводится, а
+              ручная дописка в STATE теряется (S10, S11, LPD-002 R1-R3).
+  verified  — требует существующего activated-события юнита (иначе exit 1 с
+              подсказкой про осознанный backfill), обновляет STATE.currentUnit,
+              пишет событие verified с обязательным evidence.
+  backfill-activation — корректирующее событие activated с actor
+              harness-reconciliation (для исторической реконсиляции; note
+              обязателен — fail-closed, как skippedReason у /goal).
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+EVIDENCE_MAX = 500
+_STATE_LOCKS = threading.local()
+STATE_LOCK_WAIT_SECONDS = 5.0
+
+# Единица учёта живёт в общем модуле: и писатель, и retro-скан обязаны видеть
+# ОДИН И ТОТ ЖЕ жизненный цикл (S10-LEDGER). Раскладка skills/_shared одинакова
+# в репо методологии и в установленном ~/.claude/skills.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
+import itd_unit_lifecycle as LC  # noqa: E402
+import itd_risk_classes as RC  # noqa: E402
+from itd_safe_atomic import atomic_replace_bytes, durable_append_bytes, ledger_events, open_private_lock_fd, read_ledger_snapshot  # noqa: E402
+
+# Единственный читатель strictClasses политики пропорциональности (G-001):
+# классы, которые high по построению, какой бы тир ни объявил агент.
+PROPORTIONALITY_POLICY_PATH = Path(__file__).resolve().parents[2] / "_shared" / "PROPORTIONALITY_POLICY.json"
+
+# Терминалы, которыми можно закрыть цикл вручную при реконсиляции.
+CLOSE_OUTCOMES = ("superseded", "abandoned", "blocked", "skipped")
+
+# Закрытое множество риск-тиров. Первые три обязаны совпадать с ключами
+# `riskRoutes` в `skills/_shared/PROPORTIONALITY_POLICY.json` (дрейф ловит
+# `tests/verify_unit_log.py`); `unknown` — честное «не классифицировано»,
+# которое политика верификации ведёт по строгому маршруту, а не по дешёвому.
+RISK_TIERS = ("low", "medium", "high", "unknown")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class LedgerAmbiguity(Exception):
+    """Леджер события не выводится однозначно — писать нельзя (fail-closed)."""
+
+
+def resolve_ledger(mem: Path, unit_id: str, explicit: str = "") -> str:
+    """Леджер, которым будет проштампован event.
+
+    Порядок: явный `--ledger` (проверенный по существующим) -> единственный
+    владелец имени -> для неоднозначного имени единственный ОТКРЫТЫЙ цикл ->
+    отказ. Молчаливый откат на `STATE` для неоднозначного имени был дефектом
+    (ревьюер 2026-08-17, high/correctness): терминал авторизовался открытым
+    циклом одного леджера и записывался в другой.
+    """
+    owners = [led["name"] for led in LC.load_ledgers(mem) if unit_id in led["unitIds"]]
+    if explicit:
+        # Явный леджер обязан ВЛАДЕТЬ юнитом: иначе вызывающий мог бы завести
+        # цикл под чужим леджером и сам же его закрыть — проверка открытого
+        # цикла подтвердила бы ту же подделку (ревьюер 2026-08-17,
+        # high/correctness+security).
+        if explicit == LC.STATE_LEDGER:
+            if owners:
+                raise LedgerAmbiguity(
+                    f"{LC.STATE_LEDGER} допустим только для id без леджера-владельца; "
+                    f"{unit_id} принадлежит: {', '.join(sorted(owners))}")
+            return explicit
+        if explicit not in owners:
+            raise LedgerAmbiguity(
+                f"леджер {explicit} не владеет юнитом {unit_id} (владельцы: "
+                f"{', '.join(sorted(owners)) or 'нет — только ' + LC.STATE_LEDGER})")
+        return explicit
+
+    if not owners:
+        return LC.STATE_LEDGER
+    if len(owners) == 1:
+        return owners[0]
+
+    # Пересечение с ВЛАДЕЛЬЦАМИ обязательно: `attribute()` считает явное поле
+    # `ledger` в строке авторитетным, поэтому подделанная или испорченная
+    # append-only запись открывает цикл в леджере, который юнитом не владеет.
+    # Без пересечения неявная резолюция выбрала бы именно его, и проверка
+    # владения из явной ветки обходилась бы историей (ревьюер 2026-08-17, high).
+    open_ledgers = {lc["ledger"] for lc in LC.open_lifecycles(mem, unit_id)}
+    owned_open = open_ledgers & set(owners)
+    if len(owned_open) == 1:
+        return owned_open.pop()
+    raise LedgerAmbiguity(
+        f"id {unit_id} принадлежит нескольким леджерам ({', '.join(sorted(owners))}), "
+        f"а открытых циклов в них {len(owned_open)}"
+        + (f" (открытые циклы в невладеющих леджерах игнорируются: "
+           f"{', '.join(sorted(open_ledgers - set(owners)))})"
+           if open_ledgers - set(owners) else "")
+        + " — укажи --ledger явно")
+
+
+def state_describes(mem: Path, cur: dict, unit_id: str, ledger: str) -> bool:
+    """Описывает ли STATE.currentUnit ИМЕННО ТОТ цикл, который сейчас закрывается.
+
+    Совпадения по `id` мало: у коллизионного имени STATE может держать WIP в
+    леджере A, пока закрывается легитимный цикл в леджере B — обновление по id
+    пометило бы чужой WIP завершённым (ревьюер 2026-08-17, high/correctness).
+    Пустой `ledger` в STATE — легаси-запись до этого юнита, она принимается.
+    """
+    if cur.get("id") != unit_id:
+        return False
+    recorded = cur.get("ledger")
+    # Внешний вход проверяется по ТИПУ: `[]`, `{}`, `0`, `false` в поле `ledger`
+    # — искажённая запись, а не легаси-пустая; трактовать её как «без леджера»
+    # значило бы снова описать этой записью любой цикл имени (ревьюер
+    # 2026-08-17, medium — тот же класс, что закрывался у метки времени и id
+    # леджера). Fail-closed: искажённая запись не описывает ни один цикл.
+    # Только отсутствие поля / `null` / пустая строка — легаси.
+    if recorded is not None and not isinstance(recorded, str):
+        return False
+    if recorded:
+        return recorded == ledger
+    # Легаси-запись без `ledger` принимается ТОЛЬКО для однозначного имени:
+    # у коллизионного она описывала бы любой цикл, и закрытие цикла в леджере B
+    # снова помечало бы завершённым WIP из леджера A — та же дыра, что закрыта
+    # выше, лишь уже (ревьюер 2026-08-17, high).
+    owners = [led["name"] for led in LC.load_ledgers(mem) if unit_id in led["unitIds"]]
+    return len(owners) <= 1
+
+
+def die(msg: str, code: int = 2) -> int:
+    print(f"error: {msg}")
+    return code
+
+
+def append_event(mem: Path, unit_id: str, decision: str, evidence: str,
+                 ledger: str, actor: str = "harness") -> None:
+    events_path = mem / "events.jsonl"
+    # A failed append can leave a non-newline JSON fragment.  Appending the
+    # next event would concatenate it to that fragment; lifecycle parsing
+    # would then lose both terminal records while STATE could still advance.
+    # Preserve the bytes for recovery and refuse before another mutation.
+    # The tail is inspected through the shared anchored no-follow reader, so a
+    # link swapped in at this path cannot make the preflight inspect one file
+    # while durable_append_bytes appends to another (Sol-a12).
+    try:
+        tail = read_ledger_snapshot(events_path)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"events.jsonl tail cannot be safely read: {exc}") from exc
+    if tail and not tail.endswith(b"\n"):
+        raise RuntimeError("events.jsonl has a partial final record; preserved without append")
+    evt = {
+        "id": f"evt-unit-{int(time.time())}",
+        "at": now_iso(),
+        "actor": actor,
+        "type": "unit",
+        "name": unit_id,
+        "decision": decision,
+        "evidence": evidence[:EVIDENCE_MAX],
+        # Без этого поля один id из разных леджеров неразличим в логе (live:
+        # `G-001` принадлежит пяти разным юнитам). Леджер приходит УЖЕ
+        # разрешённым, тем же значением, по которому проверялся открытый цикл.
+        "ledger": ledger,
+    }
+    durable_append_bytes(events_path, (json.dumps(evt, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def has_event(mem: Path, unit_id: str, decision: str) -> bool:
+    for e in ledger_events(mem / "events.jsonl"):
+        if e.get("type") == "unit" and e.get("name") == unit_id and e.get("decision") == decision:
+            return True
+    return False
+
+
+def event_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def landed_terminal_event(mem: Path, current: dict, unit_id: str, ledger: str,
+                         decision: str, evidence: str, actor: str) -> dict | None:
+    """Return the latest exact terminal in the current activation epoch only."""
+    expected_evidence = evidence[:EVIDENCE_MAX]
+    relevant: list[dict] = []
+    # Recovery authority: anchored no-follow read, fail-closed on malformed
+    # records (Sol-a12); an absent ledger simply has no landed terminal.
+    for event in ledger_events(mem / "events.jsonl"):
+        if event.get("type") == "unit" and event.get("name") == unit_id and event.get("ledger") == ledger:
+            if (
+                not isinstance(event.get("decision"), str)
+                or event_time(event.get("at")) is None
+                or not isinstance(event.get("actor"), str)
+                or not isinstance(event.get("evidence"), str)
+            ):
+                return None
+            relevant.append(event)
+    if not relevant or relevant[-1].get("decision") != decision:
+        return None
+    terminal = relevant[-1]
+    if terminal.get("actor") != actor or terminal.get("evidence") != expected_evidence:
+        return None
+    activation_index = max(
+        (index for index, event in enumerate(relevant)
+         if event.get("decision") == "activated"),
+        default=-1,
+    )
+    if activation_index < 0 or activation_index >= len(relevant) - 1:
+        return None
+    activation = relevant[activation_index]
+    activation_at = event_time(activation.get("at"))
+    terminal_at = event_time(terminal.get("at"))
+    current_started = event_time(current.get("startedAt"))
+    if (
+        activation_at is None or terminal_at is None or current_started is None
+        or not activation_at <= current_started <= terminal_at
+    ):
+        return None
+    return terminal
+
+
+def recover_landed_terminal(mem: Path, unit_id: str, ledger: str,
+                            decision: str, evidence: str, actor: str) -> bool:
+    """Repair STATE only from one exact canonical terminal event already landed."""
+    state, state_sha256 = load_state_snapshot(mem)
+    current = state.get("currentUnit") or {}
+    if (
+        not state_describes(mem, current, unit_id, ledger)
+        or current.get("status") not in ("in_progress", "verifying", "recovery_required")
+    ):
+        return False
+    event = landed_terminal_event(
+        mem, current, unit_id, ledger, decision, evidence, actor
+    )
+    if event is None:
+        return False
+    current["status"] = decision
+    current["completedAt"] = event["at"]
+    state["currentUnit"] = current
+    save_state(mem, state, expected_sha256=state_sha256)
+    return True
+
+
+def load_state(mem: Path) -> dict:
+    raw = read_ledger_snapshot(mem / "STATE.json")
+    return json.loads(raw.decode("utf-8")) if raw else {}
+
+
+def load_state_snapshot(mem: Path) -> tuple[dict, str]:
+    """Read one STATE generation for a later lock-protected CAS write."""
+    # Anchored no-follow read: the generation hash authorizes a later CAS
+    # write, so a swapped STATE link must be refused here (Sol-a12).
+    raw = read_ledger_snapshot(mem / "STATE.json") or b""
+    return (json.loads(raw.decode("utf-8")) if raw else {},
+            hashlib.sha256(raw).hexdigest())
+
+
+@contextlib.contextmanager
+def state_write_lock(mem: Path):
+    """Bounded-lock STATE writers on each native Windows/POSIX backend."""
+    key = str(mem.resolve())
+    held = getattr(_STATE_LOCKS, "held", {})
+    if key in held:
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    # The lock file is opened anchored and no-follow, and proved regular,
+    # single-link and owned: a link or a second hard link planted at the lock
+    # pathname used to move both the lock and its initialising byte into a
+    # foreign file while every writer believed STATE writes were serialised
+    # (Sol-a13).
+    with open_private_lock_fd(mem / ".STATE.write.lock") as fd:
+        if os.lseek(fd, 0, os.SEEK_END) == 0:
+            os.write(fd, b"\0")
+            os.fsync(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+            attempt = lambda: msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            unlock = lambda: msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            attempt = lambda: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            unlock = lambda: fcntl.flock(fd, fcntl.LOCK_UN)
+        deadline = time.monotonic() + STATE_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                attempt()
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+        try:
+            held[key] = 1
+            _STATE_LOCKS.held = held
+            yield
+        finally:
+            held.pop(key, None)
+            unlock()
+
+
+def save_state_locked(mem: Path, state: dict) -> None:
+    """Write STATE while ``state_write_lock`` is already held."""
+    p = mem / "STATE.json"
+    atomic_replace_bytes(p, (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def save_state(mem: Path, state: dict, *, expected_sha256: str | None = None) -> None:
+    """Atomically replace STATE under the shared cross-process writer lock.
+
+    A lifecycle caller that read STATE before appending its canonical event
+    supplies that generation hash, so it fails instead of overwriting a
+    concurrent Goal or task transition.
+    """
+    with state_write_lock(mem):
+        if expected_sha256 is not None:
+            current = read_ledger_snapshot(mem / "STATE.json") or b""
+            if hashlib.sha256(current).hexdigest() != expected_sha256:
+                raise RuntimeError("STATE changed before lifecycle write; refusing overwrite")
+        save_state_locked(mem, state)
+
+
+def serialize_lifecycle_main(fn):
+    """Keep task WIP checks, event append, and STATE replacement one transaction."""
+    def wrapped() -> int:
+        probe = argparse.ArgumentParser(add_help=False)
+        probe.add_argument("--dir", default=".itd-memory")
+        args, _ = probe.parse_known_args()
+        mem = Path(args.dir)
+        if not mem.is_dir():
+            return fn()
+        with state_write_lock(mem):
+            return fn()
+    return wrapped
+
+
+@serialize_lifecycle_main
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", choices=["activate", "verified", "close", "backfill-activation"])
+    ap.add_argument("unit_id")
+    ap.add_argument("--goal", default="")
+    ap.add_argument("--evidence", default="")
+    ap.add_argument("--note", default="")
+    ap.add_argument("--ledger", default="",
+                    help="явный леджер-владелец события; обязателен, когда id "
+                         "принадлежит нескольким леджерам и открытый цикл не один")
+    ap.add_argument("--risk-tier", choices=RISK_TIERS, default=None,
+                    help="риск-тир юнита при activate: " + " | ".join(RISK_TIERS)
+                         + " (обязателен: пропорциональность маршрута ревью "
+                           "не выводится из имени юнита)")
+    ap.add_argument("--outcome", default="superseded",
+                    help="терминал для close: " + ", ".join(CLOSE_OUTCOMES))
+    ap.add_argument("--dir", default=".itd-memory")
+    a = ap.parse_args()
+
+    if not a.unit_id or not a.unit_id.strip():
+        return die("unit_id не может быть пустым или из одних пробелов: такое имя "
+                   "бухгалтерия отбрасывает как непригодное", 1)
+    a.unit_id = a.unit_id.strip()
+    mem = Path(a.dir)
+    if not mem.is_dir():
+        return die(f"{mem} не существует — /task не создаёт .itd-memory (территория /adopt)")
+
+    if a.command == "activate":
+        state, state_sha256 = load_state_snapshot(mem)
+        cur = state.get("currentUnit") or {}
+        if cur.get("id") and cur.get("id") != a.unit_id and cur.get("status") in ("in_progress", "verifying", "recovery_required"):
+            return die(f"WIP=1: текущий unit {cur['id']} в статусе {cur['status']} — сначала доведи его", 1)
+        if not a.goal:
+            return die("--goal обязателен при activate (однострочная формулировка задачи)", 1)
+        # Отказ ДО события и до записи STATE: активация без тира оставляла бы
+        # цикл открытым, а тир — на ручной дописке (её и теряли на S10/S11 и
+        # на R1-R3 плана LPD-002). Пропорциональность обязана быть объявлена
+        # тем же вызовом, который открывает цикл.
+        if not a.risk_tier:
+            return die("--risk-tier обязателен при activate ("
+                       + " | ".join(RISK_TIERS)
+                       + "): маршрут ревью пропорционален тиру, а тир не "
+                         "выводится из имени юнита; неклассифицированный риск "
+                         "объявляется явно как unknown и идёт по строгому маршруту", 1)
+        # Strict-классы (G-001): деньги / прод-конфиг / схема БД / auth / секреты —
+        # high по построению. Объявленный тир ниже — принудительно поднимается,
+        # причина печатается и остаётся в STATE как riskTierForced. Сломанная
+        # политика — отказ ДО события: угадывать маршрут ревью нельзя.
+        try:
+            strict_classes = RC.load_strict_classes(
+                json.loads(PROPORTIONALITY_POLICY_PATH.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as exc:
+            return die(f"PROPORTIONALITY_POLICY strictClasses недоступны или некорректны: {exc}", 2)
+        try:
+            scope_text = RC.read_scope_lock(mem)
+        except RC.StrictClassPolicyError as exc:
+            return die(f"SCOPE_LOCK недоступен для strict-классов: {exc}", 2)
+        forced = RC.match_strict_class(a.goal, scope_text, strict_classes, a.unit_id)
+        risk_tier = a.risk_tier
+        forced_note = None
+        match_note = None
+        if forced:
+            # Совпадение записывается ВСЕГДА (аудит одинаков независимо от объявленного
+            # тира); riskTierForced - только когда тир реально поднят.
+            match_note = {"class": forced[0], "match": RC.describe(forced)}
+            if risk_tier != "high":
+                forced_note = {"declared": risk_tier, **match_note}
+                risk_tier = "high"
+                print(f"riskTier forced to high (declared {forced_note['declared']}): "
+                      f"{forced_note['match']}")
+            else:
+                print(f"strict class matched, declared tier already high: {match_note['match']}")
+        # TIER-SOURCE-1 / TIER-WORDING-2: на области-списке путей (тестовые пути или
+        # конкретные файлы) goal не источник пола; отложенное совпадение печатается и
+        # остаётся в STATE, чтобы низкий тир был объясним. Пишется и рядом с
+        # riskTierForced от пути/слова самой области: оба - факты аудита (PUB2).
+        exempt = RC.exempt_goal_hit(a.goal, scope_text, strict_classes, a.unit_id)
+        exempt_note = None
+        areas_kind = "tests-only" if RC.tests_only(RC.allowed_areas(scope_text)) else "a list of paths"
+        if exempt:
+            exempt_note = {"class": exempt[0], "match": RC.describe(exempt),
+                           "reason": f"Allowed Change Areas are {areas_kind}: the goal text is not a strict-class source"}
+            print(f"strict class not applied ({exempt_note['match']}): Allowed Change Areas are {areas_kind}")
+        elif (forced and forced[3] == "goal" and RC.path_list(RC.allowed_areas(scope_text))
+              and not RC.names_unit(scope_text, a.unit_id)):
+            print(f"hint: Allowed Change Areas are {areas_kind}, but the Current Task of .itd/SCOPE_LOCK.md "
+                  f"does not open with {a.unit_id} - a scope not bound to the unit keeps the goal text "
+                  f"as a strict-class source")
+        try:
+            ledger = resolve_ledger(mem, a.unit_id, a.ledger)
+        except LedgerAmbiguity as exc:
+            return die(str(exc), 1)
+        # Событие первым — как в `verified`/`close`. Иначе падение append
+        # оставило бы STATE с in_progress без открытого цикла в бухгалтерии:
+        # WIP-гейт заблокировал бы всё, а закрывать было бы нечего
+        # (ревьюер 2026-08-17). Обратный порядок безопаснее: лишний открытый
+        # цикл виден бухгалтерии и закрывается штатной `close`.
+        append_event(mem, a.unit_id, "activated", a.goal, ledger)
+        state["currentUnit"] = {"id": a.unit_id, "goal": a.goal, "status": "in_progress",
+                                "startedAt": now_iso(), "ledger": ledger,
+                                "riskTier": risk_tier}
+        if match_note:
+            state["currentUnit"]["riskTierMatch"] = match_note
+        if forced_note:
+            state["currentUnit"]["riskTierForced"] = forced_note
+        if exempt_note:
+            state["currentUnit"]["riskTierExempt"] = exempt_note
+        save_state(mem, state, expected_sha256=state_sha256)
+        print(f"activated {a.unit_id}: {a.goal}")
+        return 0
+
+    if a.command == "verified":
+        if not a.evidence:
+            return die("--evidence обязателен: verified без evidence не бывает", 1)
+        # Проверять надо ОТКРЫТЫЙ цикл, а не факт «когда-либо активировали»:
+        # старая проверка пропускала verified, опирающийся на активацию,
+        # закрытую месяцем раньше (live: второй verified у PE5-015 в августе
+        # при активации из июля).
+        try:
+            ledger = resolve_ledger(mem, a.unit_id, a.ledger)
+        except LedgerAmbiguity as exc:
+            return die(str(exc), 1)
+        # Проверять надо открытый цикл ИМЕННО В ТОМ леджере, которым будет
+        # проштамповано событие: иначе терминал уедет в чужой леджер.
+        if not LC.open_lifecycle_exists(mem, a.unit_id, ledger):
+            if recover_landed_terminal(
+                mem, a.unit_id, ledger, "verified", a.evidence, "harness"
+            ):
+                print(f"recovered verified {a.unit_id}")
+                return 0
+            hint = ("backfill-activation" if not has_event(mem, a.unit_id, "activated")
+                    else "activate")
+            return die(
+                f"нет ОТКРЫТОГО жизненного цикла у {a.unit_id} в леджере {ledger} — "
+                f"verified не пишется вне цикла (нужен `{hint} {a.unit_id}`)", 1)
+        # Тот же порядок, что и в `close`: сначала событие, потом STATE.
+        append_event(mem, a.unit_id, "verified", a.evidence, ledger)
+        state, state_sha256 = load_state_snapshot(mem)
+        cur = state.get("currentUnit") or {}
+        if state_describes(mem, cur, a.unit_id, ledger):
+            cur["status"] = "verified"
+            cur["completedAt"] = now_iso()
+            state["currentUnit"] = cur
+            save_state(mem, state, expected_sha256=state_sha256)
+        print(f"verified {a.unit_id}")
+        return 0
+
+    if a.command == "close":
+        # Терминал по реконсиляции: закрывает открытый цикл, который иначе
+        # висит вечно и тихо тянет VCR вниз (live: GPG-001 активирован
+        # 2026-07-29 и не имеет терминального события вообще).
+        if not a.note.strip():
+            return die("--note обязателен и не может быть из одних пробелов: "
+                       "закрытие цикла без причины не бывает (fail-closed)", 1)
+        a.note = a.note.strip()
+        if a.outcome not in CLOSE_OUTCOMES:
+            return die(f"--outcome должен быть одним из {', '.join(CLOSE_OUTCOMES)}", 1)
+        try:
+            ledger = resolve_ledger(mem, a.unit_id, a.ledger)
+        except LedgerAmbiguity as exc:
+            return die(str(exc), 1)
+        if not LC.open_lifecycle_exists(mem, a.unit_id, ledger):
+            evidence = f"close: {a.note}"
+            if recover_landed_terminal(
+                mem, a.unit_id, ledger, a.outcome, evidence,
+                "harness-reconciliation"
+            ):
+                print(f"recovered closed {a.unit_id} as {a.outcome}")
+                return 0
+            return die(f"у {a.unit_id} нет открытого цикла в леджере {ledger} — "
+                       f"закрывать нечего", 1)
+        # Событие пишется ПЕРВЫМ: если append упадёт после сохранения STATE,
+        # состояние объявит цикл завершённым, а бухгалтерия по-прежнему увидит
+        # его открытым — реконсиляция стала бы неатомарной (ревьюер 2026-08-17).
+        append_event(mem, a.unit_id, a.outcome, f"close: {a.note}", ledger,
+                     actor="harness-reconciliation")
+        state, state_sha256 = load_state_snapshot(mem)
+        cur = state.get("currentUnit") or {}
+        if state_describes(mem, cur, a.unit_id, ledger):
+            cur["status"] = a.outcome
+            cur["completedAt"] = now_iso()
+            state["currentUnit"] = cur
+            save_state(mem, state, expected_sha256=state_sha256)
+        print(f"closed {a.unit_id} as {a.outcome}")
+        return 0
+
+    # backfill-activation
+    if not a.note.strip():
+        return die("--note обязателен и не может быть из одних пробелов: "
+                   "реконсиляция без причины не бывает (fail-closed)", 1)
+    a.note = a.note.strip()
+    try:
+        ledger = resolve_ledger(mem, a.unit_id, a.ledger)
+    except LedgerAmbiguity as exc:
+        return die(str(exc), 1)
+    # Проверка обязана быть привязана к леджеру: активация того же имени в
+    # ДРУГОМ леджере не должна запрещать backfill в выбранном (ревьюер
+    # 2026-08-17, medium/error-handling).
+    if LC.has_activation(mem, a.unit_id, ledger):
+        return die(f"activation-событие для {a.unit_id} в леджере {ledger} уже есть "
+                   f"— backfill не нужен", 1)
+    append_event(mem, a.unit_id, "activated", f"backfill: {a.note}", ledger,
+                 actor="harness-reconciliation")
+    print(f"backfilled activation {a.unit_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

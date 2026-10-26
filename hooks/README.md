@@ -1,0 +1,328 @@
+# Hooks — Skill Discovery Enforcement
+
+These 31 hooks turn the methodology from "use it if you remember" into "you literally cannot forget". Without them, even Claude itself will skip the methodology under time pressure (verified the hard way during a 2026-04-07 production incident — see [the case study](#case-study) below).
+
+## Defense-in-depth overview (v1.19.0)
+
+Quality enforcement now spans **five layers**, from earliest-feedback to latest. Each layer catches something the previous ones missed:
+
+| # | Layer | Where it runs | When | What it catches | Bypass? |
+|---|---|---|---|---|---|
+| 0 | `pre-flight-check.sh` *(v1.5.0)* | Local | UserPromptSubmit | Stale context, parallel session conflicts, missing memory | Soft context injection only |
+| 1 | `check-skills.sh` | Local | UserPromptSubmit | Ambiguous prompts → wrong routing | Soft reminder only |
+| 2 | `check-tool-skill.sh` *(v1.19.0: enforcement mode)* | Local | PreToolUse on Bash/Edit/Write | Ad-hoc tool calls when a skill fits | **Soft → Hard after 3 ignores** |
+| 3 | `check-skill-completeness.sh` + `check-commit-completeness.sh` | Local | PreToolUse on Write/Edit/MultiEdit, PreToolUse on `git commit` | Incomplete skills (missing references/triggers/fixtures), incomplete commits | Only via `.methodology-self-extend-override` file |
+| 4 | **[CI workflow](../docs/CI.md)** (new in v1.8.0) | GitHub Actions | Push to main, every PR | Everything in the meta-rubric that local hooks missed OR scenarios where local hooks were never installed | Only by admin override of branch protection (audit-logged) |
+
+Layers 1–3 give fast local feedback. Layer 4 is the server-side last line of defense — catches contributors who never installed local hooks and future Claude sessions on unprepared machines. See [`docs/CI.md`](../docs/CI.md) for how to enable it as a required check on the main branch.
+
+## What they do
+
+| Hook | When it fires | What it does | Blocks? |
+|---|---|---|---|
+| `pre-flight-check.sh` *(v1.67.0)* | Every user prompt (UserPromptSubmit) | Loads `git log -10`, `git status`, recent commits, and the project memory index (`MEMORY.md`) into Claude's context before each turn. Detects stale parallel-session lockfiles (`.active-session.lock`) and warns if another Claude session has touched this project in the last 10 minutes. v1.68.0: warns when key `.itd/` contracts are template prose (`--filled` mirror) and when `IMPLEMENTATION_PLAN.md` has no `.itd-memory/GOAL.json` mirror (resume surface missing) — both advisory, rate-limited 4h. v1.67.0: also auto-consumes crash checkpoints — a `claude-checkpoint-*.json` for the SAME cwd whose `clean_exit` is still false (session died mid-work) is surfaced once (last tool calls + branch), then marked consumed. | No — soft context injection only |
+| `check-skills.sh` | Every user prompt (UserPromptSubmit) | Scans the prompt for Russian/English trigger words. If matched, injects a system reminder telling Claude which skill should be invoked first. Silent if no trigger matches. | No — soft reminder only |
+| `check-tool-skill.sh` *(v1.19.0: enforcement)* | Before every Bash/Edit/Write/NotebookEdit (PreToolUse) | Rate-limited skill reminder (60s). **Now tracks consecutive ignores.** After 3 ignored reminders, BLOCKS the next tool call until Claude either invokes a Skill or provides a `SKILL_BYPASS: <reason>` justification. Counter resets on Skill call or bypass. | **Yes — after 3 ignores** |
+| `session-open-diagnostic.sh` *(v1.19.0)* | First user prompt of session (UserPromptSubmit) | Reads last `session_*.md`, next-session plan, LAUNCH_PLAN.md, BACKLOG.md, latest ROADMAP. Injects diagnostic context so Claude starts with full awareness of prior work and planned next steps. Fires once per session (sentinel file). | No — soft context injection only |
+| `check-skill-completeness.sh` *(v1.5.1)* | **Before** Write/Edit/MultiEdit on `skills/*/SKILL.md` (PreToolUse) | Parses the pending tool input, extracts the skill name from the file path, verifies that `references/` exists and is non-empty (if the pending content mentions it), that `hooks/check-skills.sh` has a trigger phrase for the skill, and that a matching fixture exists in `tests/fixtures/`. | **Yes — exit 2 with `hookSpecificOutput.permissionDecision: "deny"`.** The Write never runs, the file never lands on disk. |
+| `check-commit-completeness.sh` *(v1.5.1)* | Before every Bash command matching `git commit` (PreToolUse) | Parses the staged diff. If any `skills/<name>/SKILL.md` is staged, the hook requires matching references/hook/fixture to also be staged (or already present on disk). Written to be the last line of defense against the v1.4.0 "Potemkin release" pattern. | **Yes — exit 2 with `hookSpecificOutput.permissionDecision: "deny"`.** The commit never runs. |
+| `check-review-before-commit.sh` *(exact cache v1.90.0)* | Before every Bash command matching `git commit` (PreToolUse) | Blocks a commit with more than 2 staged files unless a successful `/review` record matches the exact repository, base/tree, binary diff, scope/acceptance contracts, rubric/version, and risk tier. Legacy markers and `BLOCKED`/`UNVERIFIED` records never unlock it. | **Yes — exit 2 with `hookSpecificOutput.permissionDecision: "deny"`.** The commit never runs. |
+| `check-dod-before-commit.sh` *(v1.23.0)* | Before every Bash command matching `git commit` (PreToolUse) | Definition-of-Done gate. Inspects the staged diff and blocks the commit when a high-risk signal is present but the matching evidence is absent: migration/schema → `/migrate`+`/test`; payments/auth/secrets in a file path → an accepted `/security-audit` signal; brand-new source file with no test staged → `/test`. Escape: `SKILL_BYPASS:` in the commit message. | **Yes — exit 2 with `hookSpecificOutput.permissionDecision: "deny"`.** The commit never runs. |
+| `check-predeploy-gate.sh` *(U16, 2026-08-10; ADR-008 shipment-scoped receipt gate, 2026-08-12)* | Before every Bash command whose command word is a **recognized deploy transport** (`ssh`, `scp`, `rsync`, `docker` push, `kubectl`, `helm`, `tar` non-read-only, `curl`, `wget`, `nc`, `aws`, `rclone`, `terraform`, `pulumi`, `flyctl`, `vercel`, `kamal`, …) or a statically **opaque** command that could hide one — command/process substitution outside single quotes, `eval`/`source`/`xargs`, `case`/`select`, unlexable text (PreToolUse) | Pre-deploy independent review gate (ADR-008). For a **gated** candidate (data-sensitive / irreversible / monetary, as classified by `skills/deploy/scripts/itd_predeploy_gate.py classify`) a recognized transport or transport-hiding opaque command is denied unless a Verification Loop adjudication receipt is recorded for the exact current candidate digest. A **valid current pass then allows the reviewed deploy regardless of shipment form** — the r53–r89 arms race proved static shipment-form analysis is undecidable, so the gate stopped parsing it. **Ordinary local code execution** (interpreters, build/test/task runners, `bash deploy.sh`, path-qualified/custom executables) and **file operations** (`rm`, editors) are **out of scope** (allowed) — that residual is covered by `/careful`, the completion gate and human deploy review. The trust anchor (installed methodology) is derived from the OS account database, never from `HOME` (r53). Read-only inspection (`docker ps`, `kubectl get`, `tar -tf`, …) and routine candidates are never touched; outside a git checkout there is no candidate and nothing is gated. A classifier that cannot run **denies** with the repair command (r41). | **Yes — exit 2 with `hookSpecificOutput.permissionDecision: "deny"`.** The deploy command never runs. |
+| `record-agent-skill.sh` *(verdict-aware v1.90.0)* | **After** a `Task`/`Agent` subagent finishes (PostToolUse) | Writes only the existence-based `/test` sentinel for `test-generator`. It deliberately cannot infer review/security success from agent type; the authenticated `/review` or `/security-audit` caller records those verdicts explicitly. | No — pure side-effect, always exits 0. |
+| `wip-gate.sh` *(v1.41.0)* | Before Write/Edit/MultiEdit (PreToolUse) | WIP=1 activation gate. When `.itd-memory/STATE.json` has `currentUnit.status` ∈ `verifying`/`recovery_required` AND the edited path falls outside the `Allowed Change Areas` of `.itd/SCOPE_LOCK.md`, injects a soft hint: finish the current unit's verification (or explicitly reclassify — update SCOPE_LOCK + currentUnit) before starting new work. Computational detect, soft by design (map §8.3): "is this really a new task?" is semantic. Silent when no `.itd-memory/` or no real scope declared. Rate-limited (`ITD_WIP_GATE_RATE_MIN`, default 30 min); disable with `ITD_WIP_GATE=0`. | No — soft additionalContext only |
+| `handoff-readiness.sh` *(v1.40.0)* | End of each assistant turn (Stop) | Handoff-readiness detector — the "end every session handoff-ready" half of the Anthropic long-running-agents research (session start is covered by pre-flight + session-open-diagnostic + crash-recovery). When the turn ends with a **dirty git tree** AND **no fresh `session_*.md`** in the project memory dir (fresher than `ITD_HANDOFF_FRESH_MIN`, default 120 min), emits a soft `systemMessage` reminding the user to run `/session-save` or `/handoff` and leave a clean checkpoint. Rate-limited (`ITD_HANDOFF_RATE_MIN`, default 45 min per session); disable with `ITD_HANDOFF_READINESS=0`. Purely computational detect, semantic decision ("am I done?") stays with the human — hence hint, not deny (map §8.3). | No — soft systemMessage only |
+| `narration-final.sh` *(v1.49.0)* | When a subagent finishes (SubagentStop) | Mechanical narration-final detector — retro signal ×5 in one v1.48.0 review run: a reviewer's FINAL message ends on process narration ("Now check…", «Далее проверю…») instead of the verdict, even after the named anti-pattern entered the agent contract (v1.47.0) — prompt-level contracts don't hold. If the subagent's final paragraph starts with a narration opener AND the whole message carries no verdict marker (PASSED/BLOCKED/FAILED/FINAL STATUS/Вердикт/Итог), blocks the subagent's stop and feeds a "finish with the deliverable in one message" instruction back to it. A verdict-final (including a valid «Не успел проверить» tail) is never blocked. At most `ITD_NARRATION_MAX_PINGS` (default 2) blocks per subagent run; `stop_hook_active` loop guard; fail-open on any parse/IO error; disable with `ITD_NARRATION_FINAL=0`. | **Yes — blocks the subagent's stop (≤2×); never touches the main session** |
+| `verdict-contract.sh` *(trust-boundary v1.91.0)* | When a subagent finishes (SubagentStop) | Enforces the vendor-neutral `{verdict, findings[]}` contract and appends non-gating findings for retro mining. It never mints review/security cache evidence: only the explicit workflow caller can bind an independently accepted verdict to the exact context. | **Yes — blocks the subagent's stop (≤2×) when the JSON contract is missing; never touches the main session** |
+| `cross-review-precommit.sh` *(GPG-003)* | Before every Bash command matching `git commit` (PreToolUse) | Always reminds on sensitive staged paths that `/review` and `/cross-review` converge on one fresh opposite-GPT `Sol -> Terra` / `Terra -> Sol` producer. It never egresses code or writes evidence; the exact-candidate Verification Loop gate remains authoritative. Caller flags do not suppress the reminder. | **No — the reminder never blocks or grants acceptance.** |
+
+### Safety guardrails (v1.17.0, optional)
+
+| Hook | When it fires | What it does | Blocks? |
+|---|---|---|---|
+| `careful.sh` | Before Bash (PreToolUse) | Detects destructive commands (rm -rf, DROP TABLE, git push --force, git reset --hard, chmod 777, pipe-to-bash) and injects a warning asking Claude to confirm with the user. Activated via `CAREFUL_MODE=1` env var or a state file. | No — soft warning only |
+| `freeze.sh` | Before Write/Edit/MultiEdit/NotebookEdit (PreToolUse) | Restricts file modifications to a specific directory scope. Any edit outside the frozen scope triggers a warning. **Registered always-on since v1.42.0** (no-op until a scope state file exists). Activated by the freeze snippets in `/bugfix`, `/refactor`, `/perf` (they write `claude-freeze-<session>.state` to both temp dirs), or manually: `echo "/path/to/scope" > "$(python3 -c 'import tempfile;print(tempfile.gettempdir())')/claude-freeze-${CLAUDE_SESSION_ID:-default}.state"`. Deactivate by deleting the state file. There is no `/freeze` skill — the state file IS the interface. | No — soft warning only |
+| `pii-egress-guard.sh` *(exact approval v1.90.0)* | Before every tool (PreToolUse, matcher `.*`) | Shared outbound boundary. `itd_external_write_gate.py` silently allows local/read-only calls, but external mutations require a preview of exact targets, full payload and attachments. An approvable write returns native `permissionDecision: ask`, so the host—not a forgeable local ledger—binds human confirmation to that exact pending invocation; missing provenance/targets and live secrets are denied. Any target/payload change is a new invocation and prompt. `ITD_PII_GUARD=0` disables only PII scanning, never write approval. | **Yes — ASK exact writes; DENY unapprovable writes or live secrets (exit 2); ASK on read-only PII** |
+| `model-policy.sh` *(model+effort v1.91.0)* | Before Task/Agent spawn (PreToolUse, matcher `Task\|Agent`) | Keeps the model monotonicity hint and adds bounded effort routing. An explicit `effort=low` is silent only for an already-low role or an active low/medium-risk `working_deadline` slice marked `[itd:mechanical]`; protected/high/unknown/unbounded downgrades return native ASK with WHY/FIX. Model/effort never removes evidence contours. Real per-agent attribution lands in the cost ledger (`by_agent`). | No hard block — advisory model hint or host ASK for an unsafe effort override |
+| `context-budget.sh` *(v1.21)* | Before Bash (PreToolUse) | Detects commands likely to dump a large unbounded output (raw HTTP/API bodies, `cat` of big files, wide `grep`/`find`/`rg` with no cap) and injects a reminder to bound/summarize or write to a file + reference the path. See `skills/_shared/helpers.md` §7. Opt-in via settings.json. | No — soft reminder only |
+| `execution-trace.sh` *(v1.21)* | Before any tool (PreToolUse, register with matcher `*`) | Appends one JSON line per tool call (`{ts, tool, target}`) to `.claude/traces/session-<id>.jsonl` — a live, replayable record of which tool ran against what, for debugging the methodology and user oversight. Pure side-effect telemetry: injects **nothing** into context (zero context-budget cost). `.claude/` is gitignored. Opt-in via settings.json. | No — never blocks |
+
+### Budget, observability & session-management hooks (v1.18–v1.30)
+
+Ported *outcomes* of GSD v2 and the omnigent policies. PostToolUse feedback is
+an ASK/reminder; `cost-tracker.sh` additionally has a narrow PreToolUse hard
+boundary that stops only the next expensive attempt at the configured estimate
+ceiling. `cost-tracker.sh` and `risk-score.sh` are **wired by default in the
+`/adopt` settings template**; the other three are opt-in per project.
+
+| Hook | When it fires | What it does | Blocks? |
+|---|---|---|---|
+| `cost-tracker.sh` *(v1.18.0; budget gate v1.31.0)* | Before expensive `Agent`/`Task`/test/build attempts + after every tool | Per-session estimate ledger plus separately provenance-labelled host-observed token/elapsed telemetry attributed to session, unit, skill, model and host. SOFT (≥80%) warns; HARD emits an ASK; the PreToolUse fast check denies the next expensive attempt before it crosses the ceiling while cheap inspection/checkpoint calls stay available. Set `ITD_COST_CEILING_TOKENS` (+ `ITD_COST_PER_1M_USD`) per project. **Wired by default in the `/adopt` template.** | Conditional — only the next expensive attempt is denied at the configured estimate ceiling |
+| `risk-score.sh` *(verdict-aware v1.90.0)* | After every tool (PostToolUse, matcher `*`) | Maintains disjoint general/security change-risk buckets. Mutations add to exactly one bucket; threshold crossing recommends `/review` or `/security-audit`. Only a successful exact-context verdict resets its matching bucket, so ordinary review cannot erase security risk and rejected verdicts reset nothing. **Wired by default in the `/adopt` template.** | No — soft escalation via additionalContext |
+| `crash-recovery.sh` *(v1.69.0)* | After significant tools (PostToolUse), end of turn (Stop) **and** subagent finish (SubagentStop) | Auto-saves a lightweight checkpoint (last N tool calls, cwd, branch + last commit, timestamp) to `claude-checkpoint-<session>.json` on every significant call with `clean_exit: false`; the Stop/SubagentStop registrations flip `clean_exit: true` when a turn or a background subagent ends normally (v1.69.0 — without the SubagentStop leg, subagent checkpoints surfaced as phantom crash banners in the main session). A checkpoint left with `clean_exit: false` = the session died mid-work — `pre-flight-check.sh` surfaces it to the next session in the same project and marks it consumed (v1.67.0 closes the "written but not consumed" gap). v1.75.0 (ACID-audit): the checkpoint is written atomically (tmp + `os.replace`) and a failed persist is logged to `<tmp>/claude-checkpoint-errors.log` instead of being swallowed. | No — pure side-effect telemetry |
+| `state-guard.sh` *(v1.78.1)* | Before Write/Edit/MultiEdit/NotebookEdit **and Bash/PowerShell** (PreToolUse), after them (PostToolUse) | State-ledger guard, three duties: (1) **PreToolUse single-writer gate (HARD, v1.76.0)** — a write to `.itd-memory/STATE.json` / `GOAL*.json` while a FRESH `.active-session.lock` is owned by ANOTHER session is DENIED (`permissionDecision: "deny"`, exit 2) — parallel sessions on one ledger are last-writer-wins (NeuroExpert 2026-04-11); ≤2 denies per session, the next attempt passes with a warning; ownerless legacy locks are never gated (attribution impossible); (2) **post-write validation (soft, v1.75.0)** — an edited ledger is re-validated IMMEDIATELY via `validate_state_core.py` (same invariants as `scripts/validate_state.py`: fail-closed fields, WIP=1 across both ledgers, reconciliation with `events.jsonl` for both STATE and GOAL units) and violations return as a red mark (`additionalContext`, FAILED/WHY/FIX); plus the `.active-session.lock` heartbeat (a fresh foreign lock is never overwritten); (3) **Bash-bypass detection (soft, v1.76.0)** — a Bash command that mutates a ledger (redirects, `sed -i`, `tee`, `jq`, `mv`/`cp`, PowerShell `Set-Content`) triggers re-validation of the project ledgers with the same red mark; (4) **Bash pre-write gate (HARD, v1.78.0)** — the same single-writer deny applies BEFORE a Bash command whose WRITE TARGET is a ledger (target-anchored regex: redirect/`tee`/`sed -i`/`mv`/`cp`/`truncate`/`dd of=`/`Set-Content` into `.itd-memory/STATE.json|GOAL*.json`); mere co-occurrence is never gated (false-deny costs more; the soft leg still revalidates). Disable: `ITD_STATE_GUARD=0`. | **Yes — PreToolUse leg denies (exit 2, ≤2 per session)**; validation/heartbeat/Bash legs are soft |
+| `graph-route.sh` | UserPromptSubmit, explicitly opted-in projects | Prepares the exact owner-authorized contract-first graph and injects its native execution plan; no policy/request means no-op. | No — additive native routing; no verification gate replaced |
+| `context-aware.sh` *(v1.18.0)* | Every user prompt (UserPromptSubmit) | Detects long sessions (many tool calls / large context) and recommends fresh-context strategies (`/session-save` + fresh start, tiered subagent dispatch) to fight context rot. Opt-in via settings.json. | No — soft reminder only |
+| `stuck-detection.sh` *(v1.18.0)* | After every tool (PostToolUse) | Sliding-window no-progress detector — same file edited 3+×, or same Bash/Grep retried 3+× in a row → injects diagnostic advice to try a different approach. Opt-in via settings.json. | No — soft reminder only |
+
+**Activation:**
+- **`careful.sh`** — **always active** inside methodology repos (auto-detected via `.claude-plugin/plugin.json`). Outside methodology repos: opt-in via `CAREFUL_MODE=1` env var or state file.
+- **`freeze.sh`** — **automatic** when skills like `/bugfix`, `/refactor`, `/perf` start work (they dual-write the scope state file to `/tmp` AND the platform temp dir, v1.42.0). Manual activation/deactivation = create/delete the state file (see the table row above); there is no `/freeze` command.
+
+All 31 hooks are written in Python 3 (works out of the box on macOS/Linux/WSL) — the `.sh` extension is a naming convention of the hook registry, not the implementation language: every file starts with `#!/usr/bin/env python3`, including the newest `check-predeploy-gate.sh`. They depend only on the standard library, and exit silently in degenerate cases (bad JSON, empty payload, not in the methodology repo) — they never break your session on unrelated work.
+
+**Enforcement hooks are scoped to methodology-repo work only.** The two v1.5.0 hooks walk up from `cwd` looking for `.claude-plugin/plugin.json`; if not found, they return 0 immediately. You can safely install them globally and still use Claude Code on ordinary projects — they fire only when you're inside a methodology (or methodology-like) repository.
+
+## Default registration (plan session 5, ADR-016)
+
+`bash scripts/sync-to-active.sh` (Claude Code) and the plugin's `hooks/hooks.json` (Codex) register one set for
+every user, the owner included:
+
+- **core**: `pre-flight-check`, `pii-egress-guard`, `careful`, `check-predeploy-gate`, `completion-signals`,
+  `completion-gate`;
+- **state hooks**, silent without `.itd-memory` or their state file: `state-guard`, `wip-gate`, `freeze`,
+  `handoff-readiness`;
+- **gates that stay quiet on ordinary work**: `check-dod-before-commit` (host budget 150 s, above its 120 s project
+  checks) with `record-agent-skill`, `cross-review-precommit`, `check-commit-completeness`,
+  `check-skill-completeness`, `graph-route`, `model-policy`, `narration-final`, `verdict-contract`;
+- **optional, off by default**: `cost-tracker`, `context-budget`, `context-aware`, `stuck-detection`, `risk-score`,
+  `completion-stop`, `session-open-diagnostic`, `execution-trace`, `crash-recovery` - name them, one per line, in
+  `~/.claude/itd-enabled-hooks.txt`;
+- **not registered**: `check-skills`, `check-tool-skill`, `check-review-before-commit` (the skill-decision line and
+  the per-commit review are no longer in the global rules; the files stay).
+
+A hook named in `~/.claude/itd-disabled-hooks.txt` is never registered (the owner opt-out of ADR-012). Both lists are
+read by `hooks/codex-dispatch.py` - on Codex an entry that is off exits before its process starts - and by the sync and
+`/adopt` (`skills/_shared/itd_project_hooks.py`), so one file switches a hook on both agents. The sync replaces only ITD
+hook commands in `settings.json`; a user's own hooks stay, also in the same event and group. Codex keeps trust per
+entry position in `config.toml`; after a plugin update `python3 scripts/itd_codex_hook_trust.py` names the entries
+Codex will not run (untrusted, switched off by position, stale) - trust them in `/hooks`.
+
+## Recommended setup
+
+The supported install is `bash scripts/sync-to-active.sh` (the default registration above); the manual steps below
+are the historical layout.
+
+```bash
+# 1. Copy hooks to your user-level Claude config
+mkdir -p ~/.claude/hooks
+cp hooks/check-skills.sh ~/.claude/hooks/
+cp hooks/check-tool-skill.sh ~/.claude/hooks/
+cp hooks/check-skill-completeness.sh ~/.claude/hooks/   # v1.5.0 enforcement
+cp hooks/check-commit-completeness.sh ~/.claude/hooks/  # v1.5.0 enforcement
+cp hooks/check-review-before-commit.sh ~/.claude/hooks/ # v1.19.0 — blocks >2-file commits without /review
+cp hooks/check-dod-before-commit.sh ~/.claude/hooks/    # v1.23.0 — Definition-of-Done gate (migrations/payments/new code)
+cp hooks/record-agent-skill.sh ~/.claude/hooks/         # v1.25.0 — counts subagent review/test/security toward the gates
+cp hooks/careful.sh ~/.claude/hooks/                     # v1.17.0 safety guardrail
+cp hooks/freeze.sh ~/.claude/hooks/                      # v1.17.0 scope guardrail
+cp hooks/session-open-diagnostic.sh ~/.claude/hooks/     # v1.19.0 session diagnostic
+chmod +x ~/.claude/hooks/*.sh
+
+# 2. Register them in ~/.claude/settings.json
+```
+
+Add this `hooks` block to your `~/.claude/settings.json` (merge with existing settings, do not replace):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session-open-diagnostic.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-skills.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-tool-skill.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-commit-completeness.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-review-before-commit.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-dod-before-commit.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-skill-completeness.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/careful.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/freeze.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/record-agent-skill.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+> **v1.5.1 note:** `check-skill-completeness.sh` moved from PostToolUse to PreToolUse in v1.5.1 because PostToolUse exit 2 is non-blocking per [Anthropic's hooks spec](https://code.claude.com/docs/en/hooks.md) — the tool already ran by that point, so the file would land on disk and the "block" would only be a message. PreToolUse exit 2 actually prevents the Write from executing. Both v1.5.1 hooks emit the correct `hookSpecificOutput.permissionDecision` field (v1.5.0 used a top-level `decision` field that was silently ignored by the schema validator).
+
+**Important — enforcement vs. reminder hooks:**
+
+- `check-skills.sh` and `check-tool-skill.sh` are **soft reminders** (no blocking). Safe to run on all projects.
+- `check-skill-completeness.sh` and `check-commit-completeness.sh` are **hard blocks** (exit 2, decision: deny/block). They only fire inside methodology repos (detected via `.claude-plugin/plugin.json`). Outside the methodology repo they return 0 immediately.
+
+If you never work on methodology repos, the two enforcement hooks (`check-skill-completeness.sh` and `check-commit-completeness.sh`) are harmless but unused — you can skip registering them. The other three (`pre-flight-check.sh`, `check-skills.sh`, `check-tool-skill.sh`) are useful on every project regardless of whether it's a methodology repo.
+
+After saving, the hooks fire on the very next prompt — no restart needed (Claude Code's settings watcher picks them up live).
+
+## Verifying
+
+Pipe-test the prompt hook:
+
+```bash
+echo '{"prompt":"у меня баг в auth"}' | ~/.claude/hooks/check-skills.sh
+```
+
+You should see JSON output with `additionalContext` mentioning `/bugfix` and `security-guidance`. If you see nothing, the hook is silent — try a clearer trigger word.
+
+Pipe-test the tool hook:
+
+```bash
+echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | ~/.claude/hooks/check-tool-skill.sh
+```
+
+You should see JSON with a SKILL CHECK reminder about Bash.
+
+Pipe-test the completeness hook (v1.5.1) — must be run inside a methodology repo to see the block:
+
+```bash
+cd /path/to/idea-to-deploy
+echo '{"tool_name":"Write","tool_input":{"file_path":"skills/fake-skill/SKILL.md","content":"body references/foo-checklist.md"}}' \
+  | ~/.claude/hooks/check-skill-completeness.sh
+```
+
+You should see JSON with `hookSpecificOutput.permissionDecision: "deny"` and a list of missing artifacts (references, trigger, fixture). Exit code 2.
+
+Pipe-test the commit-gate hook (v1.5.1) — must be inside a methodology repo with a staged SKILL.md:
+
+```bash
+cd /path/to/idea-to-deploy
+# Stage a fake SKILL.md without its supporting files first, then:
+echo '{"tool_name":"Bash","tool_input":{"command":"git commit -m test"}}' \
+  | ~/.claude/hooks/check-commit-completeness.sh
+```
+
+You should see JSON with `hookSpecificOutput.permissionDecision: "deny"` explaining which skill is incomplete. Exit code 2.
+
+## Customizing triggers
+
+Open `check-skills.sh` and edit the `TRIGGERS` list (line ~25). Each entry is a tuple `(regex_pattern, hint_text)`. The pattern matches against the lowercased prompt; add Russian or English phrases as needed. The script handles Unicode lowercasing correctly (uses Python's `str.lower()`, not `tr`).
+
+Common pitfalls to avoid:
+- Don't use `tr '[:upper:]' '[:lower:]'` for Russian — it doesn't lowercase Cyrillic without a UTF-8 locale.
+- Don't make patterns too greedy. `*` matches everything; prefer word boundaries (`\b`).
+- Avoid duplicate hint text — the dedup is by exact string match.
+
+## Case study
+
+In a 2026-04-07 hotfix session, Claude (Opus 4.6) spent ~2 hours doing direct SSH/sed/curl work to fix a 3-week-old production auth outage. Throughout that work, `/bugfix` was a perfect fit and was never invoked. The user noticed and asked: "почему ты не используешь методологию?". The honest answer: nothing was forcing it.
+
+These hooks are the answer. After installation, the same prompt — "у меня баг в auth" — would inject a SKILL HINT about `/bugfix` and `security-guidance` into Claude's context **before** Claude's first response. It then becomes physically impossible to skip the methodology without acknowledging it first.
+
+## Limitations
+
+- The hooks are user-level (`~/.claude/`), not project-level. If you want them only for specific projects, move them to `.claude/settings.json` in the project root and gitignore them.
+- The PreToolUse hook fires on every Bash/Edit/Write — that's a lot of noise on long sessions. If it bothers you, change the matcher to match only specific tools or specific commands (e.g., `Bash(git:*)`).
+- Hooks slow each prompt by ~50ms (Python startup). Acceptable for interactive use; might matter for scripted/CI use.
+- Only Russian + English triggers are included by default. Add your language by editing `check-skills.sh`.
+
+## Completion Gate (v1.51.0)
+
+Anti-premature-completion subsystem. Judges task completion from an objective
+runtime-signal ledger, not agent confidence. The host-neutral policy lives in
+`.itd/COMPLETION_POLICY.json`; hook transport currently records the runtime
+ledger under `.claude/completion/`. Missing transport fails closed only for
+strict/high-risk boundaries and degrades to advisory for calibrated low risk.
+
+| File | Event | Role |
+|---|---|---|
+| `completion_lib.py` | — (library) | signal classification into layers L1 static / L2 tests / L3 e2e, three-layer verdict with blocked-transition, `red_mark`+`FIX_HINTS` |
+| `completion-signals.sh` | PostToolUse · Bash | appends each Bash call to `.claude/completion/signals.jsonl`; returns a WHY+FIX teacher mark on a failed test/build. Soft. |
+| `completion-gate.sh` | PreToolUse · Bash/PowerShell | on a `git commit` touching source (including absolute git paths and global options such as `-C`/`--git-dir`): **deny** when a layer fails; in strict/high-risk mode also deny missing/ambiguous runtime evidence or transport failure; calibrated low-risk no-signal stays advisory. **Hard gate.** |
+| `completion-stop.sh` | Stop | reminder when the turn ends with a dirty code tree and a non-green verdict; never blocks. Soft. |
+
+**Ladder (cheap→expensive, blocked transition):** L1 syntax/static → L2 runtime
+tests (green or not done) → L3 e2e/smoke. No layer advances until the previous is
+green.
+
+**Projects without unit tests** declare an L2 equivalent in
+`.claude/completion/config.json` (`l2_evidence_patterns`) — a behaviour-proving
+command (e.g. a register-diff / repost script) counts as `test_run`.
+
+**Toggles:** `ITD_COMPLETION_GATE=0` plus a non-empty
+`ITD_COMPLETION_BYPASS_REASON` (audited veto bypass), `ITD_COMPLETION_STOP=0` (Stop),
+`ITD_COMPLETION_SIGNALS=0` (collection). Conscious bypass of one commit:
+`COMPLETION_BYPASS: <reason>` in the Bash `description` field; the non-empty
+reason is durably audited in `.itd-memory/events.jsonl`.
+
+Behavioural proof: `tests/verify_completion_gate.py` drives the gate to `deny`.
+
+## License
+
+Same as the parent project (MIT).

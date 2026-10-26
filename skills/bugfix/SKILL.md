@@ -1,0 +1,169 @@
+---
+name: bugfix
+description: 'Systematically debug an issue — find root cause and fix it. Traces errors through stack traces, logs, git history.'
+argument-hint: error message, symptom, or issue description
+license: MIT
+allowed-tools: Read Edit Glob Grep Bash
+metadata:
+  effort: medium
+  side_effect: command-execution
+  explicit_invocation: false
+  author: HiH-DimaN
+  version: 1.83.0
+  category: code-quality
+  tags: [debugging, bugfix, troubleshooting]
+---
+
+
+# Bugfix
+
+> **Note:** this skill was renamed from `/debug` to `/bugfix` in v1.4.0 to avoid a
+> name collision with Claude Code's built-in `/debug` slash command. The built-in
+> `/debug` has `disableModelInvocation: true` baked into the Claude Code binary,
+> which prevented the model from invoking this skill via the Skill tool. Use
+> `/bugfix` everywhere — the methodology is unchanged.
+
+
+## Trigger phrases
+
+These are the user phrases (Russian and English) that should auto-invoke this skill. They are kept here, not in the description, to avoid diluting the embedding-based matcher in the frontmatter. The hook `hooks/check-skills.sh` also uses this list — keep them in sync.
+
+- почини баг, не работает, ошибка, сломалось, крашит, падает
+- exception, stack trace, стектрейс, traceback
+- странное поведение, работало вчера сейчас нет, не понимаю что не так
+- debug this, fix this bug, troubleshoot
+- любая вставка error message, log fragment, panic
+- симптом без явной ошибки (тихий сбой)
+
+## Recommended model
+
+**sonnet** — Reading logs, grepping, running tests, applying focused fixes. Sonnet handles this well; Opus only helps for very deep/cross-language root-cause analysis.
+
+Set via `/model {model}` before invoking this skill, or via the project's default model in `~/.claude/settings.json`.
+
+
+## Instructions
+
+### Step 0: Auto-freeze scope (v1.17.0)
+
+After identifying the target file/directory from $ARGUMENTS or the error context, automatically activate scope freeze:
+
+```bash
+# Write freeze state — limits edits to the bug's directory (dual-write: /tmp + platform temp)
+tmpd="$(python3 -c 'import tempfile;print(tempfile.gettempdir())' 2>/dev/null || python -c 'import tempfile;print(tempfile.gettempdir())' 2>/dev/null || echo /tmp)"  # win-ok: цепочка падает в /tmp (шим exit!=0)
+mkdir -p /tmp 2>/dev/null || true
+echo "/path/to/bug/directory" | tee "/tmp/claude-freeze-${CLAUDE_SESSION_ID:-default}.state" > "$tmpd/claude-freeze-${CLAUDE_SESSION_ID:-default}.state" 2>/dev/null || echo "/path/to/bug/directory" > "$tmpd/claude-freeze-${CLAUDE_SESSION_ID:-default}.state"
+```
+
+This prevents accidental edits outside the bug's scope during debugging. The freeze is cleared automatically when the skill completes (Step 5+). If the fix legitimately requires changes outside the frozen scope (e.g., a shared utility), the freeze hook will warn and ask for confirmation — which is correct behavior.
+
+### Step 1: Reproduce
+Understand the exact symptoms. Find the error in logs/output.
+
+```
+Expected: What should happen
+Actual: What happens instead
+Error: Exact error message or unexpected behavior
+```
+
+**Рекомендация (goal-driven fix, v1.5.0):** по возможности напиши **failing test**, который воспроизводит баг, **до** правки. Это превращает размытое «почини баг» в verifiable goal: «сделай, чтобы этот тест прошёл». Преимущества:
+
+- Root cause становится явным (если тест не падает — ты ловишь не тот баг).
+- Автоматический регрессионный тест (Step 6 выполняется за счёт Step 1).
+- Проверка фикса — не ручная, а по зелёному тесту.
+
+Когда failing test писать нельзя (UI glitch без testable API, race condition без reproduction harness, env-specific баг) — зафиксируй явный критерий успеха в виде текста: «после фикса `curl /health` возвращает 200», «форма сохраняет данные после повторного submit». Критерий должен быть бинарным.
+
+Адаптировано из [andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills) principle #4 (Goal-Driven Execution).
+
+### Step 2: Locate
+Trace from the error back to the root cause:
+- Read the stack trace / error message carefully
+- Find the relevant code path
+- Check recent changes: `git log --oneline -10` and `git diff HEAD~3`
+
+If the bug is language- or stack-specific (Python pdb, JS source maps, Go race detector, Bash quoting, SQL query plans, frontend rendering), consult `references/debugging-patterns.md` for the idiomatic tools and common pitfalls of that ecosystem.
+
+### Step 3: Understand — record root cause (v1.21 — PFO port)
+Explain WHY it fails, not just WHERE. Identify the incorrect assumption or state.
+
+**Root-cause gate:** before writing the fix, record the root cause as an artifact. For non-trivial bugs, scaffold `ROOT_CAUSE.md` from `docs/templates/ROOT_CAUSE.md` and fill: Summary, Reproduction, Evidence, Fix Hypothesis, Regression Test. The gate is **fail-closed** — if you cannot state the root cause in one sentence with evidence, it is not found yet; keep analysing (Step 2), do not jump to a fix. This prevents symptom-patching and repeat bugs. For a one-line trivial fix (typo, off-by-one with obvious cause) an inline root-cause sentence is sufficient — no separate file.
+
+### Step 4: Fix
+Implement the minimal correct fix. Do not refactor surrounding code.
+
+### Step 5: Verify
+Run the relevant tests or reproduce steps to confirm the fix works.
+
+```bash
+# Run specific test
+pytest tests/test_affected_module.py -v
+# Or verify manually
+curl http://localhost:8000/api/health
+```
+
+### Step 6: Prevent
+If appropriate, add a test that would have caught this bug.
+
+Report your findings at each step. If you hit a dead end, say so and try a different angle.
+
+## Examples
+
+### Example 1: Runtime error
+User says: "TypeError: Cannot read properties of undefined (reading 'map')"
+
+Actions:
+1. Search codebase for `.map(` calls on potentially undefined variables
+2. Check the component/function where the error occurs
+3. Trace data flow — where does the undefined value come from?
+4. Fix: add null check or fix the data source
+
+Result: Identified that API response changed format, added optional chaining and default value.
+
+### Example 2: Silent failure
+User says: "Форма отправляется, но данные не сохраняются"
+
+Actions:
+1. Check network tab — is the API call made? What's the response?
+2. Check backend logs — does the request reach the handler?
+3. Check database — is the query executed?
+4. Trace the gap between where data exists and where it disappears
+
+Result: Found that validation middleware silently rejected the request due to missing field.
+
+## Rules
+
+1. Ищи root cause, а не маскируй симптомы — `try/except: pass`, подавление ошибок, fallback на default value без логирования запрещены как "фикс"
+2. Каждый исправленный баг должен сопровождаться регрессионным тестом, который падает на старом коде и проходит на новом. **Предпочтительно** написать failing test до фикса (Step 1), а не после (Step 6) — это превращает задачу в verifiable goal и делает root cause явным (goal-driven, v1.5.0)
+3. Минимальный фикс — не рефактори окружающий код, не добавляй фичи, не меняй форматирование в незатронутых строках
+4. Перед фиксом объясни WHY (Step 3) вслух — если не можешь сформулировать причину в одном предложении, root cause ещё не найден
+5. Не меняй тесты, чтобы они проходили — если тест падает после фикса, значит тест проверял корректное поведение, а фикс сломал контракт
+
+## Self-validation
+
+Before reporting fix to user, verify:
+- [ ] Root cause identified and documented (not just symptom fix)
+- [ ] Fix addresses the specific error/behavior described by user
+- [ ] Tests pass after fix (run existing test suite)
+- [ ] No new warnings or errors introduced
+- [ ] Fix does not break other functionality (check related tests)
+- [ ] If regression test needed, it has been added or recommended
+
+## Troubleshooting
+
+### Dead end: No error message
+If there's no visible error:
+1. Add logging at key points in the code path
+2. Check browser console / server logs at DEBUG level
+3. Use `git bisect` to find the commit that broke it
+
+### Dead end: Error is in a dependency
+If the bug is in node_modules or a library:
+1. Check the library's GitHub issues for the exact error
+2. Try upgrading/downgrading the dependency
+3. Look for a workaround in the library's docs
+
+### Fix breaks other tests
+If your fix causes new failures:
+1. The root cause is likely deeper — revert and re-analyze
+2. Check if the failing tests relied on the buggy behavior

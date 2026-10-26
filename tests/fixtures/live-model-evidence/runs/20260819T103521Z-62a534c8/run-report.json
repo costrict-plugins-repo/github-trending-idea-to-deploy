@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "itd-live-fixture-v1",
+  "evidencePurpose": "workflow-output-quality",
+  "independentReviewEvidence": false,
+  "status": "PASS",
+  "observedAt": "2026-08-19T10:35:21Z",
+  "provider": "openai",
+  "fixture": "fixture-03-cli-tool",
+  "candidateModelRequested": "provider-default",
+  "reason": "live candidate passed independent snapshot oracle",
+  "source": {
+    "revision": "5e8d6e3dea518f93b5c2ee9314eb30b5cbe0754a",
+    "workingTreeDirty": false,
+    "workingTreeStatusSha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "methodologyTreeSha256": "sha256:db756975ddfd8ab1ad8a1b3ff8a3815b82820e1b3ac5254dff2d51abeac2880b"
+  },
+  "runner": "tests/run-live-model-benchmark.py",
+  "runId": "20260819T103521Z-62a534c8",
+  "runReport": "tests/fixtures/live-model-evidence/runs/20260819T103521Z-62a534c8/run-report.json",
+  "runArtifactDir": "tests/fixtures/live-model-evidence/runs/20260819T103521Z-62a534c8",
+  "candidate": {
+    "commandFamily": "codex exec --json --ephemeral --repository-local-itd",
+    "exitCode": 0,
+    "liveResultEvents": 1,
+    "resultSubtype": null,
+    "isError": false,
+    "durationMs": null,
+    "totalCostUsd": null,
+    "attemptCount": 1,
+    "recoveryTriggered": false,
+    "attempts": [
+      {
+        "attempt": 1,
+        "exitCode": 0,
+        "timedOut": false,
+        "missingBefore": [
+          "STRATEGIC_PLAN.md",
+          "PROJECT_ARCHITECTURE.md",
+          "PRD.md",
+          "IMPLEMENTATION_PLAN.md",
+          "CLAUDE_CODE_GUIDE.md",
+          "CLAUDE.md"
+        ],
+        "missingAfter": [],
+        "liveResultEvents": 1,
+        "isError": false,
+        "captureLimitBytes": 8388608,
+        "transcriptRedactionCount": 0,
+        "transcriptBytes": 91834,
+        "transcriptSha256": "sha256:47b925379512371d52e82ac7c262576df39f8b409d1b119eccbd1c4f17fa33bd"
+      },
+      {
+        "attempt": 2,
+        "phase": "devils-advocate",
+        "exitCode": 0,
+        "timedOut": false,
+        "liveResultEvents": 1,
+        "isError": false,
+        "captureLimitBytes": 8296774,
+        "transcriptRedactionCount": 0,
+        "transcriptBytes": 95812,
+        "transcriptSha256": "sha256:e71594428d07f8dbac41715d0a17da88879be430d53913d6eb8d319988627f24"
+      }
+    ],
+    "workspaceTransport": "native-temp",
+    "approvalPolicy": "never-no-escalation",
+    "hookPolicy": "disabled",
+    "captureLimitBytes": 8388608,
+    "transcriptBytes": 187646,
+    "transcriptSanitized": true,
+    "transcriptRedactionCount": 0,
+    "transcriptSha256": "sha256:619e5c45e3466166185d6f843c44539454c0361b49d2962af7e993e962a534c8",
+    "transcriptArtifact": "tests/fixtures/live-model-evidence/runs/20260819T103521Z-62a534c8/transcript.jsonl.gz",
+    "transcriptGzipSha256": "sha256:f58307f3292bae2e633679a37c5c3bc9a848fc853c203d367e7d679f6cd58c98"
+  },
+  "harnessInvocation": {
+    "mode": "repository-local-adopted-project",
+    "skill": "$idea-to-deploy:blueprint",
+    "skillPath": ".itd-plugin/skills/blueprint/SKILL.md",
+    "referencePath": ".itd-plugin/skills/blueprint/references/document-templates.md",
+    "projectGuidance": "AGENTS.md",
+    "projectContracts": ".itd/",
+    "projectHooks": ".codex/hooks.json",
+    "transcriptProvesSkillLoad": true,
+    "hookExecution": "disabled-for-live-model-evidence",
+    "methodologyTreeSha256": "sha256:db756975ddfd8ab1ad8a1b3ff8a3815b82820e1b3ac5254dff2d51abeac2880b"
+  },
+  "artifacts": {
+    "outputDir": "tests/fixtures/live-model-evidence/runs/20260819T103521Z-62a534c8/output",
+    "requiredFiles": [
+      "STRATEGIC_PLAN.md",
+      "PROJECT_ARCHITECTURE.md",
+      "PRD.md",
+      "IMPLEMENTATION_PLAN.md",
+      "CLAUDE_CODE_GUIDE.md",
+      "CLAUDE.md"
+    ],
+    "sha256": {
+      "STRATEGIC_PLAN.md": "sha256:07013a868a42a1b538365771a3edfb81465fee67ba312b862613ad86fd1c79a3",
+      "PROJECT_ARCHITECTURE.md": "sha256:6273acba9d9853ad795a0b6b78c6c9124641c57bac99256ce3d08484f94ee7f2",
+      "PRD.md": "sha256:a2fe06a8896861de9feb275982a766f26badf23aaa2c1862b5422aa4feae0973",
+      "IMPLEMENTATION_PLAN.md": "sha256:0edcbe57b9c501c1abd9e1abd72c3fd8bb5ef9c45865ebea5c881aafbaafc7df",
+      "CLAUDE_CODE_GUIDE.md": "sha256:723120b1290890c460a5a703efbb3aaad22dc38a9bfdd71bc2a37e24dc5038d4",
+      "CLAUDE.md": "sha256:58b1184b7975334085ce8d6728460c3d221faabd74f60a5378b6e65e496f5e4b",
+      "DEVILS_ADVOCATE_REVIEW.md": "sha256:d1955916c787025965150c2889b354545956d34c7de61ae30c4189f568ba3af0"
+    }
+  },
+  "independentVerdict": {
+    "actor": "deterministic-external-oracle",
+    "oracle": "tests/verify_snapshot.py",
+    "exitCode": 0,
+    "status": "PASS",
+    "candidateSelfReportAccepted": false
+  },
+  "devilsAdvocate": {
+    "mode": "harness-orchestrated-fresh-session",
+    "agentPath": "agents/devils-advocate.md",
+    "agentSha256": "sha256:ee08e71de63ebcddcc8673ef6fa61d35789a9810d5ce8290f9da2ff72d05344f",
+    "artifact": "DEVILS_ADVOCATE_REVIEW.md",
+    "artifactSha256": "sha256:d1955916c787025965150c2889b354545956d34c7de61ae30c4189f568ba3af0",
+    "artifactBytes": 17072,
+    "exitCode": 0,
+    "resultSubtype": null,
+    "isError": false,
+    "liveResultEvents": 1,
+    "phase1ArtifactsUnchanged": true,
+    "sessionIsolation": "codex exec --ephemeral",
+    "inlineSelfCritiqueSubstitution": false
+  },
+  "sourcePins": {
+    "benchmarkRunner": "sha256:2599857812000d1ce609f0749c3f5ce08bb330fcf5ed6567e43b36fa392e9981",
+    "candidateAdapter": "sha256:2599857812000d1ce609f0749c3f5ce08bb330fcf5ed6567e43b36fa392e9981",
+    "oracle": "sha256:3cdfa961238e0010172633a1ad655cc9c005cc6885751a878a9538f92aa33a89",
+    "fixturePrompt": "sha256:c05ab7ede6cae6c36ccc134d0e96f7e50bcfb478ccc8e15538bd7d33496daf04",
+    "fixtureContract": "sha256:3f092bdf1d20065fa6acfe464262ab5bee16daadd561fbb8f32e0eb2a3ae65b7",
+    "codexAdapterTemplate": "sha256:5fd95566ad36468a43bb6ef4e35471c8aac4f133d37f017a952737a8746f9298",
+    "agentsTemplate": "sha256:af0b59d7a879d5c0a5e5b1218aa11141dab3312e7ed975b7bb39a07759df5c21",
+    "methodologyTree": "sha256:db756975ddfd8ab1ad8a1b3ff8a3815b82820e1b3ac5254dff2d51abeac2880b"
+  }
+}

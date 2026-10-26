@@ -1,0 +1,439 @@
+{
+  "version": 1,
+  "kind": "itd-efficacy-immutable-history-v1",
+  "baselineCommit": "541081840d2f972e1b0c5aea16fa09a767f80b2c",
+  "entries": [
+    {
+      "path": "accepted-base-5410818/wsl.json",
+      "sha256": "95a0542caaf793a7d74a74991d824519f68b21d3af76baf865ff45a2c839aed2",
+      "sourceProducerSha256": "7048543a2d8adcf3c9875f200ec9fa29fbc214d3bf6015feee0341cd4e7d5232",
+      "observedAt": "2026-08-31T15:47:31Z",
+      "sourceGitBlobSha1": "3f6d5b3a73fb5e174787e83b9ecc2b40dbfdfd36",
+      "classification": "accepted-base",
+      "sizeBytes": 11363
+    },
+    {
+      "path": "accepted-base-5410818/windows.json",
+      "sha256": "33dbf3964aa555b501b7a4b2a428d72883e52c20675bd56e89a2aa54a528ec36",
+      "sourceProducerSha256": "7048543a2d8adcf3c9875f200ec9fa29fbc214d3bf6015feee0341cd4e7d5232",
+      "observedAt": "2026-08-31T16:04:55Z",
+      "sourceGitBlobSha1": "fa4f8b7154231073c90859fdf3b427f32c89b416",
+      "classification": "accepted-base",
+      "sizeBytes": 11097
+    },
+    {
+      "path": "accepted-base-5410818/u12-cross-vendor-wsl.json",
+      "sha256": "a05260dc1996528d25544e14f8d236c610452dc2be034a95d49f1ad1699fc29e",
+      "sourceProducerSha256": "7048543a2d8adcf3c9875f200ec9fa29fbc214d3bf6015feee0341cd4e7d5232",
+      "observedAt": "2026-08-31T15:59:11Z",
+      "sourceGitBlobSha1": "33988acadcc2f632da851a26adc330e8b2418bec",
+      "classification": "accepted-base",
+      "sizeBytes": 11508
+    },
+    {
+      "path": "diagnostic-37da0624/wsl.json",
+      "sha256": "d80f49172dd78a661740ed3f6640b29766cdd346222dc364b2507c47b0774ecf",
+      "sourceProducerSha256": "37da0624c198aed7a6f2ecfb1e29b40d9f6e76c81298d4cc6fcf93409c839122",
+      "observedAt": "2026-09-05T17:38:13Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 9919
+    },
+    {
+      "path": "diagnostic-37da0624/windows.json",
+      "sha256": "7653f95bad74f8d304a069627d45ec82434147d452da37b477d4e6eda4fac21c",
+      "sourceProducerSha256": "37da0624c198aed7a6f2ecfb1e29b40d9f6e76c81298d4cc6fcf93409c839122",
+      "observedAt": "2026-09-05T17:31:11Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10777
+    },
+    {
+      "path": "diagnostic-37da0624/u12-cross-vendor-wsl.json",
+      "sha256": "abe95eb77d1c9c038ba0f122f9fdfc37a894f2c2455fd00bc1506470b45a8a39",
+      "sourceProducerSha256": "37da0624c198aed7a6f2ecfb1e29b40d9f6e76c81298d4cc6fcf93409c839122",
+      "observedAt": "2026-09-05T17:52:01Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10758
+    },
+    {
+      "path": "diagnostic-9ee3303a/wsl.json",
+      "sha256": "c6980c087abad36fbc589efede593136ce7079e7a13417b1930b1d2bf3c0ebac",
+      "sourceProducerSha256": "9ee3303a6ff0829f84a88206a087e958e3342339cad8289ec25d4c8c11ac95b8",
+      "observedAt": "2026-09-05T20:23:17Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 11664
+    },
+    {
+      "path": "diagnostic-9ee3303a/windows.json",
+      "sha256": "ccdddc40ac0d7e59474e40f640280f7269e0c6a43d26ae51a50937ae045713e1",
+      "sourceProducerSha256": "9ee3303a6ff0829f84a88206a087e958e3342339cad8289ec25d4c8c11ac95b8",
+      "observedAt": "2026-09-06T08:30:24Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 9801
+    },
+    {
+      "path": "diagnostic-9ee3303a/u12-cross-vendor-wsl.json",
+      "sha256": "524593abc79eaefd7e0ec26e393485862ee2cfe7fc76adc52289699250356cb5",
+      "sourceProducerSha256": "9ee3303a6ff0829f84a88206a087e958e3342339cad8289ec25d4c8c11ac95b8",
+      "observedAt": "2026-09-06T08:23:58Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10413
+    },
+    {
+      "path": "diagnostic-d0044c10/wsl.json",
+      "sha256": "f1f850455420c76f896d2ccd94d416929640399dc340df04b048f969a4cda06f",
+      "sourceProducerSha256": "d0044c1020d98c5add0b49bd2343a0cdf4b1e5099a33ef07b1b6a4d322f9b1eb",
+      "observedAt": "2026-09-06T10:13:55Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10537
+    },
+    {
+      "path": "diagnostic-d0044c10/windows.json",
+      "sha256": "57ebd2ffbbaa91183ef155823c035a135b432a0c8eb959ec9837618c1cb8b616",
+      "sourceProducerSha256": "d0044c1020d98c5add0b49bd2343a0cdf4b1e5099a33ef07b1b6a4d322f9b1eb",
+      "observedAt": "2026-09-06T10:12:59Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10722
+    },
+    {
+      "path": "diagnostic-d0044c10/u12-cross-vendor-wsl.json",
+      "sha256": "6533ee1d041dade6858f0a18138d0d64889371be021abf7373acba362506e2d6",
+      "sourceProducerSha256": "d0044c1020d98c5add0b49bd2343a0cdf4b1e5099a33ef07b1b6a4d322f9b1eb",
+      "observedAt": "2026-09-06T10:12:09Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10620
+    },
+    {
+      "path": "diagnostic-5c597f17/wsl.json",
+      "sha256": "79c5e6693b48557babf4b183d9c29af3bed86fedda515e2783ae84431fc8a8b8",
+      "sourceProducerSha256": "5c597f170b3b546838f28b292f72356c502ecd3bb5149b9358380da142d3c9e4",
+      "observedAt": "2026-09-06T10:36:00Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10539
+    },
+    {
+      "path": "diagnostic-5c597f17/windows.json",
+      "sha256": "aaa922908c340a010ca4e29a9f1c222e8ce5b1e28eada096485cffc1a376cedd",
+      "sourceProducerSha256": "5c597f170b3b546838f28b292f72356c502ecd3bb5149b9358380da142d3c9e4",
+      "observedAt": "2026-09-06T10:38:09Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10712
+    },
+    {
+      "path": "diagnostic-5c597f17/u12-cross-vendor-wsl.json",
+      "sha256": "5b9e38da3436b14ce755ce6397e2aaa06e27875bc3a22f684c3fcffc40b8ab54",
+      "sourceProducerSha256": "5c597f170b3b546838f28b292f72356c502ecd3bb5149b9358380da142d3c9e4",
+      "observedAt": "2026-09-06T10:34:29Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10523
+    },
+    {
+      "path": "diagnostic-a7b46110/wsl.json",
+      "sha256": "d966c86eef6b6f9484d280f6d919173ce4c424ba358aaa95da5c76b63a8c019c",
+      "sourceProducerSha256": "a7b46110df4fd1496cef640a0242bee8b90746290a05f721e78896ab295bb368",
+      "observedAt": "2026-09-06T11:54:13Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 11240
+    },
+    {
+      "path": "diagnostic-a7b46110/windows.json",
+      "sha256": "f3229c27fee64a8b4f52b9c2d0250f1693d66823d99a4a911a889b2206acb2f3",
+      "sourceProducerSha256": "a7b46110df4fd1496cef640a0242bee8b90746290a05f721e78896ab295bb368",
+      "observedAt": "2026-09-06T11:54:38Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10993
+    },
+    {
+      "path": "diagnostic-a7b46110/u12-cross-vendor-wsl.json",
+      "sha256": "232f2b65c96ea2228b388fd086348223a0ab9c95362f53a119546a8d7625f1c3",
+      "sourceProducerSha256": "a7b46110df4fd1496cef640a0242bee8b90746290a05f721e78896ab295bb368",
+      "observedAt": "2026-09-06T11:59:14Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10454
+    },
+    {
+      "path": "diagnostic-096f771b/wsl.json",
+      "sha256": "2a298414a7eb738cffc67b4293f226564e2e0f564f47a65c1bc3da5f4f5a64e5",
+      "sourceProducerSha256": "096f771b634939d3d8df9247cf471ee966f836eb0fe2792511780b0f494b08a6",
+      "observedAt": "2026-09-06T13:04:26Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10273
+    },
+    {
+      "path": "diagnostic-096f771b/windows.json",
+      "sha256": "00437837bb5577270cd2e08f77907b7a8d84dd95f2e511f7bbc3ffd2831faa3c",
+      "sourceProducerSha256": "096f771b634939d3d8df9247cf471ee966f836eb0fe2792511780b0f494b08a6",
+      "observedAt": "2026-09-06T13:04:50Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10904
+    },
+    {
+      "path": "diagnostic-096f771b/u12-cross-vendor-wsl.json",
+      "sha256": "816c4c0794232ce9bd3df13158fbf5b5906ee7446908b47adc9f2752c2a3764d",
+      "sourceProducerSha256": "096f771b634939d3d8df9247cf471ee966f836eb0fe2792511780b0f494b08a6",
+      "observedAt": "2026-09-06T13:04:36Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10940
+    },
+    {
+      "path": "diagnostic-0f1b8759/wsl.json",
+      "sha256": "535ba978af6801efdd8b8be2f8cb37ef1af5a394893a265fa29e6c67e7a5f374",
+      "sourceProducerSha256": "0f1b875997c1db31b73a6188e1b5f5070565022e462f44e4d416c9242d0e55b3",
+      "observedAt": "2026-09-06T13:28:41Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 9484
+    },
+    {
+      "path": "diagnostic-0f1b8759/windows.json",
+      "sha256": "fd9cc3108bd260c533a68ec226d890b42860fbcc86e2a70e9c5fc38c5d32c0dc",
+      "sourceProducerSha256": "0f1b875997c1db31b73a6188e1b5f5070565022e462f44e4d416c9242d0e55b3",
+      "observedAt": "2026-09-06T13:29:10Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 11128
+    },
+    {
+      "path": "diagnostic-0f1b8759/u12-cross-vendor-wsl.json",
+      "sha256": "3f31f58c17f93b9deeefd6e2144040a4b3afcc8f88e3624d4ba157ed7a96b461",
+      "sourceProducerSha256": "0f1b875997c1db31b73a6188e1b5f5070565022e462f44e4d416c9242d0e55b3",
+      "observedAt": "2026-09-06T13:29:37Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10540
+    },
+    {
+      "path": "diagnostic-68b25d08/wsl.json",
+      "sha256": "fbb80ad450db01eb40f9df43344fe557278353209b4cf09ae538eae3f3c3e6dc",
+      "sourceProducerSha256": "68b25d0863ee5f2f92874b86032cc927b87d3ee30d76b890978bccd4e2a64f81",
+      "observedAt": "2026-09-08T19:54:03Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 11051
+    },
+    {
+      "path": "diagnostic-68b25d08/windows.json",
+      "sha256": "6e05d7ec97c97b538e5a278a2219bfd220aec000add60ff0a40bfcb4f6fd15a9",
+      "sourceProducerSha256": "68b25d0863ee5f2f92874b86032cc927b87d3ee30d76b890978bccd4e2a64f81",
+      "observedAt": "2026-09-08T20:02:04Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 9696
+    },
+    {
+      "path": "diagnostic-68b25d08/u12-cross-vendor-wsl.json",
+      "sha256": "ddd7614628731bebc17b50cebc122b9de27cbc22f9bb2d7b6861b9f8c5249071",
+      "sourceProducerSha256": "68b25d0863ee5f2f92874b86032cc927b87d3ee30d76b890978bccd4e2a64f81",
+      "observedAt": "2026-09-08T19:58:14Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10731
+    },
+    {
+      "path": "diagnostic-ec40a183/wsl.json",
+      "sha256": "2013428a7d098fba3551807a948e7a8b4441dfea0e5b201021e9c8f1dd83be4a",
+      "sourceProducerSha256": "ec40a1839e8f9dce72a578a90b65932d7ddfdf4664a3013a075913bed60a66bd",
+      "observedAt": "2026-09-10T20:55:26Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 11314
+    },
+    {
+      "path": "diagnostic-ec40a183/windows.json",
+      "sha256": "08fb0c40be8659e5eba0dae60b76f6395c439ac7a25c94b0ce5e9c533b6cc8f6",
+      "sourceProducerSha256": "ec40a1839e8f9dce72a578a90b65932d7ddfdf4664a3013a075913bed60a66bd",
+      "observedAt": "2026-09-10T21:01:28Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 9614
+    },
+    {
+      "path": "diagnostic-ec40a183/u12-cross-vendor-wsl.json",
+      "sha256": "6e72a38eae1f1bbd1b24dd1f8dbeeba33da4a5377bdd17b1c68f9e275b31aa7f",
+      "sourceProducerSha256": "ec40a1839e8f9dce72a578a90b65932d7ddfdf4664a3013a075913bed60a66bd",
+      "observedAt": "2026-09-10T20:57:40Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10597
+    },
+    {
+      "path": "diagnostic-7a7ef0d9/wsl.json",
+      "sha256": "be7dbee594e3f976857db0f8ed4c520a7b47f0c74157eb3142499184f47d4b6a",
+      "sourceProducerSha256": "7a7ef0d9f3479af867bc9272b1864585bebb9c2774a28ae8e10c426c515ae3cc",
+      "observedAt": "2026-09-11T09:29:32Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10835
+    },
+    {
+      "path": "diagnostic-7a7ef0d9/windows.json",
+      "sha256": "1feb2fec8e73b7c0a118bef61403729456685a77fa133c0c973cb2a8754a9acf",
+      "sourceProducerSha256": "7a7ef0d9f3479af867bc9272b1864585bebb9c2774a28ae8e10c426c515ae3cc",
+      "observedAt": "2026-09-11T09:36:02Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10874
+    },
+    {
+      "path": "diagnostic-7a7ef0d9/u12-cross-vendor-wsl.json",
+      "sha256": "4c6dea93d8eb8733f1e9fd60295f613a2b330fddf689fdd3e44fe77945043852",
+      "sourceProducerSha256": "7a7ef0d9f3479af867bc9272b1864585bebb9c2774a28ae8e10c426c515ae3cc",
+      "observedAt": "2026-09-11T09:32:08Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10651
+    },
+    {
+      "path": "diagnostic-260950c6/wsl.json",
+      "sha256": "589149d3e8a3543ab5b565519740e391c565f79a8f460b3eb4bb7ea5d16ec359",
+      "sourceProducerSha256": "260950c68618bebd26c834dbe6dced2c2e09438b2a2f241742e6e56978979e84",
+      "observedAt": "2026-09-12T17:20:30Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 11049
+    },
+    {
+      "path": "diagnostic-260950c6/windows.json",
+      "sha256": "45175ebb439ac9fde5ce69fe53cac81fc51dbc506ed1b3205aee0244b24f00dd",
+      "sourceProducerSha256": "260950c68618bebd26c834dbe6dced2c2e09438b2a2f241742e6e56978979e84",
+      "observedAt": "2026-09-12T17:34:43Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10867
+    },
+    {
+      "path": "diagnostic-260950c6/u12-cross-vendor-wsl.json",
+      "sha256": "b87d655f68085e02ed4e76d0bbe59741fe9653a1814d309f462952febe58d301",
+      "sourceProducerSha256": "260950c68618bebd26c834dbe6dced2c2e09438b2a2f241742e6e56978979e84",
+      "observedAt": "2026-09-12T17:23:33Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 11399
+    },
+    {
+      "path": "diagnostic-34778075-scope-v2/wsl.json",
+      "sha256": "ad652b4e099a9837d8384171dc26e2800f578522132414ce29f0a00941428f5d",
+      "sourceProducerSha256": "3477807574efff2136704c3d1366ca43673f9fcb7961a1e6780e684f0f9f2df5",
+      "observedAt": "2026-10-12T10:30:14Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 9678
+    },
+    {
+      "path": "diagnostic-34778075-scope-v2/windows.json",
+      "sha256": "707812368664e8f2b84689f9fdadcd3d91015e453a02a71e233afda6b772ffb8",
+      "sourceProducerSha256": "3477807574efff2136704c3d1366ca43673f9fcb7961a1e6780e684f0f9f2df5",
+      "observedAt": "2026-10-12T10:30:52Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10205
+    },
+    {
+      "path": "diagnostic-34778075-scope-v2/u12-cross-vendor-wsl.json",
+      "sha256": "e08ebf9bbe818743f04666ef92437cde9fa2452952437679974384af0942e72d",
+      "sourceProducerSha256": "3477807574efff2136704c3d1366ca43673f9fcb7961a1e6780e684f0f9f2df5",
+      "observedAt": "2026-10-12T10:33:26Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10181
+    },
+    {
+      "path": "diagnostic-71b0336d-astra-route/wsl.json",
+      "sha256": "3e2bc2373b17050c4f4d8bbb7f7b706b597dee83bc91efa4bb4b0ad89e8cb4f9",
+      "sourceProducerSha256": "71b0336dab99620646d347dcd80d465878cf93df014fd5311e504ee32b164a03",
+      "observedAt": "2026-10-12T20:57:51Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10135
+    },
+    {
+      "path": "diagnostic-71b0336d-astra-route/windows.json",
+      "sha256": "6b0e2ad1c8b582949e9d0430163e436d750ea8787276ffb6a6e104ba79aae763",
+      "sourceProducerSha256": "71b0336dab99620646d347dcd80d465878cf93df014fd5311e504ee32b164a03",
+      "observedAt": "2026-10-12T20:47:54Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10260
+    },
+    {
+      "path": "diagnostic-71b0336d-astra-route/u12-cross-vendor-wsl.json",
+      "sha256": "ede06ff25dcbc80fe5d62c5d13559dbf790eb7b0c30fcb03c8e91d76bcee75b0",
+      "sourceProducerSha256": "71b0336dab99620646d347dcd80d465878cf93df014fd5311e504ee32b164a03",
+      "observedAt": "2026-10-12T21:01:50Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10336
+    },
+    {
+      "path": "diagnostic-f0cedfe6-fallback-ledger/wsl.json",
+      "sha256": "2ce127e706c480f75e99a40097558a70e23ae7e5725b6365f9d5f8a3b9437e1b",
+      "sourceProducerSha256": "f0cedfe670835ff61b7019d61578b713dcba5cce79ef734868c9dda4855cfd92",
+      "observedAt": "2026-10-15T17:09:08Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 9631
+    },
+    {
+      "path": "diagnostic-f0cedfe6-fallback-ledger/windows.json",
+      "sha256": "7d9e68bd7a4ff9a56171a92b98e29e5618879cfebcc4f0c3f7ea6567b17a22b9",
+      "sourceProducerSha256": "f0cedfe670835ff61b7019d61578b713dcba5cce79ef734868c9dda4855cfd92",
+      "observedAt": "2026-10-15T17:09:48Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10364
+    },
+    {
+      "path": "diagnostic-f0cedfe6-fallback-ledger/u12-cross-vendor-wsl.json",
+      "sha256": "b99d504db44fd7b5ac6f6dd6e03ef289d051561e10e44c506afc288cc4b6254a",
+      "sourceProducerSha256": "f0cedfe670835ff61b7019d61578b713dcba5cce79ef734868c9dda4855cfd92",
+      "observedAt": "2026-10-15T17:11:47Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10999
+    },
+    {
+      "path": "diagnostic-f0cedfe6-wsl-rerun1/wsl.json",
+      "sha256": "2c881206a81a39774c738fef0dcf744fa0ea30781ee9a7b64a82e25c859a84b3",
+      "sourceProducerSha256": "f0cedfe670835ff61b7019d61578b713dcba5cce79ef734868c9dda4855cfd92",
+      "observedAt": "2026-10-15T17:16:22Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10302
+    },
+    {
+      "path": "diagnostic-f0cedfe6-wsl-rerun1/windows.json",
+      "sha256": "7d9e68bd7a4ff9a56171a92b98e29e5618879cfebcc4f0c3f7ea6567b17a22b9",
+      "sourceProducerSha256": "f0cedfe670835ff61b7019d61578b713dcba5cce79ef734868c9dda4855cfd92",
+      "observedAt": "2026-10-15T17:09:48Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10364
+    },
+    {
+      "path": "diagnostic-f0cedfe6-wsl-rerun1/u12-cross-vendor-wsl.json",
+      "sha256": "b99d504db44fd7b5ac6f6dd6e03ef289d051561e10e44c506afc288cc4b6254a",
+      "sourceProducerSha256": "f0cedfe670835ff61b7019d61578b713dcba5cce79ef734868c9dda4855cfd92",
+      "observedAt": "2026-10-15T17:11:47Z",
+      "sourceGitBlobSha1": null,
+      "classification": "diagnostic",
+      "sizeBytes": 10999
+    }
+  ]
+}

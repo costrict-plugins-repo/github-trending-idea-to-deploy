@@ -1,0 +1,28 @@
+{
+  "$schema_version": "2.0",
+  "fixture_type": "orchestrator-stdout",
+  "skill_under_test": "/cross-review",
+  "status": "contract",
+  "description": "Cross-review is the explicit entry point to the one mandatory fresh opposite-GPT pre-PR producer. It freezes the exact candidate, preserves Sol -> Terra and Terra -> Sol, has no automatic provider fallback, and accepts success only through evidence-first Verification Loop adjudication.",
+  "skill_contract": {
+    "skill": "cross-review",
+    "required_sections": [
+      "Trigger phrases",
+      "Recommended model",
+      "Examples",
+      "Self-validation",
+      "Troubleshooting",
+      "Rules"
+    ],
+    "must_contain": [
+      "/cross-review",
+      "/review",
+      "itd_free_reviewer_producer.py",
+      "Sol -> Terra",
+      "Terra -> Sol",
+      "UNAVAILABLE",
+      "no caller bypass",
+      "Verification Loop"
+    ]
+  }
+}

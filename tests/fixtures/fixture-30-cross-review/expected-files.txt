@@ -1,0 +1,6 @@
+# No candidate source files are expected.
+#
+# /cross-review may create ignored exact-candidate prompts, reports, checker
+# receipts, and adjudication receipts below .itd-memory/verification-loop/.
+# Those artifacts must come from itd_free_reviewer_producer.py and the shared
+# Verification Loop; arbitrary project output is a contract violation.

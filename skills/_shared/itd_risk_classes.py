@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""itd_risk_classes.py — strict risk classes that force `riskTier=high` (G-001, v1.106.0).
+
+Audit 2026-09-22: the proportionality route exists, but 91% of units were opened as
+medium/high by habit, and nothing guaranteed `high` where it is non-negotiable. This
+module is the single reader of `strictClasses` in `PROPORTIONALITY_POLICY.json`:
+
+  * `load_strict_classes(policy)` — fail-closed: exactly the five classes
+    (money / prod-config / db-schema / auth / secrets), each with non-empty `keywords`,
+    non-empty `paths` and `tier: "high"`; anything else raises `StrictClassPolicyError`,
+    and the unit writer refuses to activate on a broken policy instead of guessing.
+  * `match_strict_class(goal, scope_text, classes)` — lexical floor, not a classifier.
+    Both the unit goal and the Allowed Change Areas section of `.itd/SCOPE_LOCK.md` are
+    matched against keywords AND path patterns. Keywords match as whole words bounded by
+    non-letters (case-insensitive; camelCase/ACRONYMWord are split and `_`/`-` become
+    spaces first, so `auth_service`, `OAuth2`, `AuthService`, `JWTBearer`, `access_token`,
+    `BOT_TOKEN` and `getApiKey` hit;
+    a trailing `*` makes a stem match, e.g. `оплат*`); path patterns match with `fnmatch`
+    against path-like tokens (anything with a `/` or a dot-extension, dotfiles included:
+    `.env`, `.env.example`, `app.prod.yaml`, `db/migrations/0004.sql`). The scope section is
+    `## Allowed Change Areas` or `## In scope` at any heading level and runs until a heading of
+    the same or a higher level; deeper sub-headings and fenced code stay inside it (a fence
+    closes only with the same delimiter character and at least the opening length).
+    Returns `(class, kind, pattern, where)` for the first hit in class order, else None.
+  * Tests-only scope (TIER-SOURCE-1, pilot PILOT-LOW-1): when the Allowed Change Areas are a
+    list of test paths only (`tests_only`, `is_test_path`) and the Current Task opens with the
+    unit being activated (`names_unit`), the goal text is not a source - it describes the module
+    under test, and the pilot measured the same module going low or high by wording alone.
+    Strict paths and keywords inside the areas still hit; a scope without any path, an item
+    with prose, a Current Task that does not open with the unit and a missing SCOPE_LOCK keep
+    the goal. `exempt_goal_hit` returns the goal hit that was set aside.
+  * Path-list scope (TIER-WORDING-2, owner decision 2026-10-01): the same holds when the items
+    are test paths or concrete files (`path_list`, `is_file_path`) - the tier of a change over
+    the same files must not follow the words of its goal. A directory, a glob, an extensionless
+    name (a dotfile without an extension included), a name with `..` and an extension outside
+    `_FILE_EXTS` are not concrete files: they may hold files the matcher never saw, so such a
+    scope keeps the goal. So does a SCOPE_LOCK outside the plain layout (`plain_scope_layout`):
+    `hooks/wip-gate.sh` reads an item the strict reader did not (`gate_items`), or a heading only
+    starts with a scope title.
+
+Only stdlib. Shared by `skills/task/scripts/itd_unit_log.py`; tests:
+`tests/verify_risk_tier_default.py`, `tests/verify_tier_source.py`, `tests/verify_tier_wording.py`.
+"""
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+from pathlib import Path
+
+REQUIRED_CLASSES = ("money", "prod-config", "db-schema", "auth", "secrets")
+FORCED_TIER = "high"
+# The scope section is recognised by heading text, not by exact bytes: any `#` level, an
+# optional trailing colon, and the two spellings the templates use (checker c7).
+_ALLOWED_HEADINGS = ("allowed change areas", "in scope")
+_CURRENT_TASK_HEADINGS = ("current task",)
+# A heading needs whitespace after the hashes (a shell comment `#run` is not one) and the
+# section ends only at a heading of the SAME or HIGHER level than the one that opened it, so
+# `### Backend` sub-sections stay inside `## Allowed Change Areas`; fenced code is skipped
+# (checker c8).
+_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})[ \t]+(.+?)\s*:?\s*$")
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+# Split on whitespace and the punctuation Markdown bullets wrap paths in; a token is
+# path-like when it carries a slash or a dot-extension (leading dot allowed).
+_SPLIT_RE = re.compile(r"[\s`'\"(),;:<>]+")
+_MARKUP_CHARS = "*[]!~|\\#=+"
+_SENTENCE_CHARS = ".?"
+_PATH_LIKE_RE = re.compile(r"\.[\w\-]+(?:\.[\w\-]+)*|[\w\-]+(?:\.[\w\-]+)+")
+# A keyword is bounded by non-letters: `_`, digits and punctuation end a word, so
+# `auth_service`, `payments_api` and `oauth2` hit while `unauthorized` does not.
+_LETTER = r"[^\W\d_]"
+# camelCase / PascalCase identifiers (AuthService, authStore.ts, getApiKey) are split at
+# every lower->Upper transition BEFORE lower-casing, otherwise the word boundary vanishes
+# and `auth` / `api key` never hit (checker c5).
+_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+# snake_case / kebab-case / SCREAMING_CASE identifiers (access_token, BOT_TOKEN, refresh-token)
+# become space-separated words so multi-word keywords such as `access token` hit (checker c6).
+_JOINER_RE = re.compile(r"[_\-]+")
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _words(text: str) -> str:
+    """Word-form of a text: camelCase and ACRONYMWord split, `_`/`-` joiners and any
+    whitespace run (tabs, double spaces, Markdown line wraps) -> one space, lowered."""
+    return _WS_RE.sub(" ", _JOINER_RE.sub(" ", _CAMEL_RE.sub(" ", text or ""))).lower()
+
+
+class StrictClassPolicyError(ValueError):
+    """The policy's strictClasses block is missing or malformed (fail-closed)."""
+
+
+def load_strict_classes(policy: dict) -> dict[str, dict]:
+    block = policy.get("strictClasses") if isinstance(policy, dict) else None
+    if not isinstance(block, dict):
+        raise StrictClassPolicyError("PROPORTIONALITY_POLICY.strictClasses is missing or not an object")
+    if set(block) != set(REQUIRED_CLASSES):
+        raise StrictClassPolicyError(
+            "strictClasses must contain exactly " + ", ".join(REQUIRED_CLASSES)
+            + f"; got {sorted(block)}")
+    out: dict[str, dict] = {}
+    for cls in REQUIRED_CLASSES:
+        spec = block[cls]
+        if not isinstance(spec, dict):
+            raise StrictClassPolicyError(f"strictClasses.{cls} must be an object")
+        for field in ("keywords", "paths"):
+            values = spec.get(field)
+            if (not isinstance(values, list) or not values
+                    or not all(isinstance(v, str) and v.strip() for v in values)):
+                raise StrictClassPolicyError(f"strictClasses.{cls}.{field} must be a non-empty list of strings")
+        if spec.get("tier") != FORCED_TIER:
+            raise StrictClassPolicyError(f"strictClasses.{cls}.tier must be '{FORCED_TIER}'")
+        out[cls] = {"keywords": [k.strip().lower() for k in spec["keywords"]],
+                    "paths": [p.strip().lower() for p in spec["paths"]],
+                    "tier": FORCED_TIER}
+    return out
+
+
+def _keyword_hit(keyword: str, text: str) -> bool:
+    if keyword.endswith("*"):
+        return re.search(r"(?<!" + _LETTER + ")" + re.escape(keyword[:-1]), text) is not None
+    return re.search(r"(?<!" + _LETTER + ")" + re.escape(keyword) + r"(?!" + _LETTER + ")",
+                     text) is not None
+
+
+_CLOSING_HASHES_RE = re.compile(r"[ \t]+#+[ \t]*$")
+
+
+def _heading_title(raw: str) -> str:
+    """Normalise an ATX heading title for the scope-section test: drop the optional closing
+    hash sequence (`## In scope ##`), inline presentation (`## **In scope**`, `_x_`,
+    backticks) and a trailing colon (PUB5 F3; CommonMark 4.2)."""
+    title = _CLOSING_HASHES_RE.sub("", raw.strip())
+    title = title.strip().strip("*_`~").strip()
+    title = title.rstrip(":").strip().strip("*_`~").strip()
+    return _WS_RE.sub(" ", title).lower()
+
+
+def allowed_areas(scope_text: str) -> str:
+    """Return the body of the `Allowed Change Areas` / `In scope` section of a SCOPE_LOCK.md
+    text ('' if absent); heading level and a trailing colon do not matter."""
+    return _section_body(scope_text, _ALLOWED_HEADINGS)
+
+
+def _section_body(scope_text: str, titles: tuple[str, ...]) -> str:
+    """Body of every section whose heading title is in `titles`, joined in order."""
+    if not scope_text:
+        return ""
+    out: list[str] = []
+    level = 0          # heading level that opened the section; 0 = not inside
+    fence = ""         # the delimiter that opened the current fence ("" = not fenced)
+    for line in scope_text.splitlines():
+        fm = _FENCE_RE.match(line)
+        # a backtick marker whose info string contains a backtick is inline code, not a
+        # fence (CommonMark; checker c17): `\`\`\`rm -rf\`\`\` is forbidden` opens nothing
+        if fm and not fence and fm.group(1)[0] == "`" and "`" in fm.group(2):
+            fm = None
+        if fm:
+            marker, rest = fm.group(1), fm.group(2)
+            if not fence:
+                fence = marker                      # open: remember char + length
+            elif marker[0] == fence[0] and len(marker) >= len(fence) and not rest.strip():
+                fence = ""                          # close: same char, not shorter, bare
+            # a mismatched marker or a marker with an info string (```text) inside a
+            # fence is fenced content, not a closer (CommonMark; PUB4 F3)
+            if level:
+                out.append(line)
+            continue
+        m = None if fence else _HEADING_RE.match(line)
+        if m:
+            depth = len(m.group(1))
+            title = _heading_title(m.group(2))
+            if title in titles:
+                if not level:
+                    level = depth                   # open a scope section
+                elif depth > level:
+                    out.append(line)                # nested `### In scope` is a sub-heading
+                else:
+                    level = depth                   # another scope section: union, never discard
+                continue
+            if level and depth <= level:
+                level = 0                           # section over; a later one may reopen
+                continue
+            if level:
+                out.append(line)      # a deeper sub-heading stays inside the section
+        elif level:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _strip_markup(tok: str) -> str:
+    """Drop Markdown presentation around a token: `**db/schema.rb**`, `[x.py]`, `~~old~~`,
+    `_italic/path_` (PUB3 F3). A leading `_` is kept unless the token is wrapped on both
+    sides, so `__init__.py` and `_config.yml` survive."""
+    # Markup and sentence punctuation nest in either order (`**x**.`, `.**x**`, `_x_?`),
+    # so strip both until the token is stable (checker c14).
+    while True:
+        before = tok
+        # a leading dot is a dotfile (`.env`), so sentence punctuation goes only from the right
+        tok = tok.strip(_MARKUP_CHARS).rstrip(_SENTENCE_CHARS)
+        while len(tok) > 2 and tok[0] == "_" and tok[-1] == "_":
+            tok = tok[1:-1]
+        if tok == before:
+            return tok
+
+
+def _path_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in _SPLIT_RE.split(text):
+        tok = _strip_markup(raw).lower()
+        if not tok:
+            continue
+        if "/" in tok or _PATH_LIKE_RE.fullmatch(tok):
+            out.append(tok)
+    return out
+
+
+def _path_hit(token: str, pattern: str) -> bool:
+    """fnmatch with a virtual leading slash so `*/k8s/*` also hits repo-root `k8s/x.yaml`
+    and `*/auth.py` hits a bare `auth.py` (checker c3 finding 1)."""
+    return fnmatch.fnmatchcase(token, pattern) or fnmatch.fnmatchcase("/" + token, pattern)
+
+
+# A test path has a test directory segment or a test file name; anything else (and any path
+# that escapes through `..`) is not one, so a scope with a single such token keeps the goal.
+_TEST_DIRS = frozenset({"tests", "test", "__tests__"})
+_TEST_FILES = ("test_*.py", "*_test.*", "*.test.*", "*.spec.*", "conftest.py")
+# a test file name counts only on a code file: `api.spec.yaml` is an OpenAPI document, not a test
+_CODE_EXTS = frozenset({"py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "rb", "java", "kt",
+                        "rs", "php", "cs", "swift", "vue", "svelte"})
+
+
+# a glued token (`tests/a.py|src/b.py`, `tests/a.py→src/b.py`) is not one path: only this ASCII
+# set - a Unicode letter such as U+3164 (invisible) or U+01C0 (looks like `|`) would let a line
+# read as two paths while the lexer sees one under tests/ (checker c3)
+_SAFE_PATH_RE = re.compile(r"[A-Za-z0-9_.\-/*?]+")
+
+
+def is_test_path(token: str) -> bool:
+    # the charset is checked on the raw token: Unicode strip()/lower() first would turn a padded
+    # `\xa0tests/x.py` or a Kelvin sign U+212A into ASCII and let them through (checker c4), and
+    # `\` is outside the set rather than rewritten to `/` (PUB1)
+    raw = token or ""
+    if not raw or not _SAFE_PATH_RE.fullmatch(raw):
+        return False
+    tok = raw.lower()
+    parts = tok.split("/")
+    if ".." in parts:
+        return False                # `tests/../src/x.py` is not under tests/
+    # a trailing slash names a directory: `tests/` is a test dir, not a file called `tests`
+    dirs = parts if tok.endswith("/") else parts[:-1]
+    if any(p in _TEST_DIRS for p in dirs):
+        return True
+    name = parts[-1]
+    return (name.rpartition(".")[2] in _CODE_EXTS
+            and any(fnmatch.fnmatchcase(name, p) for p in _TEST_FILES))
+
+
+_LIST_ITEM_RE = re.compile(r"^\s{0,12}(?:[-*+]|\d{1,9}[.)])\s+")
+# A tests-only line is a whitelist, not a lexer (owner decision 2026-09-26, after the stop rule
+# fired on c2): one list item, one path (optionally in a code span), an optional `(new)` or
+# `(updated)` and nothing else. Prose, a second path, markup, a continuation line, a sub-heading
+# or a fence is not in the grammar, so the goal stays a source.
+_TEST_ITEM_RE = re.compile(
+    r"^[ \t]{0,12}(?:[-*+]|\d{1,9}[.)])[ \t]+(`?)([^\s`]+)\1(?:[ \t]+\((?:new|updated)\))?[ \t]*$",
+    re.IGNORECASE | re.ASCII)
+
+
+def tests_only(areas: str) -> bool:
+    """True when every non-blank line of the Allowed Change Areas matches `_TEST_ITEM_RE` and
+    names a test path (`is_test_path`); an empty scope never is tests-only (not vacuous)."""
+    found = False
+    for line in (areas or "").splitlines():
+        if not line.strip():
+            continue
+        m = _TEST_ITEM_RE.match(line)
+        if not m or not is_test_path(m.group(2)):
+            return False                    # any other line keeps the goal as a source
+        found = True
+    return found
+
+
+# A non-test item of a path list names one concrete file (TIER-WORDING-2): the same ASCII set as a
+# test path, no wildcard, no `..` segment, and a file name with a stem and an extension of this
+# closed set. A directory (`src/`, `src/fx`), a glob (`src/*`), an extensionless name
+# (`Dockerfile`; a dotfile without an extension - `.gitignore`, `.github`) or another extension
+# (`conf.d`) may be a container of files the matcher never saw, so such an item keeps the goal
+# as a source. `..` is refused anywhere in the token, not only as a segment: `_path_tokens` does
+# not read a slash-less `x..sql` as a path, so no strict path pattern would see it (review r1).
+_FILE_EXTS = _CODE_EXTS | frozenset({
+    "md", "rst", "txt", "json", "jsonl", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml", "csv",
+    "sh", "bash", "ps1", "bat", "cmd", "sql", "html", "htm", "css", "scss", "sass", "less",
+    "c", "h", "cc", "cpp", "hpp", "m", "scala", "dart", "ex", "exs", "lua", "pl", "r", "lock"})
+
+
+def is_file_path(token: str) -> bool:
+    # the raw token is tested, as in is_test_path: no strip, no lower, no `\` rewrite
+    path = token or ""
+    if not _SAFE_PATH_RE.fullmatch(path) or "*" in path or "?" in path:
+        return False
+    if ".." in path:
+        return False                # `src/../payments/x.py`, `x..sql`
+    stem, dot, ext = path.rpartition("/")[2].rpartition(".")
+    return bool(stem and dot) and ext.lower() in _FILE_EXTS
+
+
+def path_list(areas: str) -> bool:
+    """True when every non-blank line of the Allowed Change Areas matches `_TEST_ITEM_RE` and names
+    a test path (`is_test_path`) or one concrete file (`is_file_path`); an empty scope never is a
+    path list (not vacuous)."""
+    found = False
+    for line in (areas or "").splitlines():
+        if not line.strip():
+            continue
+        m = _TEST_ITEM_RE.match(line)
+        if not m or not (is_test_path(m.group(2)) or is_file_path(m.group(2))):
+            return False            # a line outside the grammar keeps the goal as a source
+        found = True
+    return found
+
+
+def names_unit(scope_text: str, unit_id: str) -> bool:
+    """The first line of the Current Task section opens with the unit id as a whole token
+    (`- U-3: ...`; `U-3` does not match `U-12`, `XU-3` or `U-3.5`). A mention anywhere else - a
+    title, Forbidden, "follow-up of U-3" - does not bind a stale scope to a new unit."""
+    if not unit_id:
+        return False
+    for line in _section_body(scope_text, _CURRENT_TASK_HEADINGS).splitlines():
+        if line.strip():
+            head = _LIST_ITEM_RE.sub("", line, count=1).lstrip(" \t*_`[")
+            return re.match(re.escape(unit_id) + r"(?![\w\-]|\.\w)", head) is not None
+    return False
+
+
+# What `hooks/wip-gate.sh` opens as the allowed section: a stripped line that starts with `## `
+# and, lower-cased, with this prefix. The hook is the one other machine reader of the section.
+_GATE_SCOPE_PREFIX = "## allowed change areas"
+_SETEXT_UNDERLINE_RE = re.compile(r"^\s{0,3}(?:=+|-+)\s*$")
+
+
+def gate_items(scope_text: str) -> list[str]:
+    """The Allowed Change Areas item lines as `hooks/wip-gate.sh` (`allowed_areas`) reads them:
+    a stripped line that starts with `## ` toggles the section (open when it starts with
+    `## allowed change areas` in any case), a stripped `- ` line inside it is an item. No fences,
+    no indent limit, no other heading level: this mirrors the hook, it is not Markdown."""
+    items: list[str] = []
+    inside = False
+    for line in (scope_text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            inside = stripped.lower().startswith(_GATE_SCOPE_PREFIX)
+        elif inside and stripped.startswith("- "):
+            items.append(stripped)
+    return items
+
+
+def plain_scope_layout(scope_text: str) -> bool:
+    """Fail-closed guard of the exemption: the strict reader must have seen everything another
+    reader takes for the allowed scope (review r1, checker c1; BACKLOG P2 2026-09-26).
+
+    1. Containment: every item line the hook reads (`gate_items`) is a line of the section the
+       strict reader read. Whatever opens a section for the hook only - a suffixed heading
+       (`## Allowed Change Areas (continued)`), a `# Notes` that ends the section here but not
+       there, a heading indented by four spaces, a heading inside a fence - hides nothing.
+    2. Titles a person reads as scope but no reader opens: an ATX heading whose title only starts
+       with a scope title (`### In scope for the backend`) and a setext heading with such a title.
+       Fences are not tracked for this rule, so such a line inside one only keeps the goal."""
+    text = scope_text or ""
+    seen = {line.strip() for line in allowed_areas(text).splitlines()}
+    if any(item not in seen for item in gate_items(text)):
+        return False                # the hook reads an item the strict reader did not
+    previous = ""
+    for line in text.splitlines():
+        m = _HEADING_RE.match(line)
+        if m:
+            title = _heading_title(m.group(2))
+            if title not in _ALLOWED_HEADINGS and title.startswith(_ALLOWED_HEADINGS):
+                return False        # a scope-titled heading the strict reader does not open
+        elif (_SETEXT_UNDERLINE_RE.match(line)
+              and _heading_title(previous).startswith(_ALLOWED_HEADINGS)):
+            return False            # a setext scope heading is not opened either
+        previous = line
+    return True
+
+
+def path_list_scope(scope_text: str, unit_id: str) -> bool:
+    """Precondition of the goal exemption: path-list Allowed Change Areas in a plain-layout
+    SCOPE_LOCK that opens its Current Task with the unit being activated. SCOPE_LOCK is not
+    bound to a unit (ADR-011): a stale scope of the previous unit may only raise a tier, so
+    without the unit id the goal stays a source."""
+    return (path_list(allowed_areas(scope_text or "")) and plain_scope_layout(scope_text)
+            and names_unit(scope_text, unit_id))
+
+
+def exempt_goal_hit(goal: str, scope_text: str, classes: dict[str, dict], unit_id: str = ""):
+    """The strict-class hit in the goal that a path-list scope set aside, else None."""
+    if not path_list_scope(scope_text, unit_id):
+        return None
+    return match_strict_class(goal, "", classes)
+
+
+def match_strict_class(goal: str, scope_text: str, classes: dict[str, dict], unit_id: str = ""):
+    areas = allowed_areas(scope_text or "")
+    if path_list_scope(scope_text, unit_id):
+        goal = ""       # the listed paths are the change; the goal only describes it
+    # keywords see camel-split words; path patterns see the raw lower-cased tokens
+    goal_plain = (goal or "").lower()
+    areas_plain = areas.lower()
+    # both forms are tried: the camel-split one finds `AuthService`, the plain one keeps
+    # brand names such as `YooKassa` whole
+    goal_l = _words(goal) + "\n" + goal_plain
+    areas_l = _words(areas) + "\n" + areas_plain
+    goal_paths = _path_tokens(goal_plain)
+    scope_paths = _path_tokens(areas_plain)
+    for cls in REQUIRED_CLASSES:
+        spec = classes.get(cls) or {}
+        for kw in spec.get("keywords", ()):
+            if _keyword_hit(kw, goal_l):
+                return (cls, "keyword", kw, "goal")
+            if _keyword_hit(kw, areas_l):
+                return (cls, "keyword", kw, "SCOPE_LOCK")
+        for pattern in spec.get("paths", ()):
+            for tok in goal_paths:
+                if _path_hit(tok, pattern):
+                    return (cls, "path", pattern, "goal")
+            for tok in scope_paths:
+                if _path_hit(tok, pattern):
+                    return (cls, "path", pattern, "SCOPE_LOCK")
+    return None
+
+
+def read_scope_lock(mem_dir: Path) -> str:
+    """SCOPE_LOCK.md lives next to the memory dir: <project>/.itd/SCOPE_LOCK.md.
+
+    A missing file is an empty scope (legitimate); an EXISTING file that cannot be read or
+    decoded is a safety input that failed - fail closed instead of silently matching nothing.
+    """
+    path = Path(mem_dir).resolve().parent / ".itd" / "SCOPE_LOCK.md"
+    # lexists: a dangling or looping symlink still IS an entry the owner put there - a
+    # failure to read it must not degrade into "no scope" (checker c12)
+    if not os.path.lexists(path):
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StrictClassPolicyError(f"{path} exists but cannot be read as UTF-8 text: {exc}") from exc
+
+
+def describe(hit) -> str:
+    cls, kind, pattern, where = hit
+    return f"strict class '{cls}' matched {kind} '{pattern}' in {where}"

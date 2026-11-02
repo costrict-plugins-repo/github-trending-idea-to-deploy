@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+PreToolUse hook on Bash — Definition-of-Done gate (v1.23.0, Layer 1).
+
+Fires before every Bash invocation. If the command is , it
+inspects the staged diff for HIGH-RISK signals and BLOCKS the commit
+(decision: deny, exit 2) when the matching idea-to-deploy skill was NOT
+run in this session:
+
+  migration / schema / DDL   -> requires /migrate AND /test
+  payments / auth / secrets  -> requires /security-audit
+  agent context / memory     -> requires /security-audit
+  brand-new source file with
+    no test file staged       -> requires /test
+
+This GENERALISES check-review-before-commit.sh (which owns the
+">2 files -> /review" rule) to the other risk signals. The >2-files rule
+is intentionally NOT duplicated here.
+
+`/test` and `/migrate` completion is detected via per-session sentinels with a
+legacy fresh fallback for hosts that do not preserve a session id.
+`/security-audit` is status-aware and marker-free: the gate asks
+`itd_review_cache.py` for an accepted security verdict whose complete context
+still matches the current staged candidate.
+
+Escape hatch (narrow, logged): include  in the commit
+message. The signal set is deliberately NARROW to avoid alarm fatigue —
+ordinary edits never trip this gate.
+
+Reads JSON on stdin: {"tool_name": "Bash", "tool_input": {"command": "..."}}
+"""
+from __future__ import annotations
+
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+GIT_COMMIT_RE = re.compile(r"(^|\s|;|&&|\|\|)git\s+commit(\s|$)")
+SENTINEL_FRESHNESS_SECONDS = 900  # 15 min
+CACHE_SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "skills" / "review" / "scripts" / "itd_review_cache.py"
+)
+
+# --- risk-signal patterns (matched against staged file PATHS only) ---
+MIGRATION_RE = re.compile(r"(^|/)migrations?/|\.sql$|schema\.prisma$|(^|/)alembic/", re.I)
+MONEY_AUTH_RE = re.compile(
+    r"(payment|payout|billing|invoice|\bbank\b|\bwallet\b|"
+    r"\bauth(?:n|z|entication|orization)?\b|oauth|\bjwt\b|\blogin\b|"
+    r"\bpasswords?\b|passwd|\bsecrets?\b|\btokens?\b|\bcredentials?\b|crypto)",
+    re.I,
+)
+# --- agent context / long-term memory files (Day-3 context-engineering, v1.32.0) ---
+# Files that feed an AI/agent context window or its durable memory: an unreviewed
+# write here is a context-integrity / memory-poisoning surface (review C-code-7).
+# Async/out-of-band memory writers especially must not land unreviewed (ADR-001).
+# Scoped to AGENT memory/context artifacts; ordinary docs/config never match.
+MEMORY_RE = re.compile(
+    r"(^|/)(agent[_-]?memory|long[_-]?term[_-]?memory|memor(?:y|ies)[_-]?store|"
+    r"vector[_-]?(?:store|db)|embeddings?[_-]?store|context[_-]?(?:store|window)|"
+    r"system[_-]?prompts?|prompt[_-]?templates?|rag[_-]?(?:index|pipeline)|"
+    r"retriev(?:er|al))[\w./-]*\.(py|js|jsx|ts|tsx|go|rb|java|rs|json|ya?ml|toml)$",
+    re.I,
+)
+
+# Source extensions whose BRAND-NEW files should ship with a test.
+# Shell/infra scripts deliberately excluded — rarely unit-tested here,
+# and excluding them keeps the gate from blocking its own hook commits.
+SOURCE_EXT_RE = re.compile(
+    r"\.(py|js|jsx|ts|tsx|go|rb|java|rs|php|c|cc|cpp|cs|kt|kts|swift|scala|ex|exs)$",
+    re.I,
+)
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|spec|__tests__)/|\.(test|spec)\.|(^|/)test_|_test\.", re.I
+)
+
+
+def session_id() -> str:
+    # Mirrors check-review-before-commit.sh: the getppid() fallback is
+    # unreliable across hook spawns, but sentinel_present()'s fresh-glob
+    # fallback (any matching sentinel < 15 min) is the real cross-session
+    # mechanism — an exact session match is a fast-path bonus, not required.
+    return os.environ.get("CLAUDE_SESSION_ID") or str(os.getppid())
+
+
+def sentinel_present(skill: str) -> bool:
+    """True if a claude-<skill>-done sentinel exists for this session, or
+    for legacy test/migrate signals any fresh one (< 15 min).
+
+    Security is deliberately absent from this compatibility path; its gate
+    reads the exact-context cache directly through security_review_was_done().
+    """
+    sid = session_id()
+    explicit_session = bool(os.environ.get("CLAUDE_SESSION_ID"))
+    dirs = []
+    for d in ("/tmp", tempfile.gettempdir()):
+        if d and d not in dirs:
+            dirs.append(d)
+    cutoff = time.time() - SENTINEL_FRESHNESS_SECONDS
+    for d in dirs:
+        exact = os.path.join(d, "claude-%s-done-%s" % (skill, sid))
+        if os.path.exists(exact):
+            return True
+        if explicit_session:
+            continue
+        for p in glob.glob(os.path.join(d, "claude-%s-done-*" % skill)):
+            try:
+                if os.path.getmtime(p) > cutoff:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def security_review_was_done() -> bool:
+    """Fail closed unless an accepted security verdict matches this candidate."""
+    try:
+        loader = importlib.machinery.SourceFileLoader(
+            "itd_security_review_cache_gate", str(CACHE_SCRIPT))
+        spec = importlib.util.spec_from_loader(
+            "itd_security_review_cache_gate", loader)
+        if spec is None:
+            return False
+        module = importlib.util.module_from_spec(spec)
+        # Never leave bytecode next to the loaded validator: when it resolves to
+        # the installed content-addressed runtime, a stray .pyc blocks the next
+        # reinstall ("installed runtime directory inventory drifted").
+        previous = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            loader.exec_module(module)
+        finally:
+            sys.dont_write_bytecode = previous
+        return bool(module.cache_allows(Path.cwd(), kind="security"))
+    except Exception:
+        return False
+
+
+def staged_entries() -> list:
+    """Return [(status, path)] for staged entries (status A/M/D/R...)."""
+    try:
+        res = subprocess.run(
+            ["git", "diff", "--cached", "--name-status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if res.returncode != 0:
+            return []
+        out = []
+        for line in res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                out.append((parts[0].strip(), parts[-1].strip()))
+        return out
+    except Exception:
+        return []
+
+
+def required_skills(entries: list) -> dict:
+    """Map required skill -> human reason, from staged risk signals."""
+    paths = [p for _s, p in entries]
+    req = {}
+
+    if any(MIGRATION_RE.search(p) for p in paths):
+        req["migrate"] = "изменение схемы/миграции БД в staged diff"
+        req.setdefault("test", "изменение схемы/миграции требует тестов")
+
+    if any(MONEY_AUTH_RE.search(p) for p in paths):
+        req["security-audit"] = "затронуты платежи/auth/секреты (путь файла)"
+
+    if any(MEMORY_RE.search(p) for p in paths):
+        req.setdefault(
+            "security-audit",
+            "AI-агент: файл контекста/долговременной памяти (context-integrity)",
+        )
+
+    new_src = [
+        p for s, p in entries
+        if s.startswith("A") and SOURCE_EXT_RE.search(p) and not TEST_PATH_RE.search(p)
+    ]
+    has_test = any(TEST_PATH_RE.search(p) for p in paths)
+    if new_src and not has_test:
+        req.setdefault("test", "новый код-файл без парного теста: %s" % new_src[0])
+
+    return req
+
+
+def run_project_checks(entries: list) -> tuple:
+    """First-class слот project-level проверок (v1.87.0, retro сет-3 упр.2).
+
+    Если в корне проекта есть .itd/checks/ — прогнать раннер
+    skills/_shared/itd_project_checks.sh на staged-файлах. Нет каталога /
+    раннера / sh — no-op (opt-in слот, best-effort invariant: исчезнувшая
+    фича деградирует в нейтральный путь, не в ложный "green").
+    Bypass — тот же SKILL_BYPASS в description (проверен выше по main).
+    """
+    if not os.path.isdir(os.path.join(".itd", "checks")):
+        return 0, ""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(os.path.dirname(here), "skills", "_shared", "itd_project_checks.sh"),
+        os.path.expanduser("~/.claude/skills/_shared/itd_project_checks.sh"),
+    ]
+    runner = next((c for c in candidates if os.path.isfile(c)), None)
+    if runner is None:
+        return 0, ""
+    files = [p for _, p in entries]
+    try:
+        res = subprocess.run(
+            ["sh", runner, "--files"] + files,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120,
+        )
+        return res.returncode, (res.stdout or "") + (res.stderr or "")
+    except Exception:
+        return 0, ""  # best-effort: сломанный раннер не блокирует коммит молча-ложно
+
+
+def emit_deny_project_checks(output: str) -> None:
+    msg = (
+        "[DoD GATE] Коммит заблокирован: project-level проверки (.itd/checks/) красные.\n\n"
+        + output.strip()[-1500:]
+        + "\n\nДействия:\n"
+        "  1. Почини по FIX-подсказкам выше и повтори git commit.\n"
+        "  2. Осознанный обход: 'SKILL_BYPASS: <причина>' в description Bash-вызова коммита.\n"
+    )
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": msg,
+        }
+    }
+    sys.stdout.write(json.dumps(out, ensure_ascii=False))
+    sys.stderr.write(msg)
+    sys.exit(2)
+
+
+def emit_deny(missing: dict) -> None:
+    lines = "\n".join("  ❌ /%s — %s" % (s, r) for s, r in missing.items())
+    msg = (
+        "[DoD GATE] Коммит заблокирован.\n"
+        "WHY: рисковые изменения подготовлены без обязательного скилла.\n"
+        "FIX: запусти перечисленные скиллы и повтори commit.\n\n"
+        + lines
+        + "\n\nДействия:\n"
+        "  1. Запусти нужный скилл (он отметит выполнение), затем повтори git commit.\n"
+        "  2. Осознанный обход: добавь 'SKILL_BYPASS: <причина>' в поле description Bash-вызова коммита.\n\n"
+        "Гейт узкий (миграции / деньги / новый код без теста) — это не шум, "
+        "а Definition of Done. См. CHANGELOG v1.23.0."
+    )
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": msg,
+        }
+    }
+    sys.stdout.write(json.dumps(out, ensure_ascii=False))
+    sys.stderr.write(msg)
+    sys.exit(2)
+
+
+def task_contract_advisory(payload: dict) -> str | None:
+    """Sprint Contract per-задача (v1.88.0, GP-003) — ADVISORY, не гейт.
+
+    Если в проекте есть активный юнит (.itd-memory/GOAL.json in_progress или
+    STATE.json currentUnit), а контракта задачи .itd-memory/contracts/<id>.md
+    нет — вернуть однострочное предупреждение (additionalContext). Контракт =
+    Scope / Verification Standards / Exclusions, шаблон
+    docs/templates/itd/TASK_CONTRACT.md. Без .itd-memory/ — молча None
+    (opt-in, ceremonial-шум не растёт: одна строка и только на git commit).
+    """
+    try:
+        root = payload.get("cwd") or os.getcwd()
+        mem = os.path.join(root, ".itd-memory")
+        if not os.path.isdir(mem):
+            return None
+        unit_id = None
+        gp = os.path.join(mem, "GOAL.json")
+        if os.path.isfile(gp):
+            try:
+                with open(gp, encoding="utf-8") as f:
+                    g = json.load(f)
+                for u in g.get("units", []):
+                    if u.get("status") == "in_progress":
+                        unit_id = u.get("id")
+                        break
+            except Exception:
+                pass
+        if not unit_id:
+            sp = os.path.join(mem, "STATE.json")
+            if os.path.isfile(sp):
+                try:
+                    with open(sp, encoding="utf-8") as f:
+                        st = json.load(f)
+                    cu = st.get("currentUnit") or {}
+                    if cu.get("status") in ("in_progress", "active", "verifying"):
+                        unit_id = cu.get("id")
+                except Exception:
+                    pass
+        if not unit_id:
+            return None
+        contract = os.path.join(mem, "contracts", f"{unit_id}.md")
+        if os.path.isfile(contract):
+            return None
+        return (
+            f"[TASK-CONTRACT] У активного юнита {unit_id} нет контракта задачи "
+            f"(.itd-memory/contracts/{unit_id}.md: Scope / Verification Standards / "
+            "Exclusions, шаблон docs/templates/itd/TASK_CONTRACT.md). Advisory — "
+            "коммит не блокируется, но оценщик без контракта судит по общим правилам."
+        )
+    except Exception:
+        return None
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0
+    if (payload or {}).get("tool_name") != "Bash":
+        return 0
+    tool_input = payload.get("tool_input") or {}
+    cmd = tool_input.get("command") or ""
+    if not GIT_COMMIT_RE.search(cmd):
+        return 0
+    # Explicit bypass only via the human-visible Bash `description` field —
+    # never the raw command string, which can carry a crafted "SKILL_BYPASS:"
+    # in a path or commit message (mirrors check-tool-skill.sh). When used,
+    # check-tool-skill.sh records it in the per-session bypass ledger.
+    if "SKILL_BYPASS:" in (tool_input.get("description") or ""):
+        return 0
+
+    entries = staged_entries()
+    if not entries:
+        return 0
+    req = required_skills(entries)
+    missing = {
+        skill: reason for skill, reason in req.items()
+        if not (security_review_was_done()
+                if skill == "security-audit" else sentinel_present(skill))
+    }
+    if missing:
+        emit_deny(missing)
+        return 2  # unreachable
+
+    rc_pc, out_pc = run_project_checks(entries)
+    if rc_pc != 0:
+        emit_deny_project_checks(out_pc)
+        return 2  # unreachable
+
+    ctx = task_contract_advisory(payload)
+    if ctx:
+        sys.stdout.write(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": ctx,
+            }
+        }, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

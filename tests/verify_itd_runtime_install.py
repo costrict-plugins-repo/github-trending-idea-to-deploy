@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""Regression oracle for the content-bound installed ITD runtime."""
+from __future__ import annotations
+
+import importlib.util
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+CHECKS = 0
+
+
+def load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+runtime = load(
+    "itd_install_runtime_test", SCRIPTS / "itd_install_runtime.py"
+)
+cli = load("itd_install_cli_runtime_test", SCRIPTS / "itd_install_cli.py")
+hooks = load(
+    "itd_install_git_hooks_runtime_test",
+    SCRIPTS / "itd_install_git_hooks.py",
+)
+
+
+def check(value: bool, label: str) -> None:
+    global CHECKS
+    CHECKS += 1
+    if not value:
+        raise AssertionError(label)
+
+
+def runtime_inventory(root: Path) -> dict[str, str]:
+    """Closed runtime inventory, including any unexpected files/directories."""
+    inventory: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        # A link is its own entry kind: following it would report a directory
+        # symlink as the directory and a file symlink as its target's hash,
+        # so a namespace/type mutation would look byte-for-byte unchanged.
+        is_junction = getattr(path, "is_junction", None)
+        if path.is_symlink() or (os.name == "nt" and is_junction is not None and is_junction()):
+            inventory[relative] = "link:" + os.readlink(path)
+        elif path.is_dir():
+            inventory[relative + "/"] = "directory"
+        elif path.is_file():
+            inventory[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            inventory[relative] = "special"
+    return inventory
+
+
+def rejects(fn, label: str) -> None:
+    global CHECKS
+    CHECKS += 1
+    try:
+        fn()
+    except runtime.RuntimeInstallError:
+        return
+    raise AssertionError(label)
+
+
+def rejects_naming(fn, needles: tuple[str, ...], label: str) -> None:
+    """Refusal must name the offending path and a FIX, not just say 'drifted'."""
+    global CHECKS
+    CHECKS += 1
+    try:
+        fn()
+    except runtime.RuntimeInstallError as exc:
+        message = str(exc)
+        if all(needle in message for needle in needles):
+            return
+        raise AssertionError(f"{label}: {message}") from None
+    raise AssertionError(label)
+
+
+def source_fixture(root: Path) -> Path:
+    source = root / "source"
+    for relative in runtime.RUNTIME_FILES:
+        target = source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if relative in {
+            ".codex-plugin/plugin.json", ".claude-plugin/plugin.json",
+        }:
+            target.write_text(json.dumps({
+                "name": "idea-to-deploy", "version": "1.100.0",
+            }) + "\n", encoding="utf-8")
+        else:
+            target.write_text(f"fixture:{relative}\n", encoding="utf-8")
+    return source
+
+
+HOOKS_LOADING_INSTALLED_MODULES = (
+    ("check-review-before-commit.sh", "load_cache_module"),
+    ("check-dod-before-commit.sh", "security_review_was_done"),
+    ("pii-egress-guard.sh", "load_external_gate"),
+)
+
+# A hook runs from its own shebang, so the interpreter writes bytecode unless the
+# hook forbids it. When the loaded module lives in the installed runtime, that
+# .pyc lands INSIDE the content-addressed directory and the next reinstall dies
+# on "installed runtime directory inventory drifted" (measured 2026-08-29:
+# skills/review/scripts/__pycache__/itd_review_cache.cpython-312.pyc, 39 files
+# against 38 in the manifest). The guarantee is behavioural: loading a module
+# out of a runtime-shaped directory must leave that directory byte-identical.
+BYTECODE_PROBE = """
+import importlib.machinery, importlib.util, sys
+target = sys.argv[1]
+loader = importlib.machinery.SourceFileLoader("itd_bytecode_probe", target)
+spec = importlib.util.spec_from_loader("itd_bytecode_probe", loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+"""
+
+
+def bytecode_written_by(
+    source: str, module_path: Path, directory: Path,
+    *, environment: dict[str, str] | None = None, isolated: bool = True,
+) -> bool:
+    """Run `source` in a child WITHOUT -B and report whether it left bytecode."""
+    for stale in directory.rglob("__pycache__"):
+        for item in stale.iterdir():
+            item.unlink()
+        stale.rmdir()
+    result = subprocess.run(
+        [sys.executable, *(["-I"] if isolated else []),
+         "-X", "utf8", "-c", source, str(module_path)],
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        check=False, cwd=str(directory), env=environment,
+    )
+    if result.returncode:
+        raise AssertionError(f"bytecode probe failed: {result.stderr}")
+    return bool(list(directory.rglob("__pycache__")))
+
+
+def direct_launch_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    # Ordinary children do not have -I: import paths, startup customizations,
+    # optimization and cache redirection from the host can mask a missing guard.
+    for name in tuple(environment):
+        if name.upper().startswith("PYTHON"):
+            environment.pop(name)
+    return environment
+
+
+def verify_direct_environment() -> None:
+    """An ambient startup customization must not turn the cache oracle green."""
+    with tempfile.TemporaryDirectory(prefix="itd-direct-env-") as raw:
+        root = Path(raw).resolve()
+        probe_root = root / "runtime"
+        module_path = probe_root / "skills" / "probe.py"
+        module_path.parent.mkdir(parents=True)
+        module_path.write_text("VALUE = 1\n", encoding="utf-8")
+        ambient = root / "ambient"
+        ambient.mkdir()
+        marker = ambient / "startup-loaded"
+        (ambient / "sitecustomize.py").write_text(
+            "import sys\nsys.dont_write_bytecode = True\n"
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).touch()\n",
+            encoding="utf-8",
+        )
+        pollution = {
+            "PYTHONPATH": str(ambient), "PYTHONHOME": sys.base_prefix,
+            "PYTHONUSERBASE": str(ambient / "userbase"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(ambient / "redirected-cache"),
+            "ITD_DIRECT_ENV_SENTINEL": "retained",
+        }
+        with mock.patch.dict(os.environ, pollution):
+            legacy = os.environ.copy()
+            for name in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"):
+                legacy.pop(name, None)
+            check(
+                not bytecode_written_by(
+                    BYTECODE_PROBE, module_path, probe_root,
+                    environment=legacy, isolated=False,
+                ) and marker.exists(),
+                "legacy child environment can mask an unguarded bytecode write",
+            )
+            marker.unlink()
+            clean = direct_launch_environment()
+            check(
+                not any(name.upper().startswith("PYTHON") for name in clean),
+                "direct child environment excludes Python startup/import overrides",
+            )
+            check(
+                clean.get("ITD_DIRECT_ENV_SENTINEL") == "retained"
+                and clean.get("PATH") == os.environ.get("PATH"),
+                "direct child environment preserves non-Python host settings",
+            )
+            check(
+                bytecode_written_by(
+                    BYTECODE_PROBE, module_path, probe_root,
+                    environment=clean, isolated=False,
+                ) and not marker.exists(),
+                "clean direct launch detects the unguarded write despite ambient masking",
+            )
+            check(
+                os.environ["PYTHONPATH"] == str(ambient),
+                "child environment sanitization does not mutate the parent environment",
+            )
+
+
+def verify_direct_entrypoints(installed_root: Path) -> None:
+    """Direct callers must not need wrapper flags to keep the snapshot closed."""
+    before = runtime_inventory(installed_root)
+    environment = direct_launch_environment()
+    entries = (
+        ("scripts/itd.py", ["--help"], 0, "{gate,pr}"),
+        ("scripts/itd_pre_push.py", [], 1, "BLOCKED:"),
+        ("scripts/itd_machine_oracle.py", ["--help"], 0, "usage:"),
+        ("skills/_shared/itd_verification_loop.py", ["--help"], 0, "usage:"),
+    )
+    for flags in ([], ["-I"]):
+        for relative, arguments, expected_exit, expected_text in entries:
+            result = subprocess.run(
+                [sys.executable, *flags, "-X", "utf8",
+                 str(installed_root / relative), *arguments],
+                input="", capture_output=True, text=True, encoding="utf-8",
+                timeout=30, check=False, env=environment, cwd=installed_root,
+            )
+            label = f"direct {relative} flags={flags or 'ordinary'}"
+            check(
+                result.returncode == expected_exit
+                and expected_text in result.stdout + result.stderr,
+                f"{label} preserves its real exit/output: {result.stderr}",
+            )
+            check(
+                runtime_inventory(installed_root) == before,
+                f"{label} without -B leaves whole runtime inventory unchanged",
+            )
+        # --help does not load lazy broker or exact-context dependencies.
+        # run_path executes the entrypoint without an importing loader caching
+        # that entrypoint itself before its first instruction can run.
+        probe = (
+            "import pathlib,runpy,sys; root=pathlib.Path(sys.argv[1]); "
+            "loop=runpy.run_path(str(root/'skills/_shared/itd_verification_loop.py')); "
+            "loop['_review_cache_module'](); "
+            "producer=runpy.run_path(str(root/'skills/_shared/itd_free_reviewer_producer.py')); "
+            "assert producer['review_broker'].__name__ == 'itd_review_broker'; "
+            "assert sys.dont_write_bytecode; print('lazy runtime imports passed')"
+        )
+        result = subprocess.run(
+            [sys.executable, *flags, "-X", "utf8", "-c", probe, str(installed_root)],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            check=False, env=environment, cwd=installed_root,
+        )
+        check(
+            result.returncode == 0 and "lazy runtime imports passed" in result.stdout,
+            f"direct lazy/path-loaded dependencies without -B execute: {result.stderr}",
+        )
+        check(
+            runtime_inventory(installed_root) == before,
+            "lazy/path-loaded imports without -B leave whole runtime inventory unchanged",
+        )
+
+
+def main() -> int:
+    verify_direct_environment()
+    for hook_name, symbol in HOOKS_LOADING_INSTALLED_MODULES:
+        hook_source = (ROOT / "hooks" / hook_name).read_text(encoding="utf-8")
+        check(
+            symbol in hook_source,
+            f"{hook_name} still loads an installed module through {symbol}",
+        )
+        check(
+            "sys.dont_write_bytecode" in hook_source,
+            f"{hook_name} forbids bytecode writes around the installed module load",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="itd-bytecode-") as raw:
+        probe_root = Path(raw).resolve()
+        module_path = probe_root / "skills" / "review" / "scripts" / "probe_mod.py"
+        module_path.parent.mkdir(parents=True)
+        module_path.write_text("VALUE = 1\n", encoding="utf-8")
+        # The unguarded loader is the defect: it proves the probe detects the
+        # failure mode, so the guarded assertion below cannot pass vacuously.
+        check(
+            bytecode_written_by(BYTECODE_PROBE, module_path, probe_root),
+            "the probe detects bytecode written by an unguarded module load",
+        )
+        check(
+            not bytecode_written_by(
+                "import sys\nsys.dont_write_bytecode = True\n" + BYTECODE_PROBE,
+                module_path, probe_root,
+            ),
+            "forbidding bytecode keeps the runtime-shaped directory unchanged",
+        )
+
+    actual_shared = {
+        path.name for path in (ROOT / "skills" / "_shared").iterdir()
+        if path.is_file() and path.suffix in {".py", ".json"}
+    }
+    check(
+        actual_shared == set(runtime.RUNTIME_SHARED_FILES),
+        "runtime declares every shared Python/policy file exactly",
+    )
+    check(
+        runtime.RUNTIME_SKILL_FILES
+        == (
+            "skills/review/scripts/itd_review_cache.py",
+            "skills/review/SKILL.md",
+            "skills/review/references/review-checklist.md",
+            "skills/review/references/meta-review-checklist.md",
+        ),
+        "runtime declares the complete exact-context review dependency set",
+    )
+    with tempfile.TemporaryDirectory(prefix="itd-runtime-install-") as raw:
+        root = Path(raw).resolve()
+        source = source_fixture(root)
+        parent = root / "runtime"
+
+        preview = runtime.install_runtime(
+            source_root=source, runtime_parent=parent, apply=False
+        )
+        runtime_root = Path(preview["runtimeRoot"])
+        check(preview["status"] == "PREVIEW", "runtime preview is typed")
+        check(not parent.exists(), "runtime preview writes nothing")
+        check(
+            runtime_root.name.startswith("1.100.0-")
+            and preview["release"] == "1.100.0",
+            "runtime path binds canonical release identity",
+        )
+        check(
+            len(preview["runtimeSha256"]) == 64,
+            "runtime preview exposes the aggregate digest",
+        )
+
+        installed = runtime.install_runtime(
+            source_root=source, runtime_parent=parent, apply=True
+        )
+        check(installed["status"] == "INSTALLED", "runtime installs")
+        check(runtime_root.is_dir(), "runtime target exists")
+        manifest = json.loads(
+            (runtime_root / runtime.RUNTIME_MANIFEST).read_text(encoding="utf-8")
+        )
+        check(
+            manifest["runtimeSha256"] == preview["runtimeSha256"]
+            and {row["path"] for row in manifest["files"]}
+            == set(runtime.RUNTIME_FILES),
+            "runtime manifest binds the exact closed inventory",
+        )
+        check(
+            runtime.validate_runtime(runtime_root, manifest) == manifest,
+            "installed runtime validates byte-for-byte",
+        )
+        reused = runtime.install_runtime(
+            source_root=source, runtime_parent=parent, apply=True
+        )
+        check(reused["status"] == "REUSED", "exact reinstall is idempotent")
+
+        entry = runtime_root / "scripts" / "itd.py"
+        original = entry.read_bytes()
+        entry.chmod(0o600)
+        entry.write_bytes(b"tampered\n")
+        rejects(
+            lambda: runtime.install_runtime(
+                source_root=source, runtime_parent=parent, apply=False
+            ),
+            "preview also refuses a tampered existing runtime",
+        )
+        rejects(
+            lambda: runtime.install_runtime(
+                source_root=source, runtime_parent=parent, apply=True
+            ),
+            "tampered existing runtime is refused",
+        )
+        check(entry.read_bytes() == b"tampered\n", "tamper is not overwritten")
+        entry.write_bytes(original)
+        entry.chmod(0o400)
+        extra = runtime_root / "foreign.py"
+        extra.write_text("foreign\n", encoding="utf-8")
+        rejects(
+            lambda: runtime.install_runtime(
+                source_root=source, runtime_parent=parent, apply=True
+            ),
+            "extra runtime file is refused",
+        )
+        extra.unlink()
+        named = runtime_root / "foreign-named.py"
+        named.write_text("foreign\n", encoding="utf-8")
+        rejects_naming(
+            lambda: runtime.install_runtime(
+                source_root=source, runtime_parent=parent, apply=True
+            ),
+            ("foreign-named.py", "FIX"),
+            "extra-file refusal names the offending path and a FIX",
+        )
+        named.unlink()
+        extra_dir = runtime_root / "empty-extra-directory"
+        extra_dir.mkdir()
+        rejects(
+            lambda: runtime.install_runtime(
+                source_root=source, runtime_parent=parent, apply=False
+            ),
+            "extra runtime directory is refused",
+        )
+        extra_dir.rmdir()
+        # The real 2026-08-29 failure: bytecode written by a hook that loaded a
+        # module out of the installed runtime. The directory check must fire and
+        # must say WHICH directory, otherwise the operator hunts it by hand.
+        cache_dir = runtime_root / "skills" / "review" / "scripts" / "__pycache__"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "itd_review_cache.cpython-312.pyc").write_bytes(b"\x00")
+        rejects_naming(
+            lambda: runtime.install_runtime(
+                source_root=source, runtime_parent=parent, apply=True
+            ),
+            ("__pycache__", "FIX"),
+            "stray bytecode refusal names the __pycache__ directory and a FIX",
+        )
+        (cache_dir / "itd_review_cache.cpython-312.pyc").unlink()
+        cache_dir.rmdir()
+        missing_probe = runtime_root / "skills" / "review" / "SKILL.md"
+        missing_bytes = missing_probe.read_bytes()
+        missing_probe.chmod(0o600)
+        missing_probe.unlink()
+        rejects_naming(
+            lambda: runtime.install_runtime(
+                source_root=source, runtime_parent=parent, apply=True
+            ),
+            ("missing:", "skills/review/SKILL.md"),
+            "missing-file refusal names what disappeared",
+        )
+        missing_probe.write_bytes(missing_bytes)
+        missing_probe.chmod(0o400)
+        # Reviewer finding r4: the diagnostic contract must cover EVERY strict
+        # refusal branch, not the two that were easy to reach. A symlink and a
+        # special file are refused just as hard, so they must name the path and
+        # a FIX too — otherwise the operator is back to hunting by hand.
+        link = runtime_root / "stray-link"
+        try:
+            link.symlink_to(runtime_root / "scripts" / "itd.py")
+        except OSError as exc:
+            # Native Windows can deny symlink creation without Developer Mode
+            # or the privilege.  Keep the inventory/runtime execution proof
+            # live there and name this unavailable fixture explicitly.
+            print(f"SKIP  symlink refusal: native symlink fixture unavailable: {exc}")
+        else:
+            rejects_naming(
+                lambda: runtime.install_runtime(
+                    source_root=source, runtime_parent=parent, apply=True
+                ),
+                ("stray-link", "FIX"),
+                "symlink refusal names the offending path and a FIX",
+            )
+            link.unlink()
+        # Reviewer finding r8: os.mkfifo is Unix-only, and this suite also runs
+        # on native Windows. Name the platform boundary instead of crashing on
+        # it — the guarantee is exercised wherever a real special file can be
+        # created, and the skip is printed, never silent.
+        if hasattr(os, "mkfifo"):
+            fifo = runtime_root / "stray-fifo"
+            os.mkfifo(fifo)
+            rejects_naming(
+                lambda: runtime.install_runtime(
+                    source_root=source, runtime_parent=parent, apply=True
+                ),
+                ("stray-fifo", "FIX"),
+                "special-file refusal names the offending path and a FIX",
+            )
+            fifo.unlink()
+        else:
+            print(
+                "SKIP  special-file refusal: os.mkfifo is unavailable on this "
+                "platform; the symlink branch above still covers the "
+                "path+FIX contract"
+            )
+        real_is_symlink = Path.is_symlink
+        with mock.patch.object(
+            Path,
+            "is_symlink",
+            lambda path: path == runtime_root or real_is_symlink(path),
+        ):
+            rejects(
+                lambda: runtime.validate_runtime(runtime_root, manifest),
+                "a symlinked runtime root is refused before resolution",
+            )
+        with mock.patch.object(
+            Path,
+            "is_symlink",
+            lambda path: path == parent or real_is_symlink(path),
+        ):
+            rejects(
+                lambda: runtime.install_runtime(
+                    source_root=source, runtime_parent=parent, apply=False
+                ),
+                "a symlinked runtime parent is refused before planning",
+            )
+
+        changed = source_fixture(root / "changed")
+        (changed / "scripts" / "itd.py").write_text(
+            "changed runtime\n", encoding="utf-8"
+        )
+        changed_preview = runtime.install_runtime(
+            source_root=changed, runtime_parent=parent, apply=False
+        )
+        check(
+            changed_preview["runtimeRoot"] != preview["runtimeRoot"],
+            "one runtime byte changes the content address",
+        )
+        missing = source_fixture(root / "missing")
+        (missing / runtime.RUNTIME_FILES[-1]).unlink()
+        rejects(
+            lambda: runtime.install_runtime(
+                source_root=missing, runtime_parent=parent, apply=False
+            ),
+            "missing declared source file is refused",
+        )
+
+        selected = (Path(sys.executable).resolve(), "test", "explicit")
+        cli_target = root / "bin" / "itd"
+        with mock.patch.object(cli, "select_runtime", return_value=selected):
+            cli_result = cli.install(
+                cli_target, apply=True, replace_existing=False,
+                update_path=False, python=selected[0], source_root=source,
+                runtime_parent=parent,
+            )
+        hook_target = root / "hooks"
+        configured: list[tuple[str, ...]] = []
+
+        def git_config(*arguments: str, check: bool = True) -> str:
+            del check
+            configured.append(arguments)
+            if arguments == ("--get", "core.hooksPath"):
+                return hook_target.as_posix() if len(configured) > 1 else ""
+            return ""
+
+        with (
+            mock.patch.object(hooks, "select_runtime", return_value=selected),
+            mock.patch.object(hooks, "git_config", side_effect=git_config),
+        ):
+            hook_result = hooks.install(
+                hook_target, apply=True, replace_existing=False,
+                python=selected[0], source_root=source,
+                runtime_parent=parent,
+            )
+        cli_bytes = cli_target.read_text(encoding="utf-8")
+        hook_bytes = (hook_target / "pre-push").read_text(encoding="utf-8")
+        check(
+            cli_result["runtimeRoot"] == hook_result["runtimeRoot"]
+            == str(runtime_root),
+            "CLI and pre-push use one runtime identity",
+        )
+        check(
+            str(source) not in cli_bytes + hook_bytes,
+            "wrappers do not retain the mutable source checkout",
+        )
+        check(
+            (runtime_root / "scripts" / "itd.py").as_posix()
+            in cli_bytes.replace("\\", "/")
+            and (runtime_root / "scripts" / "itd_pre_push.py").as_posix()
+            in hook_bytes.replace("\\", "/"),
+            "wrappers name only deployed runtime entry points",
+        )
+        check(
+            " -I -B " in cli_bytes and " -I -B " in hook_bytes,
+            "runtime entry points disable ambient imports and bytecode writes",
+        )
+
+        real_parent = root / "real-runtime"
+        real_target = root / "real-bin" / (
+            "itd.cmd" if os.name == "nt" else "itd"
+        )
+        real_cli = cli.install(
+            real_target, apply=True, replace_existing=False,
+            update_path=False, python=Path(sys.executable), source_root=ROOT,
+            runtime_parent=real_parent,
+        )
+        installed_root = Path(real_cli["runtimeRoot"])
+        before_runtime_execution = runtime_inventory(installed_root)
+        verify_direct_entrypoints(installed_root)
+        help_command = (
+            ["cmd.exe", "/d", "/c", str(real_target), "--help"]
+            if os.name == "nt" else [str(real_target), "--help"]
+        )
+        help_result = subprocess.run(
+            help_command, capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+        check(
+            help_result.returncode == 0
+            and "{gate,pr}" in help_result.stdout,
+            "installed real CLI runs from the isolated runtime",
+        )
+        push_result = subprocess.run(
+            [
+                sys.executable, "-I", "-B",
+                str(Path(real_cli["runtimeRoot"]) / "scripts" / "itd_pre_push.py"),
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        check(
+            push_result.returncode == 1 and "BLOCKED:" in push_result.stderr,
+            "installed real pre-push entrypoint runs and fails closed",
+        )
+        load_probe = (
+            "import importlib.util, pathlib, sys; "
+            "p=pathlib.Path(sys.argv[1]); "
+            "s=importlib.util.spec_from_file_location('runtime_loop', p); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "m.candidate_context(sys.argv[2], 'high')"
+        )
+        dependency_result = subprocess.run(
+            [
+                sys.executable, "-I", "-B", "-c", load_probe,
+                str(
+                    Path(real_cli["runtimeRoot"])
+                    / "skills" / "_shared" / "itd_verification_loop.py"
+                ),
+                str(ROOT),
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        check(
+            dependency_result.returncode == 0,
+            "installed verification loop computes an exact candidate context",
+        )
+        check(
+            runtime_inventory(installed_root) == before_runtime_execution,
+            "installed runtime inventory is byte-for-byte unchanged after execution",
+        )
+        print(
+            "runtime inventory execution proof host="
+            + ("native-windows" if os.name == "nt" else "wsl-or-posix")
+        )
+
+    print(json.dumps({"checks": CHECKS, "status": "PASSED"}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

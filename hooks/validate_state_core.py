@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+"""Shared validation core for .itd-memory/STATE.json and GOAL.json (v1.75.0).
+
+Extracted from scripts/validate_state.py so the SAME invariants are enforced
+from two call sites without drift:
+
+  - scripts/validate_state.py  — the CLI (skills, CI) — thin wrapper;
+  - hooks/state-guard.sh       — PostToolUse hook that validates immediately
+    after every Write/Edit of a state ledger (ACID-audit fix #4: consistency
+    moves from "checked on next session boot" to "checked after each mutation").
+
+Functions here return error/warning LISTS instead of sys.exit'ing, so a hook
+can degrade softly (additionalContext) while the CLI stays fail-closed.
+
+Schema resolution is multi-path because this file lives in two layouts:
+  repo checkout:   <repo>/hooks/validate_state_core.py
+                   schemas at <repo>/docs/templates/itd-memory/
+  active install:  ~/.claude/hooks/validate_state_core.py
+                   schemas at ~/.claude/templates/itd-memory/  (sync Step 4/6)
+If no schema file is found, a built-in minimal required-field list keeps the
+core checks alive (best-effort invariant: a missing artifact degrades to the
+neutral path, never to a false "all green").
+
+v1.75.0 also adds the reconciliation invariant (ACID-audit fix #5): when
+events.jsonl exists next to STATE.json, the STATE tail must not CONTRADICT the
+event-log tail. Contradiction (STATE says the unit is active but the log says
+it was already verified) is an ERROR; mere absence of an event (unit never
+logged) is a WARNING — projects predating the events convention stay valid.
+
+Stdlib only. Never raises out of validate_* entry points on malformed input —
+malformed JSON is itself reported as an error.
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parent
+
+# repo layout first, then active-install layout (~/.claude/templates/...)
+_SCHEMA_DIRS = (
+    _LIB_DIR.parent / "docs" / "templates" / "itd-memory",
+    _LIB_DIR.parent / "templates" / "itd-memory",
+)
+_VERIFICATION_LOOP_PATH = (
+    _LIB_DIR.parent / "skills" / "_shared" / "itd_verification_loop.py"
+)
+
+# Built-in fallback when no schema file is resolvable (fresh machine, partial
+# install). Mirrors requiredFields of the shipped schemas — keep in sync.
+_FALLBACK_STATE_REQUIRED = [
+    "classification", "architecture", "existingProject", "currentUnit",
+    "gateResults", "humanSteering", "eventLog", "verificationHistory",
+    "decisionLog", "artifacts", "completedModules", "failedValidations",
+    "blockers", "nextAction",
+]
+_FALLBACK_GOAL = {
+    "requiredFields": ["goal", "status", "units"],
+    "goalStatuses": ["active", "done", "abandoned"],
+    "unitStatuses": [
+        "pending", "in_progress", "recovery_required", "verified", "skipped", "blocked",
+    ],
+    "unitRequiredFields": ["id", "criterion", "verificationCommand", "status"],
+    "workProfiles": ["working_deadline"],
+    "deadlineStateRequiredFields": [
+        "profile", "policyId", "policySha256", "cycle", "startedAt",
+        "hostObservedElapsedSeconds", "softCheckpointAt", "checkpoint",
+        "hardPausedAt", "stopReason", "pauses",
+    ],
+    "deadlineCheckpointFields": ["ready", "blocker", "remainder", "estimate"],
+    "deadlineStopReasons": ["", "verified", "blocked", "budget_exhausted"],
+    "runPolicyModes": ["bounded_autonomous"],
+    "runPolicyRequiredFields": [
+        "mode", "maxAttemptsPerUnit", "maxWallClockSecondsPerUnit",
+        "maxTokensPerSession", "freezeVerification", "requireApproach",
+        "requireIndependentReview",
+    ],
+    "attemptKinds": ["verification", "recheck"],
+    "attemptOutcomes": ["verified", "failed", "regressed", "unverified"],
+    "stopReasons": ["", "verified", "blocked", "budget_exhausted"],
+}
+
+_OBJECT_FIELDS = ("classification", "architecture", "existingProject", "currentUnit",
+                  "gateResults", "humanSteering", "eventLog")
+_LIST_FIELDS = ("verificationHistory", "decisionLog", "artifacts",
+                "completedModules", "failedValidations", "blockers")
+
+ACTIVE_UNIT_STATUSES = {"in_progress", "verifying", "recovery_required"}
+
+# Unit-event decisions that mean "this unit is finished" in events.jsonl.
+_TERMINAL_DECISIONS = {"verified", "closed", "skipped", "abandoned"}
+
+
+def _verification_receipt_error(goal_path: Path, receipt: dict,
+                                risk_tier: str, unit_id: str) -> str:
+    """Return an exact adjudication error; shaped ledger fields are not proof."""
+    try:
+        project_root = goal_path.resolve().parent.parent
+        target = (project_root / str(receipt.get("path") or "")).resolve()
+        target.relative_to(project_root)
+        if not target.is_file():
+            return "adjudication receipt file is missing"
+        if hashlib.sha256(target.read_bytes()).hexdigest() != receipt.get("sha256"):
+            return "adjudication receipt file hash does not match the ledger"
+        spec = importlib.util.spec_from_file_location(
+            "itd_state_verification_loop", _VERIFICATION_LOOP_PATH)
+        if spec is None or spec.loader is None:
+            return "Verification Loop validator is unavailable"
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        validated = module.validate_adjudication(
+            project_root, target, risk_tier or "unknown", unit_id)
+        if (str(validated.get("receiptSha256") or "")
+                != str(receipt.get("receiptSha256") or "")):
+            return "adjudication receipt digest does not match the ledger"
+    except Exception as exc:
+        return f"adjudication receipt validation failed: {exc}"
+    return ""
+
+
+def _load_schema(name: str) -> dict | None:
+    for d in _SCHEMA_DIRS:
+        p = d / name
+        if p.is_file():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+    return None
+
+
+def _load_json(path: Path, errors: list[str]) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        errors.append(f"{path}: missing state file")
+        return None
+    except Exception as exc:
+        errors.append(f"{path}: not valid JSON ({exc})")
+        return None
+    if not isinstance(data, dict):
+        errors.append(f"{path}: top-level value must be an object")
+        return None
+    return data
+
+
+def _check_single_wip(path: Path, state: dict, errors: list[str]) -> None:
+    """WIP=1 across both ledgers, counting a mirrored unit only once."""
+    cu = state.get("currentUnit") or {}
+    if not isinstance(cu, dict):
+        return  # already reported as a type error
+    state_unit = str(cu.get("id", "")).strip()
+    state_active = str(cu.get("status", "")).strip() in ACTIVE_UNIT_STATUSES
+    goal_path = path.parent / "GOAL.json"
+    goal_active, goal_unit = False, ""
+    if goal_path.is_file():
+        try:
+            goal = json.loads(goal_path.read_text(encoding="utf-8"))
+            goal_unit = str(goal.get("currentUnitId", "")).strip()
+            goal_active = str(goal.get("status", "")).strip() != "done" and bool(goal_unit)
+        except Exception:
+            goal_active = False
+    if state_active and goal_active and state_unit != goal_unit:
+        errors.append(
+            f"{path}: WIP=1 violated -- both STATE.currentUnit "
+            f"('{state_unit}') and GOAL.json ('{goal_unit}') are active. "
+            f"Finish/close one before activating the other.")
+
+
+def _last_unit_event(events_path: Path, unit_id: str) -> dict | None:
+    """Last {"type":"unit","name":<unit_id>,...} record in events.jsonl."""
+    return _last_unit_events(events_path).get(unit_id)
+
+
+EVENTS_TAIL_BYTES = 512 * 1024  # реконсиляция читает не больше этого хвоста
+
+
+def _last_unit_events(events_path: Path) -> dict:
+    """One pass over events.jsonl → {unit_name: last unit-event record}.
+
+    v1.76.0: shared by STATE and GOAL reconciliation — GOAL ledgers hold many
+    units, per-unit rescans would be O(units × log).
+
+    v1.80.1 (RUNBOOK-кандидат): чтение ограничено ХВОСТОМ EVENTS_TAIL_BYTES.
+    Очень большой журнал + hook-timeout 5с → валидация молча скипалась бы
+    целиком; хвост — безопасная деградация: «последнее решение по юниту»
+    tail-biased по построению, а юнит, чьи события целиком старше окна,
+    выглядит как «нет события» → это WARNING-ветка (absence), не ложный fail.
+    """
+    last: dict = {}
+    try:
+        size = events_path.stat().st_size
+        with events_path.open("rb") as fb:
+            if size > EVENTS_TAIL_BYTES:
+                fb.seek(size - EVENTS_TAIL_BYTES)
+                fb.readline()  # отбрасываем, скорее всего, неполную первую строку
+            payload = fb.read().decode("utf-8", errors="replace")
+        for line in payload.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(rec, dict) or rec.get("type") != "unit":
+                continue
+            name = str(rec.get("name", "") or "").strip()
+            if name:
+                last[name] = rec
+    except Exception:
+        return {}
+    return last
+
+
+def _events_ledger(path: Path) -> Path | None:
+    """events.jsonl next to the ledger, or None when there is nothing to
+    reconcile against (missing/empty — legacy projects stay valid)."""
+    events_path = path.parent / "events.jsonl"
+    if not events_path.is_file():
+        return None
+    try:
+        if events_path.stat().st_size == 0:
+            return None
+    except Exception:
+        return None
+    return events_path
+
+
+def reconcile_goal_with_events(path: Path, goal: dict) -> tuple[list[str], list[str]]:
+    """v1.76.0 — the reconciliation invariant GOAL.json ↔ events.jsonl.
+
+    Same semantics as the STATE check (contradiction fails, absence warns),
+    applied per unit of the long-goal ledger:
+      - a unit still OPEN in GOAL (pending/in_progress/recovery_required/verifying/blocked)
+        while the log already recorded a terminal decision for it → ERROR;
+      - a unit VERIFIED in GOAL with no terminal decision in a non-empty
+        log → WARNING (capped at 3 to keep the CLI readable).
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    events_path = _events_ledger(path)
+    if events_path is None:
+        return errors, warnings
+    last_by_unit = _last_unit_events(events_path)
+
+    units = goal.get("units")
+    if not isinstance(units, list):
+        return errors, warnings
+    open_statuses = {
+        "pending", "in_progress", "recovery_required", "verifying", "blocked",
+    }
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        uid = str(unit.get("id", "") or "").strip()
+        status = str(unit.get("status", "") or "").strip()
+        if not uid or not status:
+            continue
+        last = last_by_unit.get(uid)
+        last_decision = str((last or {}).get("decision", "") or "").strip().lower()
+        if status in open_statuses and last_decision in _TERMINAL_DECISIONS:
+            errors.append(
+                f"{path}: reconciliation violated -- unit '{uid}' is "
+                f"'{status}' in GOAL.json, but events.jsonl already recorded "
+                f"'{last_decision}' for it. Goal ledger tail is stale: update "
+                f"the unit status or append the missing unit event.")
+        elif status == "verified" and last_decision not in _TERMINAL_DECISIONS:
+            if len(warnings) < 3:
+                seen = ("no unit event at all" if last is None
+                        else f"last decision '{last_decision}'")
+                warnings.append(
+                    f"{path}: unit '{uid}' is 'verified' in GOAL.json, but "
+                    f"events.jsonl has {seen} for it -- append the 'verified' "
+                    f"unit event so the ledger stays the source of truth.")
+    return errors, warnings
+
+
+def reconcile_with_events(path: Path, state: dict) -> tuple[list[str], list[str]]:
+    """ACID-audit fix #5 — the reconciliation invariant STATE ↔ events.jsonl.
+
+    Returns (errors, warnings). Only CONTRADICTION fails; absence warns:
+      - STATE unit active, but the log's last decision for it is terminal
+        (verified/closed/...) → ERROR: STATE tail is stale vs the event log.
+      - STATE unit verified, but the log never saw a terminal decision for it
+        (activated-only, or no record at all in a non-empty log) → WARNING:
+        the "verified" claim has no event-sourced trace.
+    No events.jsonl (or empty) → nothing to reconcile against, silent.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    events_path = path.parent / "events.jsonl"
+    if not events_path.is_file():
+        return errors, warnings
+    try:
+        if events_path.stat().st_size == 0:
+            return errors, warnings
+    except Exception:
+        return errors, warnings
+
+    cu = state.get("currentUnit") or {}
+    if not isinstance(cu, dict):
+        return errors, warnings
+    unit_id = str(cu.get("id", "") or "").strip()
+    status = str(cu.get("status", "") or "").strip()
+    if not unit_id or not status:
+        return errors, warnings
+
+    last = _last_unit_event(events_path, unit_id)
+    last_decision = str((last or {}).get("decision", "") or "").strip().lower()
+
+    if status in ACTIVE_UNIT_STATUSES and last_decision in _TERMINAL_DECISIONS:
+        errors.append(
+            f"{path}: reconciliation violated -- currentUnit '{unit_id}' is "
+            f"'{status}' in STATE, but events.jsonl already recorded "
+            f"'{last_decision}' for it. STATE tail is stale: update "
+            f"currentUnit.status or append the missing unit event.")
+    elif status == "verified" and last_decision not in _TERMINAL_DECISIONS:
+        seen = "no unit event at all" if last is None else f"last decision '{last_decision}'"
+        warnings.append(
+            f"{path}: currentUnit '{unit_id}' is 'verified' in STATE, but "
+            f"events.jsonl has {seen} for it -- append the 'verified' unit "
+            f"event so the ledger stays the source of truth.")
+    return errors, warnings
+
+
+def validate_state_file(path: Path) -> tuple[list[str], list[str]]:
+    """Validate a STATE.json session-state file. Returns (errors, warnings)."""
+    errors: list[str] = []
+    state = _load_json(path, errors)
+    if state is None:
+        return errors, []
+
+    schema = _load_schema("session-state.schema.json")
+    required = (schema or {}).get("requiredFields") or _FALLBACK_STATE_REQUIRED
+    for field in required:
+        if field not in state:
+            errors.append(f"{path}: missing required state field '{field}'")
+
+    for field in _OBJECT_FIELDS:
+        if field in state and not isinstance(state.get(field), dict):
+            errors.append(f"{path}: '{field}' must be an object")
+    for field in _LIST_FIELDS:
+        if field in state and not isinstance(state.get(field), list):
+            errors.append(f"{path}: '{field}' must be a list")
+    if errors:
+        return errors, []
+
+    steering = state.get("humanSteering", {})
+    if not steering.get("approvalStatus"):
+        errors.append(f"{path}: humanSteering.approvalStatus must not be empty (fail-closed)")
+    if not steering.get("recommendedNextStep"):
+        errors.append(f"{path}: humanSteering.recommendedNextStep must not be empty (fail-closed)")
+    if "nextStepApproval" not in state.get("gateResults", {}):
+        errors.append(f"{path}: gateResults.nextStepApproval must be present")
+    if not state.get("nextAction"):
+        errors.append(f"{path}: nextAction must not be empty (fail-closed)")
+
+    _check_single_wip(path, state, errors)
+    rec_errors, warnings = reconcile_with_events(path, state)
+    errors.extend(rec_errors)
+    return errors, warnings
+
+
+def _bounded_policy_snapshot(policy: dict) -> dict:
+    base = ("mode", "maxAttemptsPerUnit", "maxWallClockSecondsPerUnit",
+            "maxTokensPerSession", "freezeVerification", "requireApproach",
+            "requireIndependentReview")
+    optional = tuple(
+        key for key in ("enforceObservedTokens", "verificationStrategy",
+                        "maxCheckpointBytes") if key in policy)
+    return {key: policy.get(key) for key in base + optional}
+
+
+def _bounded_snapshot_fingerprint(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _bounded_policy_fingerprint(policy: dict) -> str:
+    return _bounded_snapshot_fingerprint(_bounded_policy_snapshot(policy))
+
+
+def _bounded_unit_fingerprint(unit: dict) -> str:
+    payload = {
+        "criterion": str(unit.get("criterion") or ""),
+        "verificationCommand": str(unit.get("verificationCommand") or ""),
+    }
+    if "riskTier" in unit:
+        payload["riskTier"] = str(unit.get("riskTier") or "")
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def validate_goal_file(path: Path) -> tuple[list[str], list[str]]:
+    """Validate a GOAL.json long-goal unit ledger. Returns (errors, warnings)."""
+    errors: list[str] = []
+    goal = _load_json(path, errors)
+    if goal is None:
+        return errors, []
+
+    schema = _load_schema("goal.schema.json") or _FALLBACK_GOAL
+
+    for field in schema.get("requiredFields", []):
+        if field not in goal:
+            errors.append(f"{path}: missing required goal field '{field}'")
+
+    if not str(goal.get("goal") or "").strip():
+        errors.append(f"{path}: 'goal' must not be empty (fail-closed)")
+
+    goal_statuses = schema.get("goalStatuses", [])
+    if goal_statuses and goal.get("status") not in goal_statuses:
+        errors.append(f"{path}: status '{goal.get('status')}' not in {goal_statuses}")
+
+    units = goal.get("units")
+    if not isinstance(units, list) or not units:
+        errors.append(f"{path}: 'units' must be a non-empty list (fail-closed)")
+        return errors, []
+
+    policy = goal.get("runPolicy")
+    bounded = policy is not None
+    policy_sealed = False
+    if bounded:
+        if not isinstance(policy, dict):
+            errors.append(f"{path}: runPolicy must be an object")
+            policy = {}
+        for field in schema.get("runPolicyRequiredFields", []):
+            if field not in policy:
+                errors.append(f"{path}: runPolicy missing required field '{field}'")
+        modes = schema.get("runPolicyModes", [])
+        if modes and policy.get("mode") not in modes:
+            errors.append(f"{path}: runPolicy.mode '{policy.get('mode')}' not in {modes}")
+        for field in ("maxAttemptsPerUnit", "maxWallClockSecondsPerUnit",
+                      "maxTokensPerSession"):
+            value = policy.get(field)
+            if type(value) is not int or value <= 0:
+                errors.append(f"{path}: runPolicy.{field} must be a positive integer")
+        for field in ("freezeVerification", "requireApproach",
+                      "requireIndependentReview"):
+            if type(policy.get(field)) is not bool:
+                errors.append(f"{path}: runPolicy.{field} must be boolean")
+        if ("enforceObservedTokens" in policy
+                and type(policy.get("enforceObservedTokens")) is not bool):
+            errors.append(
+                f"{path}: runPolicy.enforceObservedTokens must be boolean")
+        if policy.get("verificationStrategy") not in (None, "adaptive"):
+            errors.append(
+                f"{path}: runPolicy.verificationStrategy must be 'adaptive'")
+        if "maxCheckpointBytes" in policy:
+            size = policy.get("maxCheckpointBytes")
+            if type(size) is not int or not 1024 <= size <= 4096:
+                errors.append(
+                    f"{path}: runPolicy.maxCheckpointBytes must be in 1024..4096")
+        if policy.get("freezeVerification") is not True:
+            errors.append(f"{path}: bounded run requires freezeVerification=true")
+        if policy.get("requireApproach") is not True:
+            errors.append(f"{path}: bounded run requires requireApproach=true")
+        sealed = str(policy.get("sealedFingerprint") or "")
+        policy_sealed = bool(sealed)
+        if sealed:
+            sealed_policy = policy.get("sealedPolicy")
+            if not isinstance(sealed_policy, dict):
+                errors.append(f"{path}: sealed runPolicy requires sealedPolicy snapshot")
+            elif sealed != _bounded_snapshot_fingerprint(sealed_policy):
+                errors.append(f"{path}: sealedPolicy does not match sealedFingerprint")
+            elif sealed_policy != _bounded_policy_snapshot(policy):
+                errors.append(f"{path}: runPolicy changed after approval seal")
+
+    unit_statuses = schema.get("unitStatuses", [])
+    unit_required = schema.get("unitRequiredFields", [])
+    seen_ids: set[str] = set()
+    for i, unit in enumerate(units):
+        where = f"{path}: units[{i}]"
+        if not isinstance(unit, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        for field in unit_required:
+            if not str(unit.get(field) or "").strip():
+                errors.append(f"{where}: '{field}' must not be empty (fail-closed)")
+        uid = str(unit.get("id"))
+        if uid in seen_ids:
+            errors.append(f"{where}: duplicate unit id '{uid}'")
+        seen_ids.add(uid)
+        if unit_statuses and unit.get("status") not in unit_statuses:
+            errors.append(f"{where}: status '{unit.get('status')}' not in {unit_statuses}")
+        if unit.get("status") == "skipped" and not str(unit.get("skippedReason") or "").strip():
+            errors.append(f"{where}: skipped unit must carry a non-empty skippedReason (fail-closed)")
+        if unit.get("status") == "blocked" and not str(unit.get("blockedReason") or "").strip():
+            errors.append(f"{where}: blocked unit must carry a non-empty blockedReason (fail-closed)")
+
+        risk_tier = str(unit.get("riskTier") or "")
+        adaptive = (isinstance(policy, dict)
+                    and policy.get("verificationStrategy") == "adaptive")
+        risk_tiers = schema.get("riskTiers", ["low", "medium", "high"])
+        if adaptive and risk_tier not in risk_tiers:
+            errors.append(f"{where}: adaptive unit riskTier must be in {risk_tiers}")
+        expected_checker = (
+            "full" if isinstance(policy, dict)
+            and (policy.get("requireIndependentReview")
+                 or (adaptive and risk_tier == "high"))
+            else "targeted" if adaptive and risk_tier == "medium"
+            else "machine_only")
+
+        deadline = unit.get("deadlineState")
+        if deadline is not None and not isinstance(deadline, dict):
+            errors.append(f"{where}: deadlineState must be an object")
+            deadline = {}
+        if isinstance(deadline, dict) and deadline:
+            for field in schema.get("deadlineStateRequiredFields", []):
+                if field not in deadline:
+                    errors.append(f"{where}: deadlineState missing '{field}'")
+            work_profiles = schema.get("workProfiles", ["working_deadline"])
+            if deadline.get("profile") not in work_profiles:
+                errors.append(
+                    f"{where}: deadlineState.profile '{deadline.get('profile')}' "
+                    f"not in {work_profiles}")
+            if deadline.get("policyId") != "working-deadline-v1":
+                errors.append(f"{where}: deadlineState.policyId is not canonical")
+            digest = str(deadline.get("policySha256") or "")
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                errors.append(f"{where}: deadlineState.policySha256 must be lowercase SHA-256")
+            if risk_tier not in ("low", "medium"):
+                errors.append(
+                    f"{where}: working_deadline requires low|medium risk, got "
+                    f"'{risk_tier or 'unknown'}'")
+            if unit.get("status") == "pending":
+                errors.append(
+                    f"{where}: pending deadlineState cannot replace explicit profile opt-in")
+            cycle = deadline.get("cycle")
+            if type(cycle) is not int or cycle <= 0:
+                errors.append(f"{where}: deadlineState.cycle must be a positive integer")
+            if not str(deadline.get("startedAt") or "").strip():
+                errors.append(f"{where}: deadlineState.startedAt must not be empty")
+            observed = deadline.get("hostObservedElapsedSeconds")
+            if type(observed) is not int or observed < 0:
+                errors.append(
+                    f"{where}: hostObservedElapsedSeconds must be non-negative")
+            checkpoint = deadline.get("checkpoint")
+            if not isinstance(checkpoint, dict):
+                errors.append(f"{where}: deadlineState.checkpoint must be an object")
+                checkpoint = {}
+            checkpoint_at = str(deadline.get("softCheckpointAt") or "").strip()
+            checkpoint_fields = schema.get(
+                "deadlineCheckpointFields", ["ready", "blocker", "remainder", "estimate"])
+            if checkpoint_at:
+                if set(checkpoint) != set(checkpoint_fields):
+                    errors.append(
+                        f"{where}: completed deadline checkpoint must contain exactly "
+                        f"{checkpoint_fields}")
+                for field in checkpoint_fields:
+                    if not str(checkpoint.get(field) or "").strip():
+                        errors.append(
+                            f"{where}: deadline checkpoint '{field}' must not be empty")
+            elif checkpoint:
+                errors.append(
+                    f"{where}: deadline checkpoint payload exists without softCheckpointAt")
+            stops = schema.get(
+                "deadlineStopReasons", ["", "verified", "blocked", "budget_exhausted"])
+            stop = str(deadline.get("stopReason") or "")
+            if stop not in stops:
+                errors.append(f"{where}: deadline stopReason '{stop}' not in {stops}")
+            pauses = deadline.get("pauses")
+            if not isinstance(pauses, list):
+                errors.append(f"{where}: deadlineState.pauses must be an array")
+                pauses = []
+            for j, pause in enumerate(pauses):
+                pwhere = f"{where}.deadlineState.pauses[{j}]"
+                if (not isinstance(pause, dict)
+                        or pause.get("kind") != "wall_clock"
+                        or type(pause.get("limit")) is not int
+                        or type(pause.get("observed")) is not int
+                        or pause.get("observed", -1) < pause.get("limit", 0)):
+                    errors.append(f"{pwhere}: invalid observed wall-clock pause evidence")
+            if unit.get("status") == "recovery_required":
+                if not str(unit.get("recoveryReason") or "").strip():
+                    errors.append(
+                        f"{where}: recovery_required requires non-empty recoveryReason")
+                exhausted = deadline.get("exhaustedBudget")
+                if (stop != "budget_exhausted"
+                        or not str(deadline.get("hardPausedAt") or "").strip()
+                        or not isinstance(exhausted, dict)
+                        or exhausted.get("kind") != "wall_clock"
+                        or type(exhausted.get("limit")) is not int
+                        or type(exhausted.get("observed")) is not int
+                        or exhausted.get("observed", -1) < exhausted.get("limit", 0)):
+                    errors.append(
+                        f"{where}: recovery_required needs typed observed "
+                        "budget_exhausted evidence")
+            if unit.get("status") == "verified" and stop != "verified":
+                errors.append(
+                    f"{where}: verified working_deadline unit requires stopReason=verified")
+            if unit.get("status") == "blocked" and stop != "blocked":
+                errors.append(
+                    f"{where}: blocked working_deadline unit requires stopReason=blocked")
+
+        attempts = unit.get("attempts")
+        if attempts is not None and not isinstance(attempts, list):
+            errors.append(f"{where}: attempts must be an array")
+            attempts = []
+        if isinstance(attempts, list):
+            kinds = schema.get("attemptKinds", [])
+            outcomes = schema.get("attemptOutcomes", [])
+            for j, attempt in enumerate(attempts):
+                awhere = f"{where}.attempts[{j}]"
+                if not isinstance(attempt, dict):
+                    errors.append(f"{awhere} must be an object")
+                    continue
+                if attempt.get("number") != j + 1:
+                    errors.append(f"{awhere}: number must be sequential ({j + 1})")
+                for field in ("at", "approach", "verificationCommand", "evidence"):
+                    if not str(attempt.get(field) or "").strip():
+                        errors.append(f"{awhere}: '{field}' must not be empty")
+                if kinds and attempt.get("kind") not in kinds:
+                    errors.append(f"{awhere}: kind '{attempt.get('kind')}' not in {kinds}")
+                if outcomes and attempt.get("outcome") not in outcomes:
+                    errors.append(f"{awhere}: outcome '{attempt.get('outcome')}' not in {outcomes}")
+                receipt = attempt.get("verificationReceipt")
+                requires_adjudication = (
+                    expected_checker in ("targeted", "full")
+                    and attempt.get("outcome") == "verified")
+                if requires_adjudication:
+                    if (not isinstance(receipt, dict)
+                            or not str(receipt.get("path") or "").strip()
+                            or len(str(receipt.get("sha256") or "")) != 64
+                            or len(str(receipt.get("receiptSha256") or "")) != 64
+                            or receipt.get("outcome") != "PASSED"):
+                        errors.append(
+                            f"{awhere}: adjudicated Verification Loop receipt is required")
+                    else:
+                        receipt_error = _verification_receipt_error(
+                            path, receipt, risk_tier or "unknown", uid)
+                        if receipt_error:
+                            errors.append(f"{awhere}: {receipt_error}")
+                    if (not str(attempt.get("reviewEvidence") or "").startswith("adjudicated:")
+                            or str(attempt.get("reviewEvidence") or "").split(":", 1)[-1]
+                            != str((receipt or {}).get("receiptSha256") or "")):
+                        errors.append(
+                            f"{awhere}: plain review evidence is not trusted")
+                elif receipt not in (None, {}):
+                    errors.append(
+                        f"{awhere}: non-verified attempt must not carry accepted adjudication")
+                if (adaptive or "checkerMode" in attempt) \
+                        and attempt.get("checkerMode") != expected_checker:
+                    errors.append(
+                        f"{awhere}: checkerMode must be '{expected_checker}'")
+                if "observedTokens" in attempt:
+                    observed = attempt.get("observedTokens")
+                    if type(observed) is not int or observed < 0:
+                        errors.append(f"{awhere}: observedTokens must be non-negative")
+                if (isinstance(policy, dict)
+                        and policy.get("enforceObservedTokens")
+                        and type(attempt.get("observedTokens")) is not int):
+                    errors.append(f"{awhere}: observed token evidence is required")
+            if (isinstance(policy, dict)
+                    and type(policy.get("maxAttemptsPerUnit")) is int
+                    and len(attempts) > policy["maxAttemptsPerUnit"]):
+                errors.append(f"{where}: attempt count exceeds approved budget")
+
+        run_state = unit.get("runState")
+        if run_state is not None and not isinstance(run_state, dict):
+            errors.append(f"{where}: runState must be an object")
+            run_state = {}
+        if bounded and policy_sealed:
+            if not isinstance(attempts, list):
+                errors.append(f"{where}: sealed bounded unit requires attempts[]")
+            if not isinstance(run_state, dict):
+                errors.append(f"{where}: sealed bounded unit requires runState")
+            else:
+                fp = str(run_state.get("verificationFingerprint") or "")
+                if not fp:
+                    errors.append(f"{where}: approved verification fingerprint is missing")
+                elif fp != _bounded_unit_fingerprint(unit):
+                    errors.append(f"{where}: criterion/verificationCommand changed after approval")
+                stop = str(run_state.get("stopReason") or "")
+                allowed_stops = schema.get("stopReasons", [])
+                if allowed_stops and stop not in allowed_stops:
+                    errors.append(f"{where}: stopReason '{stop}' not in {allowed_stops}")
+                if unit.get("status") in ("in_progress", "verified") \
+                        and not str(run_state.get("startedAt") or "").strip():
+                    errors.append(f"{where}: active/completed bounded unit lacks startedAt")
+                if unit.get("status") == "verified" and stop != "verified":
+                    errors.append(f"{where}: verified bounded unit requires stopReason=verified")
+                if unit.get("status") == "blocked" and not stop:
+                    errors.append(f"{where}: blocked bounded unit requires typed stopReason")
+                if stop == "budget_exhausted":
+                    exhausted = run_state.get("exhaustedBudget")
+                    if (not isinstance(exhausted, dict)
+                            or exhausted.get("kind") not in
+                            ("attempts", "wall_clock", "tokens")
+                            or type(exhausted.get("limit")) is not int):
+                        errors.append(f"{where}: budget_exhausted requires exhaustedBudget evidence")
+                    elif "observed" in exhausted:
+                        observed = exhausted.get("observed")
+                        if type(observed) is not int or observed < exhausted["limit"]:
+                            errors.append(
+                                f"{where}: exhaustedBudget.observed must meet its limit")
+                    elif (isinstance(policy, dict)
+                          and policy.get("enforceObservedTokens")
+                          and exhausted.get("kind") == "tokens"):
+                        errors.append(
+                            f"{where}: token budget stop requires observed evidence")
+
+    current = str(goal.get("currentUnitId") or "").strip()
+    if current and current not in seen_ids:
+        errors.append(f"{path}: currentUnitId '{current}' does not match any unit id")
+
+    active_units = [u for u in units if isinstance(u, dict)
+                    and u.get("status") in ("in_progress", "recovery_required")]
+    if len(active_units) > 1:
+        errors.append(
+            f"{path}: WIP=1 violated by active units "
+            f"{[u.get('id') for u in active_units]}")
+    recovering = [u for u in active_units if u.get("status") == "recovery_required"]
+    if recovering and current != str(recovering[0].get("id") or ""):
+        errors.append(
+            f"{path}: recovery_required unit must remain currentUnitId backpressure")
+
+    handoff = goal.get("handoffState")
+    if handoff is not None:
+        if not isinstance(handoff, dict):
+            errors.append(f"{path}: handoffState must be an object")
+        else:
+            required = handoff.get("required")
+            uid = str(handoff.get("unitId") or "").strip()
+            if type(required) is not bool:
+                errors.append(f"{path}: handoffState.required must be boolean")
+            if uid not in seen_ids:
+                errors.append(f"{path}: handoffState.unitId '{uid}' is unknown")
+            linked = next((u for u in units if isinstance(u, dict)
+                           and str(u.get("id") or "") == uid), None)
+            if linked is not None and linked.get("status") != "verified":
+                errors.append(f"{path}: handoffState must reference a verified unit")
+            if not str(handoff.get("requiredAt") or "").strip():
+                errors.append(f"{path}: handoffState.requiredAt must not be empty")
+            acknowledged_at = str(handoff.get("acknowledgedAt") or "").strip()
+            acknowledgement = str(handoff.get("acknowledgement") or "").strip()
+            if required is True and (acknowledged_at or acknowledgement):
+                errors.append(
+                    f"{path}: required handoff cannot already carry acknowledgement")
+            if required is False and (not acknowledged_at or not acknowledgement):
+                errors.append(
+                    f"{path}: cleared handoff requires acknowledgement provenance")
+
+    if goal.get("status") == "done":
+        open_units = [u.get("id") for u in units if isinstance(u, dict)
+                      and u.get("status") in
+                      ("pending", "in_progress", "recovery_required", "blocked")]
+        if open_units:
+            errors.append(f"{path}: goal is 'done' but units {open_units} are still open")
+        if isinstance(handoff, dict) and handoff.get("required") is True:
+            errors.append(
+                f"{path}: goal is 'done' before verified-unit handoff acknowledgement")
+
+    rec_errors, warnings = reconcile_goal_with_events(path, goal)
+    errors.extend(rec_errors)
+    return errors, warnings
+
+
+def validate_path(path: Path) -> tuple[list[str], list[str]]:
+    """Dispatch by filename (GOAL* → goal ledger, else session state)."""
+    if path.name.startswith("GOAL"):
+        return validate_goal_file(path)
+    return validate_state_file(path)

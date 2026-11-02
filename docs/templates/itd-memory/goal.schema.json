@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "purpose": "Schema for .itd-memory/GOAL.json — the persistent long-goal unit ledger written by /goal (v1.44.0). A goal is decomposed into an ORDERED list of verifiable units; each unit is driven one at a time (WIP=1) through the standard /task pipeline and flipped to 'verified' only with evidence. The file survives session death — a fresh session resumes from the first non-verified unit instead of re-deriving the plan. Validated by scripts/validate_state.py (dispatches on the GOAL.json filename). Goal units reference the same unit mechanics as STATE.json.currentUnit (v1.41.0): activating a goal unit opens it as the current unit and logs unit events to events.jsonl, so the VCR metric counts goal work automatically.",
+  "requiredFields": [
+    "version",
+    "goal",
+    "status",
+    "createdAt",
+    "updatedAt",
+    "currentUnitId",
+    "units"
+  ],
+  "unitRequiredFields": [
+    "id",
+    "criterion",
+    "verificationCommand",
+    "status"
+  ],
+  "unitOptionalFields": ["riskTier", "deadlineState", "recoveryReason"],
+  "riskTiers": ["low", "medium", "high"],
+  "goalStatuses": ["active", "done", "abandoned"],
+  "unitStatuses": ["pending", "in_progress", "recovery_required", "verified", "skipped", "blocked"],
+  "workProfiles": ["working_deadline"],
+  "deadlineStateRequiredFields": [
+    "profile",
+    "policyId",
+    "policySha256",
+    "cycle",
+    "startedAt",
+    "hostObservedElapsedSeconds",
+    "softCheckpointAt",
+    "checkpoint",
+    "hardPausedAt",
+    "stopReason",
+    "pauses"
+  ],
+  "deadlineCheckpointFields": ["ready", "blocker", "remainder", "estimate"],
+  "deadlineStopReasons": ["", "verified", "blocked", "budget_exhausted"],
+  "runPolicyModes": ["bounded_autonomous"],
+  "runPolicyRequiredFields": [
+    "mode",
+    "maxAttemptsPerUnit",
+    "maxWallClockSecondsPerUnit",
+    "maxTokensPerSession",
+    "freezeVerification",
+    "requireApproach",
+    "requireIndependentReview"
+  ],
+  "runPolicyOptionalFields": [
+    "enforceObservedTokens",
+    "verificationStrategy",
+    "maxCheckpointBytes"
+  ],
+  "attemptKinds": ["verification", "recheck"],
+  "attemptOutcomes": ["verified", "failed", "regressed", "unverified"],
+  "checkerEvidence": {
+    "machine_only": "Goal verifier executes verificationCommand directly.",
+    "targeted": "A verified attempt requires verificationReceipt {path, sha256, receiptSha256, outcome=PASSED} from verification-loop-v1; failed/unverified attempts carry no accepted receipt.",
+    "full": "Requires a full independent checker inside the adjudicated verificationReceipt; plain reviewEvidence is invalid."
+  },
+  "stopReasons": ["", "verified", "blocked", "budget_exhausted"],
+  "goalTemplate": {
+    "version": 1,
+    "goal": "",
+    "status": "active",
+    "createdAt": "",
+    "updatedAt": "",
+    "currentUnitId": "",
+    "units": [
+      {
+        "id": "",
+        "criterion": "",
+        "verificationCommand": "",
+        "riskTier": "medium",
+        "status": "pending",
+        "verifiedAt": "",
+        "evidence": "",
+        "skippedReason": "",
+        "blockedReason": ""
+      }
+    ]
+  },
+  "boundedRunPolicyTemplate": {
+    "mode": "bounded_autonomous",
+    "maxAttemptsPerUnit": 3,
+    "maxWallClockSecondsPerUnit": 14400,
+    "maxTokensPerSession": 100000,
+    "freezeVerification": true,
+    "requireApproach": true,
+    "requireIndependentReview": false,
+    "enforceObservedTokens": true,
+    "verificationStrategy": "adaptive",
+    "maxCheckpointBytes": 4096
+  },
+  "boundedUnitRuntimeTemplate": {
+    "attempts": [],
+    "runState": {
+      "approvedAt": "",
+      "startedAt": "",
+      "verificationFingerprint": "",
+      "stopReason": ""
+    }
+  },
+  "workingDeadlineUnitRuntimeTemplate": {
+    "recoveryReason": "",
+    "deadlineState": {
+      "profile": "working_deadline",
+      "policyId": "working-deadline-v1",
+      "policySha256": "",
+      "cycle": 1,
+      "startedAt": "",
+      "hostObservedElapsedSeconds": 0,
+      "softCheckpointAt": "",
+      "checkpoint": {},
+      "hardPausedAt": "",
+      "stopReason": "",
+      "pauses": []
+    }
+  },
+  "handoffStateTemplate": {
+    "required": true,
+    "unitId": "",
+    "requiredAt": "",
+    "acknowledgedAt": "",
+    "acknowledgement": ""
+  }
+}

@@ -1,0 +1,195 @@
+# Project profiles & domain markers (v1.36.0)
+
+idea-to-deploy is greenfield-first by default (idea → discover → blueprint →
+kickstart → … → deploy). That is the right shape when you build a product from
+scratch. It is the wrong shape when the work is a **feature on a mature existing
+codebase** — there the greenfield pipeline is ceremony, and the project's own
+`CLAUDE.md` is the real source of truth.
+
+Three markers let a project tell the methodology what kind of work it is:
+
+- **`itd-profile`** (brownfield vs greenfield) is **auto-detected** by repo
+  maturity from v1.36.0, and can be **overridden** explicitly in either
+  direction. Greenfield stays the default for a fresh project.
+- **`itd-domain: data-sensitive`** is **opt-in** — set it only when the project
+  mutates irreplaceable data.
+- **`itd-route: strict`** is **opt-in** — the strict steps of `/bugfix`,
+  `/test` and `/refactor` (ADR-016 session 8, see below).
+
+Markers live in the project's own `CLAUDE.md` (or `.claude/CLAUDE.md`),
+case-insensitive, matched in the first 8 KB; `itd-route` is also read from
+`AGENTS.md`.
+
+---
+
+## `itd-profile: brownfield` / `greenfield` — pick the right pipeline
+
+**What it does.** On a **brownfield** project the skill-hint hook
+(`hooks/check-skills.sh`) suppresses greenfield-pipeline hints so they stop
+firing on day-to-day feature work:
+
+`/project`, `/blueprint`, `/discover`, `/kickstart`, `/guide`, `/strategy`,
+`/market-scan`, `/autopilot`.
+
+Everything else stays active — `/task`, `/bugfix`, `/refactor`, `/test`,
+`/review`, `/doc`, `/perf`, `/session-save`, `/migrate`, `/security-audit`, …
+The review gate and feature-branch discipline are untouched (equally valuable on
+brownfield). A hint is matched by its own **primary** skill (the `/skill` after
+`используй`), never by a greenfield skill merely mentioned in the prose — so the
+`/adopt` hint, which references `/blueprint`, is not suppressed.
+
+**How it is resolved (v1.36.0).**
+
+1. **Explicit marker wins**, in either direction. Put either form anywhere in
+   the project's `CLAUDE.md`:
+
+   ```
+   <!-- itd:brownfield -->      itd-profile: brownfield
+   <!-- itd:greenfield -->      itd-profile: greenfield
+   ```
+
+2. **Otherwise auto-detect by repo maturity.** An established git history
+   (`git rev-list --count HEAD` ≥ `ITD_BROWNFIELD_MIN_COMMITS`, default **25**)
+   → brownfield; a fresh or empty project (fewer commits, or no git repo)
+   → greenfield. Tune the threshold with the `ITD_BROWNFIELD_MIN_COMMITS`
+   environment variable.
+
+**When to override.** A mature repo where you want the greenfield pipeline back
+for a big new feature → set `itd-profile: greenfield`. A brand-new project you
+want treated as brownfield immediately → set `itd-profile: brownfield` (or let
+it flip automatically once history accrues). `/adopt` can stamp `brownfield`
+when it onboards a legacy project.
+
+---
+
+## `itd-domain: data-sensitive` — read-only-before-mutate gate
+
+**What it does.** Declares that the project mutates production, financial, or
+otherwise irreplaceable data. In such a project the standing convention is:
+
+> **Model the change read-only first, show the before/after, get explicit
+> confirmation, and only then mutate.** Never run a data-mutating operation
+> (production write, mass re-post, destructive migration, money movement)
+> straight from an ad-hoc command.
+
+This is guidance the agent must follow, reinforced by the existing safety hooks
+(`careful.sh`, `risk-score.sh`) — it does not silently auto-block, it makes the
+"dry-run first" step mandatory and visible.
+
+**How to enable.** Same mechanism, in the project's `CLAUDE.md`:
+
+```
+<!-- itd:data-sensitive -->
+```
+
+or
+
+```
+itd-domain: data-sensitive
+```
+
+**When to use.** Accounting/ERP systems, anything touching a live customer DB,
+payment flows, bulk re-processing jobs. Example: the payment-calendar work on
+the OneOfS accounting platform models plan/fact read-only across all legal
+entities before any write, and never touches the live DB until a before/after is
+approved.
+
+---
+
+## `itd-route: strict` — strict steps of the daily skills
+
+**What it does.** `/bugfix`, `/test` and `/refactor` run a short minimal path by
+default: reproduce, find the cause, minimal fix, regression test, run the suite
+(`/refactor`: green baseline, refactor, green again). The strict route adds the
+steps of each skill's `references/strict.md`: the edit-scope freeze
+(`hooks/freeze.sh`) in `/bugfix` and `/refactor`, the fail-closed
+`ROOT_CAUSE.md` in `/bugfix`, the mutation refute pass in `/test`.
+
+`/task` and `/adopt` read the same marker with the same Step 0 command (plan
+session 9). `/task` on the minimal path routes, or does a small feature
+directly - change, tests for the new code, suite run; the strict route adds the
+PIV-lite pipeline with `/test`, `/review` and adjudication, process-cost
+classification and the WIP=1 unit ledger. `/adopt` on the minimal path writes
+only the pointer block in `CLAUDE.md` / `AGENTS.md` with the test, lint and
+build commands found in the manifests; `/adopt strict` (or a project that
+already declares the marker) gives the full set - this marker line inside the
+block, the `.itd/` contracts, `.itd-memory/` state with a first unit, the
+merge-gate profile, project hooks, one `/session-save`
+(`tests/verify_task_adopt_route.py`).
+
+**How to enable.** `/adopt strict` writes the line for you (and refuses when it
+would land beyond the first 8 KB). By hand: in the first 8 KB of the project's `CLAUDE.md`,
+`.claude/CLAUDE.md` or `AGENTS.md`, as a line by itself or as the comment:
+
+```
+<!-- itd:strict -->
+```
+
+or
+
+```
+itd-route: strict
+```
+
+`itd-domain: data-sensitive` also turns the strict route on. For a single call,
+pass `--strict` to the skill; a task in a strict class of the global rules (the
+methodology's own critical mechanisms, money, access, deploy, migrations,
+production data) takes the strict route without a marker.
+
+**What does not.** The `.itd/` contracts or a `.itd/SCOPE_LOCK.md` alone do not
+make a project strict: adopted ordinary projects have them too. Neither does the
+key inside a sentence, a prefixed key (`not-itd-route: strict`) or a bare
+`itd:strict` outside the comment. Each skill
+checks the marker with the same one-line command in its Step 0
+(`tests/verify_strict_route.py`).
+
+**When to use.** Projects whose own process keeps the strict route: financial
+documents and integrations (invoices), production data, and any project whose
+owner wants the freeze and the root-cause file on every fix.
+
+## Design guarantees
+
+- **Safe default.** A fresh project (few commits, or no git) stays greenfield —
+  the pipeline is available exactly as before. Auto-detection only flips an
+  *established* repo to brownfield, which is where the pipeline was ceremony
+  anyway; an explicit `itd-profile: greenfield` always overrides.
+- **`data-sensitive` is opt-in.** It never activates on its own — set it
+  deliberately.
+- **Override always wins.** An explicit `itd-profile:` marker beats
+  auto-detection in either direction; the project owner has the final say.
+- **Composable.** A project can set both markers (a brownfield, data-sensitive
+  system — the common case for mature line-of-business software).
+
+---
+
+## Recommended skill sets by scenario (v1.37.0)
+
+The profile picks *which pipeline* fits; this matrix maps the **scenario** to the
+skills that carry it. It removes the last of the "the model guesses" heuristic
+for point-1 (projects of different kind/complexity). Use it as guidance, not a
+hard gate — the skill-hint hook still routes per prompt.
+
+| Scenario | Recommended skills (in order) |
+|---|---|
+| **New product from an idea** (greenfield) | `/discover` → `/blueprint` → `/kickstart` → `/review` → `/test` → `/harden` → `/deploy` |
+| **New feature on an existing codebase** (brownfield) | `/task` → (`/bugfix` \| `/refactor` \| `/perf`) → `/test` → `/review` → `/session-save` |
+| **Bug fix** | `/bugfix` (root-cause gate) → `/test` (regression) → `/review` |
+| **Refactor / tech debt** | `/refactor` → `/test` → `/review`; `/deps-audit` if dependencies |
+| **Data-sensitive change** (`itd-domain: data-sensitive`) | model read-only first → `/task` → `/migrate` (backup + rollback) → `/review`; **never** mutate prod from an ad-hoc command |
+| **Security-critical** (auth / payments / secrets) | `/security-audit` + security-guidance plugin → `/review` |
+| **Legacy onboarding** | `/adopt` → `/strategy` or `/blueprint` |
+| **Advisory / "analyze, don't code"** | `/advisor` (or `/grill-me` to stress-test a decision) — read-only |
+| **Docs** | `/doc` |
+| **Trivial / small script** | minimal — `Скилл: не нужен` (or `SKILL_BYPASS`); no ceremony |
+
+**Complexity axis (how much ceremony):**
+
+- **Trivial** (one-liner, throwaway script) → skip the pipeline; declare `не нужен`.
+- **Small** (single-file feature/fix) → the relevant single skill + `/review`.
+- **Medium** (multi-file feature) → `/task` router + `/test` + `/review` + `/session-save`.
+- **Large** (new product / subsystem) → the full greenfield or brownfield chain above.
+
+Always-on regardless of size: a review of the final candidate (the host's
+native review on the minimal route; on the strict route one independent review
+whose single receipt every gate consumes), tests for new source, and a session
+checkpoint at meaningful state changes.

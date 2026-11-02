@@ -1,0 +1,199 @@
+{
+  "version": 2,
+  "purpose": "Executable verification contract for the active unit.",
+  "unitId": "",
+  "createdAt": "",
+  "commandSchema": {
+    "requiredFields": [
+      "id",
+      "argv",
+      "trustedVerifierPaths",
+      "timeoutSeconds",
+      "expectedOutput",
+      "passFailParser"
+    ],
+    "allowedPassFailParsers": [
+      "exit_code_zero",
+      "stdout_contains",
+      "json_field_equals",
+      "manual_evidence"
+    ]
+  },
+  "commands": [],
+  "requiredArtifacts": [
+    ".itd-memory/STATE.json",
+    ".itd/UNIT_CONTEXT_MANIFEST.json",
+    ".itd/EXECUTION_POLICY.json",
+    ".itd/PERMISSION_MATRIX.json",
+    ".itd/PERMISSION_MATRIX.md",
+    ".itd/TOOL_CAPABILITY_REGISTRY.json",
+    ".itd/VERIFICATION_LOOP_CONTRACT.json",
+    "ITD_REPORT.md"
+  ],
+  "passCriteria": [
+    "All required commands exit 0.",
+    "Expected output rules match.",
+    "Required artifacts exist.",
+    "Failures are recorded as recovery, not success."
+    ,"The active unit has an exact-candidate adjudication receipt matching its risk route."
+  ],
+  "failureMode": "RECOVERY_REQUIRED",
+  "failClosed": "If argv, a protected-base content-bound trusted verifier, a command result, or its parser is missing or ambiguous, status MUST be RECOVERY_REQUIRED — never passed.",
+  "machineGateTrust": {
+    "contractSource": "target-protected-base-head",
+    "commandExecution": "shell-free-argv",
+    "trustedVerifierPolicy": "Every commands[].trustedVerifierPaths entry must resolve to identical regular Git objects in protected base and candidate before any command may run; each command binds its exact executable verifier plus every verifier-side file it reads or executes.",
+    "interpreterIsolation": "Python verifiers use -I (or the protected itd_py.sh --itd-isolated mode), excluding the verifier script directory, candidate working directory, user site packages, and candidate-only startup modules such as sitecustomize.py from import resolution.",
+    "subjectUnderTestBoundary": "Candidate implementation/configuration/artifact paths explicitly loaded or read by a protected verifier are subjects under test, not verifier authority. They may differ and remain exact-candidate-bound; any test-side helper that participates in deciding pass/fail belongs in trustedVerifierPaths.",
+    "rotation": "Add a verifier under a new path and merge it, update this protected contract to trust that already-protected path in a second merge, then use it for implementation changes; a PR may not replace the verifier that attests itself."
+  },
+  "skillDoneSignalSchema": {
+    "purpose": "Machine-readable Definition-of-Done for the verify/impl skills (v1.60.0 — Ось 2). A skill's DoD must be expressed as >=1 structured done-signal below, not only prose Self-validation — so 'done' is a check, not a vibe. verify_dod_coverage.py enforces coverage of the required set and cross-checks every sentinel ref against the skill that writes it.",
+    "allowedDoneSignalTypes": [
+      "sentinel",
+      "command",
+      "artifact",
+      "json_field",
+      "evidence"
+    ],
+    "requiredCoverageSkills": [
+      "review",
+      "test",
+      "security-audit",
+      "perf",
+      "bugfix",
+      "refactor",
+      "deps-audit",
+      "migrate",
+      "harden",
+      "infra"
+    ]
+  },
+  "skillDefinitionOfDone": {
+    "review": {
+      "roleClass": "verify",
+      "doneSignals": [
+        {
+          "type": "artifact",
+          "ref": ".itd-memory/review-cache.json",
+          "desc": "durable exact-context review record for the current candidate"
+        },
+        {
+          "type": "json_field",
+          "ref": "records.general.accepted",
+          "desc": "true only for an accepted verdict whose complete context key still matches"
+        },
+        {
+          "type": "json_field",
+          "ref": "records.general.verificationReceipt.outcome",
+          "desc": "PASSED only while the adjudicated Verification Loop chain revalidates"
+        }
+      ]
+    },
+    "test": {
+      "roleClass": "verify",
+      "doneSignals": [
+        {
+          "type": "sentinel",
+          "ref": "claude-test-done",
+          "desc": "suite actually ran and passed this session"
+        },
+        {
+          "type": "evidence",
+          "ref": "red->green",
+          "desc": "fail-closed TDD evidence: real run output, not 'should pass'"
+        }
+      ]
+    },
+    "security-audit": {
+      "roleClass": "verify",
+      "doneSignals": [
+        {
+          "type": "artifact",
+          "ref": ".itd-memory/review-cache.json",
+          "desc": "durable exact-context security-review record for the current candidate"
+        },
+        {
+          "type": "json_field",
+          "ref": "records.security.accepted",
+          "desc": "true only for an accepted security verdict; BLOCKED or UNVERIFIED remains closed"
+        },
+        {
+          "type": "json_field",
+          "ref": "records.security.verificationReceipt.outcome",
+          "desc": "PASSED only while the security adjudication chain revalidates"
+        }
+      ]
+    },
+    "perf": {
+      "roleClass": "verify",
+      "doneSignals": [
+        {
+          "type": "evidence",
+          "ref": "before/after",
+          "desc": "fail-closed: bottleneck measured before/after, not guessed"
+        }
+      ]
+    },
+    "bugfix": {
+      "roleClass": "impl",
+      "doneSignals": [
+        {
+          "type": "evidence",
+          "ref": "red->green",
+          "desc": "regression test fails on the old code, passes on the fix"
+        }
+      ]
+    },
+    "refactor": {
+      "roleClass": "impl",
+      "doneSignals": [
+        {
+          "type": "command",
+          "ref": "test-suite",
+          "desc": "behavior-preserving: existing suite green before AND after"
+        }
+      ]
+    },
+    "deps-audit": {
+      "roleClass": "verify",
+      "doneSignals": [
+        {
+          "type": "artifact",
+          "ref": "deps-audit-report",
+          "desc": "severity-tiered CVE/license/abandonment report produced"
+        }
+      ]
+    },
+    "migrate": {
+      "roleClass": "impl",
+      "doneSignals": [
+        {
+          "type": "sentinel",
+          "ref": "claude-migrate-done",
+          "desc": "migration ran with a backup + a rollback path"
+        }
+      ]
+    },
+    "harden": {
+      "roleClass": "impl",
+      "doneSignals": [
+        {
+          "type": "artifact",
+          "ref": "runbook+health",
+          "desc": "generated hardening artifacts (health checks, runbook, limits)"
+        }
+      ]
+    },
+    "infra": {
+      "roleClass": "impl",
+      "doneSignals": [
+        {
+          "type": "artifact",
+          "ref": "iac+plan-step",
+          "desc": "generated IaC (Terraform/Helm/K8s) plus a documented plan/validate step the user runs before apply — /infra generates, it does not itself apply"
+        }
+      ]
+    }
+  }
+}

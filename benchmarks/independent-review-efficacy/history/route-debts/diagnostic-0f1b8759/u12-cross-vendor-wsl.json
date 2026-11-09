@@ -1,0 +1,238 @@
+{
+  "signatureHex": "1119972855f196795ec784bed63e519a1442b830a6bfd00688b047b52232c24f9a5addaff071db43b1169f465de9a92d3f22d6bd6b22f2bf50643077d384dd03",
+  "signed": {
+    "cases": [
+      {
+        "attempts": 1,
+        "id": "high-export-capacity",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "1709f4e4999695aae87db4d280d1a20a04aa4a4ed6039b3e0730c956135647fa",
+        "report": {
+          "findings": [
+            {
+              "category": "scale/specification compliance",
+              "confidence": "high",
+              "file": "src/export.ts",
+              "line": 10,
+              "severity": "high",
+              "summary": "The export passes all projected 1,807,231 rows to a single worksheet even though Excel permits only 1,048,576 rows. No capacity check, aggregation, or other bounded representation is implemented, so the default export must either fail, truncate data, or create an invalid workbook and therefore cannot satisfy the downloadability and worksheet-capacity acceptance criteria."
+            }
+          ],
+          "unverified": [
+            "The supplied diff does not show writeSingleBrowserWorksheet, so its exact behavior when given more than Excel's row limit (error, truncation, or invalid output) cannot be verified.",
+            "No tests are shown for the default annual dataset, row-limit handling, successful browser download, or reconciliation of exported records."
+          ],
+          "verdict": "BLOCKED"
+        },
+        "session": "01a076e3-bccd-7d51-8f8a-f8d3043b5187"
+      },
+      {
+        "attempts": 1,
+        "id": "high-reconciliation-omission",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "f516f8e28bc27fd97ef8e532787ea2d0ea49a8689417ab878b6bf4520f951904",
+        "report": {
+          "findings": [
+            {
+              "category": "correctness/reconciliation",
+              "confidence": "high",
+              "file": "src/turnover.ts",
+              "line": 4,
+              "severity": "high",
+              "summary": "displayedClosing subtracts only expense and fx_eur consumption, omitting the supported fx_other category. With the observed fx_other total of 1494440 TRY, the displayed closing balance is overstated by exactly 1494440 TRY and cannot reconcile for all supported consumption types."
+            },
+            {
+              "category": "specification-compliance",
+              "confidence": "high",
+              "file": "src/turnover.ts",
+              "line": 1,
+              "severity": "high",
+              "summary": "The change only computes a closing value; it does not display or return the required exact opening, inflow, per-category outflow, conversion, and closing turnover for every pool consumer category."
+            }
+          ],
+          "unverified": [
+            "No tests are shown for exact reconciliation across expense, fx_eur, and fx_other, including mixed-consumption pools.",
+            "The definitions of Pool and sum are not supplied, so currency precision, rounding behavior, missing-value handling, and numerical stability cannot be verified."
+          ],
+          "verdict": "BLOCKED"
+        },
+        "session": "01a076e4-af1c-7f01-8727-4dcb023f69fc"
+      },
+      {
+        "attempts": 1,
+        "id": "medium-allocation-rounding",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "a6b300190d8bb066d4271b0d644bdad0b81de843af7736cea1f6d3b5d8624b8a",
+        "report": {
+          "findings": [
+            {
+              "category": "reconciliation",
+              "confidence": "high",
+              "file": "src/allocation.ts",
+              "line": 2,
+              "severity": "high",
+              "summary": "Each detail amount is rounded independently, so the returned amounts are not guaranteed to sum to the currency-rounded source. This directly violates the acceptance criterion and matches the reported aggregate drift; the allocation needs a deterministic residual-cent distribution or equivalent reconciliation step."
+            },
+            {
+              "category": "input-validation",
+              "confidence": "high",
+              "file": "src/allocation.ts",
+              "line": 2,
+              "severity": "medium",
+              "summary": "The function neither verifies nor normalizes that shares sum to 1, so incomplete, excessive, empty, negative, or non-finite shares can produce totals unrelated to the source amount."
+            }
+          ],
+          "unverified": [
+            "No tests are shown for exact cent reconciliation across representative row counts, fractional shares, negative amounts, or floating-point boundary values."
+          ],
+          "verdict": "BLOCKED"
+        },
+        "session": "01a076e5-56b0-7741-b204-0e221f010a23"
+      },
+      {
+        "attempts": 1,
+        "id": "high-stale-generated-client",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "a52428930a6034d83ddca2f69a4fbc0d056ecd24109a9ccdcd6c8043ef726f80",
+        "report": {
+          "findings": [
+            {
+              "category": "specification compliance",
+              "confidence": "high",
+              "file": "package.json",
+              "line": 7,
+              "severity": "high",
+              "summary": "The verify script removes `prisma generate`, so generated clients are not refreshed before typecheck after schema changes."
+            },
+            {
+              "category": "error handling",
+              "confidence": "high",
+              "file": "package.json",
+              "line": 7,
+              "severity": "high",
+              "summary": "The `|| echo existing Prisma mismatch` fallback converts every TypeScript failure into a successful exit, making the release gate non-truthful and masking failures unrelated to Prisma."
+            }
+          ],
+          "unverified": [],
+          "verdict": "BLOCKED"
+        },
+        "session": "01a076e5-a6c0-7581-a6c0-b76ad3ae3162"
+      },
+      {
+        "attempts": 1,
+        "id": "medium-repository-hygiene",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "e062795c6dcdb9678a3b75756ebbcaba47c1b6b8b6b6a6ce728e69387968b41e",
+        "report": {
+          "findings": [
+            {
+              "category": "repository hygiene / specification compliance",
+              "confidence": "high",
+              "file": "review-tools/local_probe.py",
+              "line": 1,
+              "severity": "high",
+              "summary": "A file explicitly identified as a temporary local reviewer probe is added to the release tree, violating the requirement to ship only product and durable public methodology artifacts."
+            },
+            {
+              "category": "repository hygiene / specification compliance",
+              "confidence": "high",
+              "file": "ROOT_CAUSE.md",
+              "line": 1,
+              "severity": "high",
+              "summary": "Private scratch notes from the review run are added to the release tree, directly violating the frozen acceptance criteria."
+            }
+          ],
+          "unverified": [
+            "The supplied diff does not provide enough evidence to verify operational feasibility, correctness, scale and bounded output, reconciliation, numerical stability, generated-artifact freshness, error handling, security, or tests beyond the identified repository-hygiene violations."
+          ],
+          "verdict": "BLOCKED"
+        },
+        "session": "01a076e6-1a41-7283-969e-a55c733fa2a7"
+      },
+      {
+        "attempts": 1,
+        "id": "clean-bounded-reconciled-export",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "a0d640c159b42137da0fd6205e871570fb878c46c89c00fee9a6bfc0cbc7f60c",
+        "report": {
+          "findings": [],
+          "unverified": [],
+          "verdict": "PASSED"
+        },
+        "session": "01a076e7-0e7c-74f2-a1a8-709aaf9d1659"
+      },
+      {
+        "attempts": 1,
+        "id": "clean-inclusive-utc-day-span",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "c57f66fd04a9da3b401174a0412fd856bf270ea8fe1763d435b066076af610af",
+        "report": {
+          "findings": [],
+          "unverified": [],
+          "verdict": "PASSED"
+        },
+        "session": "01a076e7-6f82-7072-98f6-f2e0b3df94ef"
+      },
+      {
+        "attempts": 1,
+        "id": "clean-nearest-rank-percentile",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "c533df1f782bbd982cf8567315d09383e505c9e3c9560c55455fe1ea4bb8ed40",
+        "report": {
+          "findings": [],
+          "unverified": [],
+          "verdict": "PASSED"
+        },
+        "session": "01a076e7-d33d-7490-add8-f91a3ae4343a"
+      },
+      {
+        "attempts": 1,
+        "id": "clean-half-up-basis-point-fee",
+        "observedModel": "gpt-5.6-sol",
+        "promptSha256": "338c243eb99b74abd7a1a65cb6e43f9bdfb60017eab97a5c39988bda5dad938f",
+        "report": {
+          "findings": [],
+          "unverified": [],
+          "verdict": "PASSED"
+        },
+        "session": "01a076e8-5b03-78a1-b1b4-eb494cf8aee9"
+      }
+    ],
+    "host": "wsl",
+    "hostRuntime": {
+      "osName": "posix",
+      "pythonImplementation": "cpython",
+      "release": "6.6.87.2-microsoft-standard-WSL2",
+      "system": "Linux"
+    },
+    "keyId": "gpg003-local-producer-20260803",
+    "kind": "itd-independent-review-semantic-efficacy-run",
+    "manifestSha256": "da858327f654f000cb97785a0ad3dcc1f6dc18d9c82ae33fe803bb10768d3423",
+    "observedAt": "2026-09-06T13:29:37Z",
+    "producerSha256": "0f1b875997c1db31b73a6188e1b5f5070565022e462f44e4d416c9242d0e55b3",
+    "reviewer": {
+      "isolation": {
+        "ephemeral": true,
+        "freshSession": true,
+        "inheritedContext": false,
+        "networkTools": false,
+        "observedToolCallsZero": true,
+        "paidApi": false,
+        "repositoryAccess": false,
+        "repositoryMutation": false,
+        "secrets": false,
+        "shellTools": false
+      },
+      "makerModel": "claude-opus-5",
+      "makerProvider": "anthropic-subscription",
+      "paidApiCalls": 0,
+      "provider": "openai-subscription",
+      "proxySha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "requestedModel": "gpt-5.6-sol",
+      "runtimeVersion": "0.146.0",
+      "transportExecutableSha256": "2e863156ed35ecc5253b1e2f907a9143077b9f7cb51942070c61996471ff6e04"
+    },
+    "runnerSha256": "432ea51ec0a93ef90aa82b655a84c600666d4268d5ac4673c149fd2a4a9938fc",
+    "version": 1
+  }
+}

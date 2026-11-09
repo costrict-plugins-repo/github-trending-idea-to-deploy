@@ -1,0 +1,22 @@
+# Expected files after /handoff runs
+#
+# /handoff is a memory-write skill — it produces a compact context packet.
+#
+# Produces (plan session 7: the /session-save continuity format):
+#   .itd-memory/continuity/<topic>.md — the topic document, rewritten whole: frontmatter
+#                         (topic, status, updated, branch, unit) + Следующее действие,
+#                         Состояние, Решения, Проверки, Блокеры
+#   HANDOFF.md          — the same document + `## Передача` in project root
+#                         (From → To, reason, inputs [[STATE]]/[[BUILD_PLAN]],
+#                         write areas + forbidden changes, verification commands,
+#                         [!warning] risks); the next action is one [!todo] line
+#   STATE.json (update) — refreshed state slice in the project's memory dir
+#                         (schema: docs/templates/itd-memory/STATE.json)
+#
+# /handoff MUST NOT:
+#   - Store secrets / keys / tokens in HANDOFF.md
+#   - Modify source code or project artifacts (it transfers context, not work)
+#   - Replace /session-save (milestone save) — these are distinct
+#
+# Validation deferred (status: pending) — same bucket as fixture-15-advisor.
+# Manual verification via the checklist in notes.md.

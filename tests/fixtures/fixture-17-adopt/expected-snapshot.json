@@ -1,0 +1,47 @@
+{
+  "$schema_version": "1.0",
+  "fixture_type": "adopt-bootstrap",
+  "skill_under_test": "/adopt",
+  "status": "active",
+  "description": "Bootstrap a legacy project into the idea-to-deploy methodology. Validates that /adopt by default (minimal path, ITD-PLAN-S9) writes one pointer block into CLAUDE.md (append-with-marker) that names the installed methodology and the test, lint and build commands found in the manifests; pre-existing CLAUDE.md content is preserved. .claude/settings.json, .itd/ and .itd-memory/ are written only on the strict route (/adopt strict).",
+  "files": {
+    "required": [
+      "CLAUDE.md"
+    ],
+    "optional": [
+      ".claude/settings.json"
+    ],
+    "min_count": 1
+  },
+  "content_contracts": {
+    "CLAUDE.md": {
+      "required_sections": [
+        "idea-to-deploy|Методология|Methodology"
+      ],
+      "must_contain": [
+        "<!-- idea-to-deploy:begin",
+        "<!-- idea-to-deploy:end -->"
+      ],
+      "must_contain_any_of": {
+        "methodology_version": [
+          "<!-- idea-to-deploy:begin v"
+        ],
+        "adoption_marker": [
+          "/adopt",
+          "adopted",
+          "адоптиров"
+        ]
+      },
+      "min_length_chars": 400
+    }
+  },
+  "rubric_status": {
+    "expected": [
+      "PASSED",
+      "PASSED_WITH_WARNINGS"
+    ],
+    "forbidden": [
+      "BLOCKED"
+    ]
+  }
+}

@@ -1,0 +1,2 @@
+.itd-memory/continuity/<topic>.md
+.itd-memory/HISTORY.md

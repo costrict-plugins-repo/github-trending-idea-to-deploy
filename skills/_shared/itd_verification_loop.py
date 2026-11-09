@@ -1,0 +1,2711 @@
+#!/usr/bin/env python3
+"""Proof-carrying, risk-tiered Verification Loop for Idea to Deploy.
+
+The model is not a trust root.  This producer executes machine oracles, binds
+their output to the exact staged candidate, turns a durable reviewer report
+into a provenance-bearing checker receipt, and deterministically adjudicates
+the two.  Receipt files are diagnostic until an adjudication receipt validates
+against the *current* candidate.
+
+No arguments is a quiet no-op so global installations remain safe.  The module
+is importable by /goal and /review cache consumers.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import os
+import platform
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+# Enforce this at the entrypoint, not only in wrappers: direct callers may
+# omit -B, and -I ignores PYTHONDONTWRITEBYTECODE from the environment.
+sys.dont_write_bytecode = True
+
+
+INSTALL_ROOT = Path(__file__).resolve().parents[2]
+POLICY_PATH = Path(__file__).with_name("VERIFICATION_LOOP_POLICY.json")
+FREE_REVIEWER_PATH = Path(__file__).with_name("itd_free_reviewer_producer.py")
+REVIEW_CACHE_PATH = INSTALL_ROOT / "skills" / "review" / "scripts" / "itd_review_cache.py"
+RECEIPT_VERSION = 1
+ALLOWED_VERDICTS = {"PASSED", "PASSED_WITH_WARNINGS", "BLOCKED", "UNVERIFIED", "FAILED"}
+# ADR-007: an adjudication receipt is honestly either a clean PASSED or a
+# human-adjudicated ADJUDICATED; the checker's own verdict is never rewritten.
+ADJUDICATION_OUTCOMES = ("PASSED", "ADJUDICATED")
+DISPOSITION_CLASSES = ("accepted-trade-off", "refuted-by-evidence", "fixed")
+# The stop rule drafts dispositions with this placeholder in every field a
+# human must author (confirmedBy, class, rationale, evidence); a draft that
+# still carries it anywhere was not adjudicated and can never mint.
+DRAFT_PLACEHOLDER = "ЗАПОЛНИТЬ"
+# The confirmation is a closed affirmative sentence binding the exact checker
+# receipt: arbitrary prose, negations, or a confirmation reused from another
+# receipt can never mint (ADR-007).
+CONFIRMATION_TEMPLATE = ("I adjudicated every finding of checker receipt "
+                         "{sha256} and accept the recorded dispositions")
+V2_ADJUDICATION_VERSION = "itd-human-adjudication-v2"
+V2_APPROVAL_DOMAIN = "itd-human-adjudication-binding-v2"
+V2_CONFIRMATION_TEMPLATE = ("I affirm exact v2 approval binding {sha256} and "
+                            "accept every recorded disposition")
+RISK_TIERS = {"low", "medium", "high", "unknown"}
+ACCEPTANCE_CONTRACT_PATH = ".itd/ACCEPTANCE_CONTRACT.json"
+CHECKER_MODES = {"targeted", "full"}
+FENCED_JSON_RE = re.compile(r"```json\s*(.*?)```", re.I | re.S)
+CHECKOUT_PROBE_TIMEOUT_SECONDS = 60
+JSON_INPUT_MAX_BYTES = 4 * 1024 * 1024
+MACHINE_RUN_FIELDS = frozenset({
+    "id", "command", "commandSha256", "shell", "shellSha256",
+    "startedAt", "completedAt", "timeoutSeconds", "executionMode",
+    "executedTree", "exitCode",
+    "stdoutSha256", "stderrSha256",
+})
+
+
+class LoopError(ValueError):
+    def __init__(self, why: str, fix: str) -> None:
+        super().__init__(why)
+        self.why = why
+        self.fix = fix
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+class EvidenceClock:
+    """Emit wall-readable timestamps ordered by a monotonic process clock."""
+
+    def __init__(self) -> None:
+        self._wall_start = dt.datetime.now(dt.timezone.utc)
+        self._monotonic_start = time.monotonic()
+
+    def now_iso(self) -> str:
+        elapsed = max(0.0, time.monotonic() - self._monotonic_start)
+        value = self._wall_start + dt.timedelta(seconds=elapsed)
+        return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes()) if path.is_file() else "missing"
+
+
+def read_json(path: Path, label: str) -> dict[str, Any]:
+    fd: int | None = None
+    try:
+        before = path.lstat()
+        if _is_link_or_reparse(path) or not stat.S_ISREG(before.st_mode):
+            raise LoopError(
+                f"{label} is not a regular no-link file: {path}",
+                "Use a bounded regular JSON file inside the Verification Loop evidence root.",
+            )
+        if before.st_size > JSON_INPUT_MAX_BYTES:
+            raise LoopError(
+                f"{label} exceeds the {JSON_INPUT_MAX_BYTES}-byte limit: {path}",
+                "Regenerate a compact machine-readable receipt.",
+            )
+        flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        identity = (before.st_dev, before.st_ino)
+        if (not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != identity):
+            raise LoopError(
+                f"{label} changed while opening: {path}",
+                "Freeze the receipt and retry adjudication.",
+            )
+        chunks: list[bytes] = []
+        remaining = JSON_INPUT_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(fd)
+        current = path.lstat()
+        if (len(payload) > JSON_INPUT_MAX_BYTES
+                or (after.st_dev, after.st_ino) != identity
+                or (current.st_dev, current.st_ino) != identity
+                or _is_link_or_reparse(path)
+                or current.st_size != len(payload)):
+            raise LoopError(
+                f"{label} changed or exceeded its bound while reading: {path}",
+                "Freeze a regular receipt no larger than 4 MiB and retry.",
+            )
+        value = json.loads(payload.decode("utf-8"))
+    except LoopError:
+        raise
+    except Exception as exc:
+        raise LoopError(f"{label} is unreadable: {path}: {exc}",
+                        f"Repair or regenerate {path} through the Verification Loop producer.") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not isinstance(value, dict):
+        raise LoopError(f"{label} is not a JSON object: {path}",
+                        "Use the machine-readable receipt schema, not prose.")
+    return value
+
+
+def load_policy() -> tuple[dict[str, Any], str]:
+    policy = read_json(POLICY_PATH, "Verification Loop policy")
+    routes = policy.get("riskRoutes") or {}
+    invariants = policy.get("invariants") or {}
+    expected = {
+        "low": ("machine_only", False),
+        "medium": ("targeted", True),
+        "high": ("full", True),
+        "unknown": ("full", True),
+    }
+    malformed = (policy.get("version") != 1
+                 or policy.get("id") != "verification-loop-v1"
+                 or policy.get("defaultEnabled") is not True
+                 or policy.get("acceptedVerdicts") != ["PASSED"]
+                 or policy.get("candidateHashAlgorithm") != "sha256"
+                 or type(policy.get("maxReceiptAgeSeconds")) is not int
+                 or policy.get("maxReceiptAgeSeconds", 0) <= 0
+                 or type(policy.get("maxAttemptsPerCandidate")) is not int
+                 or not 1 <= policy.get("maxAttemptsPerCandidate", 0) <= 5)
+    for risk, (mode, required) in expected.items():
+        route = routes.get(risk) or {}
+        malformed = malformed or route.get("checkerMode") != mode \
+            or route.get("checkerRequired") is not required
+    threat = policy.get("threatModel") or {}
+    malformed = malformed or (
+        threat.get("trustRoot") != "honest-host-orchestrator"
+        or threat.get("externalClaimsWithoutHostEvidence") != "UNVERIFIED"
+        or "malicious-same-os-principal" not in (threat.get("nonGuarantees") or [])
+        or "cryptographic-model-identity-attestation" not in
+        (threat.get("nonGuarantees") or []))
+    required_invariants = {
+        "makerNarrationMayMintAcceptedVerdict": False,
+        "harnessExecutesVerificationCommands": True,
+        "machineExecutionMode": "isolated-staged-tree",
+        "machineOutputRetention": "hashes-only",
+        "undeclaredIgnoredInputsEnterMachineOracle": False,
+        "immutableReceiptPublicationRequired": True,
+        "exactCandidateBindingRequired": True,
+        "candidateChangeInvalidatesReceipts": True,
+        "plainTextCheckerEvidenceAccepted": False,
+        "majorityVoteIsEvidence": False,
+        "missingRequiredChecker": "UNVERIFIED",
+        "externalOutcomeClaimsRequireExternalEvidence": True,
+        "samePrincipalByzantineResistanceClaimed": False,
+    }
+    malformed = malformed or any(invariants.get(k) != v
+                                 for k, v in required_invariants.items())
+    if malformed:
+        raise LoopError("Verification Loop policy is malformed or weakened",
+                        "Restore the frozen risk routes and trust invariants before accepting receipts.")
+    return policy, sha256_file(POLICY_PATH)
+
+
+def _review_cache_module():
+    spec = importlib.util.spec_from_file_location("itd_loop_review_cache", REVIEW_CACHE_PATH)
+    if spec is None or spec.loader is None:
+        raise LoopError("exact-context producer cannot be loaded",
+                        "Restore skills/review/scripts/itd_review_cache.py.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def repository_root(root: Path | str) -> Path:
+    try:
+        return Path(_review_cache_module().repository_root(root)).resolve()
+    except LoopError:
+        raise
+    except Exception as exc:
+        raise LoopError(f"repository context is unavailable: {exc}",
+                        "Run the Verification Loop inside a valid Git repository.") from exc
+
+
+EMPTY_DIFF_SHA256 = sha256_bytes(b"")
+
+
+def assert_candidate_not_empty(context: dict[str, str], mode: str) -> None:
+    """Refuse a receipt over nothing; it reads as evidence but attests to none.
+
+    Measured on merged main: after a merge the index equals HEAD, so the staged
+    diff is empty and ``diffHash`` is the sha256 of the empty string. Minting
+    then SUCCEEDED and bound an empty candidate, which is worse than refusing,
+    because a later reader cannot tell it from a receipt over real content. The
+    honest post-merge route is ``committed-head``, so the refusal points there.
+    """
+    if str(context.get("diffHash") or "") != EMPTY_DIFF_SHA256:
+        return
+    raise LoopError(
+        f"{mode} candidate diff is empty and binds nothing",
+        "Stage the intended change, or use committed-head after a merge; a "
+        "receipt over an empty diff is not evidence.",
+    )
+
+
+def candidate_context(
+    root: Path | str,
+    risk_tier: str,
+    candidate_mode: str = "staged",
+) -> dict[str, str]:
+    risk = str(risk_tier or "unknown").lower()
+    if risk not in RISK_TIERS:
+        raise LoopError(f"invalid risk tier: {risk!r}",
+                        "Use low, medium, high or unknown.")
+    try:
+        # Review-cache reuse binds mutable parent state separately. Candidate
+        # receipts must not self-invalidate when a successful verification is
+        # durably reconciled into STATE.json.
+        module = _review_cache_module()
+        context = dict(module.build_context(
+            root, risk, bind_parent_state=False))
+        if candidate_mode == "staged":
+            return context
+        if candidate_mode != "committed-head":
+            raise LoopError(
+                f"invalid candidate mode: {candidate_mode!r}",
+                "Use staged or committed-head.",
+            )
+        repo = repository_root(root)
+        parents = str(module.git(repo, "rev-list", "--parents", "-n", "1", "HEAD"))
+        parts = parents.strip().split()
+        if len(parts) != 2:
+            raise LoopError(
+                "committed-head requires one exact single-parent commit",
+                "Review a normal single-parent submission commit or use staged mode before commit.",
+            )
+        head, parent = parts
+        head_tree = str(module.git(repo, "rev-parse", "HEAD^{tree}")).strip()
+        if context.get("baseCommit") != head or context.get("reviewedTree") != head_tree:
+            raise LoopError(
+                "index does not equal the exact committed HEAD tree",
+                "Commit only the reviewed candidate and keep the checkout clean.",
+            )
+        diff = module.git(
+            repo, "diff", "--binary", "--full-index", "--no-ext-diff",
+            parent, head, "--", binary=True,
+        )
+        assert isinstance(diff, bytes)
+        context["baseCommit"] = parent
+        context["diffHash"] = sha256_bytes(diff)
+        return context
+    except Exception as exc:
+        if isinstance(exc, LoopError):
+            raise
+        raise LoopError(f"exact candidate could not be computed: {exc}",
+                        "Repair Git/index/contracts and retry on one immutable candidate.") from exc
+
+
+def candidate_digest(context: dict[str, Any]) -> str:
+    return "sha256:" + sha256_bytes(canonical(context))
+
+
+def assert_checkout_matches_candidate(repo: Path, context: dict[str, Any]) -> str:
+    """Prove the control-plane checkout still has the index-derived candidate.
+
+    The review key is the staged tree. Unstaged tracked or non-ignored inputs
+    make that key ambiguous and fail closed. Ignored project files are allowed
+    in the control-plane checkout because the machine oracle never executes
+    there: ``isolated_candidate`` materializes only the staged Git tree.
+    """
+    dirty = subprocess.run(
+        ["git", "diff", "--quiet", "--"], cwd=str(repo),
+        timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS)
+    if dirty.returncode not in (0, 1):
+        raise LoopError("working-tree comparison failed",
+                        "Repair Git and retry against one immutable candidate.")
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=str(repo), capture_output=True, timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS)
+    if untracked.returncode != 0:
+        raise LoopError("untracked-file comparison failed",
+                        "Repair Git and retry against one immutable candidate.")
+    if dirty.returncode == 1 or bool(untracked.stdout):
+        raise LoopError(
+            "working tree differs from the staged candidate",
+            "Stage the intended files or remove unstaged/untracked inputs before verification.",
+        )
+    executed_tree = str(_review_cache_module().git(repo, "write-tree")).strip()
+    if executed_tree != context.get("reviewedTree"):
+        raise LoopError("executed tree does not match reviewedTree",
+                        "Freeze and rerun the exact staged candidate.")
+    return executed_tree
+
+
+@contextlib.contextmanager
+def isolated_candidate(repo: Path, context: dict[str, Any]):
+    """Materialize only the staged tree in a disposable local Git checkout.
+
+    ``--shared`` is intentional: an index tree is normally unreachable from
+    HEAD, so the disposable repository needs read-only access to the source
+    object database. No source working-tree file (ignored or otherwise) is
+    copied. The temporary checkout is local even when ``repo`` is a WSL UNC
+    path, which also gives native Windows tools a valid current directory.
+    """
+    with tempfile.TemporaryDirectory(prefix="itd-verification-candidate-") as td:
+        candidate = Path(td) / "candidate"
+        clone = subprocess.run(
+            ["git", "clone", "--shared", "--no-checkout", "--quiet",
+             str(repo), str(candidate)],
+            capture_output=True, timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS,
+        )
+        if clone.returncode != 0:
+            raise LoopError(
+                "isolated candidate checkout could not be created",
+                "Repair Git object access and retry; do not fall back to the source checkout.",
+            )
+        tree = str(context.get("reviewedTree") or "")
+        materialized = subprocess.run(
+            ["git", "-C", str(candidate), "read-tree", "--reset", "-u", tree],
+            capture_output=True, timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS,
+        )
+        if materialized.returncode != 0:
+            raise LoopError(
+                "staged tree could not be materialized in isolation",
+                "Keep the staged Git objects available and retry the exact candidate.",
+            )
+        executed_tree = str(_review_cache_module().git(candidate, "write-tree")).strip()
+        if executed_tree != tree:
+            raise LoopError(
+                "isolated checkout tree does not match reviewedTree",
+                "Stop verification; repair Git materialization before retrying.",
+            )
+        overlays = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=str(candidate), capture_output=True,
+            timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS,
+        )
+        if overlays.returncode != 0 or overlays.stdout:
+            raise LoopError(
+                "isolated candidate contains an unexpected pre-oracle overlay",
+                "Recreate the disposable checkout from the staged tree.",
+            )
+        yield candidate
+
+
+def assert_isolated_candidate(candidate: Path, expected_tree: str) -> None:
+    """Reject an oracle that modified tracked content or the isolated index."""
+    dirty = subprocess.run(
+        ["git", "diff", "--quiet", "--"], cwd=str(candidate),
+        timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS,
+    )
+    if dirty.returncode not in (0, 1):
+        raise LoopError("isolated candidate comparison failed",
+                        "Treat the machine result as UNVERIFIED and retry cleanly.")
+    current_tree = str(_review_cache_module().git(candidate, "write-tree")).strip()
+    if dirty.returncode == 1 or current_tree != expected_tree:
+        raise LoopError(
+            "machine oracle mutated the isolated staged candidate",
+            "Repair the oracle so it leaves tracked candidate inputs unchanged.",
+        )
+
+
+def input_snapshot(path: Path, relative: str) -> dict[str, Any]:
+    """Return a deterministic manifest for one declared non-Git oracle input."""
+    if path.is_symlink():
+        raise LoopError(f"declared input is a symlink: {relative}",
+                        "Use a real project-local file/directory so isolation cannot escape.")
+    if path.is_file():
+        return {"path": relative, "kind": "file", "sha256": sha256_file(path),
+                "fileCount": 1}
+    if not path.is_dir():
+        raise LoopError(f"declared input is not a regular file/directory: {relative}",
+                        "Declare only stable project-local files or directories.")
+    entries: list[dict[str, str]] = []
+    for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+        child_rel = child.relative_to(path).as_posix()
+        if child.is_symlink():
+            raise LoopError(f"declared input contains a symlink: {relative}/{child_rel}",
+                            "Materialize symlink targets inside the declared input snapshot.")
+        if child.is_dir():
+            entries.append({"kind": "directory", "path": child_rel})
+        elif child.is_file():
+            entries.append({"kind": "file", "path": child_rel,
+                            "sha256": sha256_file(child)})
+        else:
+            raise LoopError(f"declared input contains a special file: {relative}/{child_rel}",
+                            "Use only regular files/directories as oracle inputs.")
+    return {"path": relative, "kind": "directory",
+            "sha256": sha256_bytes(canonical(entries)),
+            "fileCount": sum(1 for entry in entries if entry["kind"] == "file")}
+
+
+def _declared_input_paths(repo: Path, raw_inputs: list[str],
+                          policy: dict[str, Any]) -> list[str]:
+    """Validate lexical paths without following repository-controlled links."""
+    values: list[Path] = []
+    receipt_relative = Path(str(policy["receiptDirectory"]))
+    for raw in raw_inputs:
+        candidate = Path(raw)
+        try:
+            relative_path = (candidate.absolute().relative_to(repo)
+                             if candidate.is_absolute() else candidate)
+        except ValueError as exc:
+            raise LoopError(f"declared input escapes the repository: {raw}",
+                            "Declare a project-local input path.") from exc
+        if (not relative_path.parts or relative_path.is_absolute()
+                or any(part in {"", ".", ".."} for part in relative_path.parts)):
+            raise LoopError(f"declared input path is not canonical: {raw}",
+                            "Use a normalized project-relative path without dot segments.")
+        relative = relative_path.as_posix()
+        if "\\" in relative or ":" in relative or "\0" in relative:
+            raise LoopError(f"declared input path is not portable: {raw}",
+                            "Use a canonical slash-separated project-relative path.")
+        if relative_path.parts[0] == ".git":
+            raise LoopError("the Git database cannot be a declared input",
+                            "Declare only the minimal external data needed by the oracle.")
+        if relative_path == receipt_relative or receipt_relative in relative_path.parents:
+            raise LoopError("Verification Loop evidence cannot be its own machine input",
+                            "Keep oracle inputs outside the receipt directory.")
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", relative], cwd=str(repo),
+            capture_output=True, timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS)
+        if tracked.returncode == 0:
+            raise LoopError(f"declared input is already tracked in the staged tree: {relative}",
+                            "Remove redundant --input; tracked files are materialized automatically.")
+        if any(relative_path == prior or relative_path in prior.parents
+               or prior in relative_path.parents for prior in values):
+            raise LoopError(f"declared inputs overlap: {relative}",
+                            "Declare each input exactly once without parent/child overlap.")
+        values.append(relative_path)
+    return sorted(path.as_posix() for path in values)
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    junction_probe = getattr(path, "is_junction", None)
+    try:
+        if callable(junction_probe) and junction_probe():
+            return True
+        attributes = int(getattr(path.lstat(), "st_file_attributes", 0) or 0)
+    except (FileNotFoundError, OSError):
+        return False
+    return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)))
+
+
+def _copy_open_file(source_fd: int, destination: Path, expected: os.stat_result,
+                    label: str) -> None:
+    before = os.fstat(source_fd)
+    if (not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino)):
+        raise LoopError(f"declared input changed while opening: {label}",
+                        "Freeze the input and retry the machine oracle.")
+    target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                offset += os.write(target_fd, chunk[offset:])
+        os.fsync(target_fd)
+    finally:
+        os.close(target_fd)
+    after = os.fstat(source_fd)
+    stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable):
+        raise LoopError(f"declared input changed during snapshot: {label}",
+                        "Freeze the input and retry the machine oracle.")
+
+
+def _copy_open_directory(source_fd: int, destination: Path, label: str) -> None:
+    destination.mkdir(mode=0o700)
+    before_names = sorted(os.listdir(source_fd))
+    directory_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                       | getattr(os, "O_NOFOLLOW", 0))
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    for name in before_names:
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise LoopError(f"declared input contains an invalid entry: {label}",
+                            "Use ordinary portable file names.")
+        info = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        child_label, target = f"{label}/{name}", destination / name
+        if stat.S_ISLNK(info.st_mode):
+            raise LoopError(f"declared input contains a link: {child_label}",
+                            "Materialize links inside the declared input boundary.")
+        flags = directory_flags if stat.S_ISDIR(info.st_mode) else file_flags
+        child_fd = os.open(name, flags, dir_fd=source_fd)
+        try:
+            opened = os.fstat(child_fd)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise LoopError(f"declared input changed while opening: {child_label}",
+                                "Freeze the input and retry the machine oracle.")
+            if stat.S_ISDIR(info.st_mode):
+                _copy_open_directory(child_fd, target, child_label)
+            elif stat.S_ISREG(info.st_mode):
+                _copy_open_file(child_fd, target, info, child_label)
+            else:
+                raise LoopError(f"declared input contains a special file: {child_label}",
+                                "Use only regular files/directories as oracle inputs.")
+        finally:
+            os.close(child_fd)
+    if sorted(os.listdir(source_fd)) != before_names:
+        raise LoopError(f"declared input directory changed during snapshot: {label}",
+                        "Freeze the input and retry the machine oracle.")
+
+
+def _plain_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Identity of one entry bound by the guarded no-dir_fd fallback.
+
+    st_size is bound for regular files only: NTFS moves a directory index
+    between resident and non-resident storage, so a directory size changes
+    with no write behind it — measured 2026-08-10 on a 1.1 GB node_modules
+    tree, two consecutive scans disagreed on 1964/1964 directory entries
+    (4096|8192|12288|32768 -> 0) while the other five fields stayed stable,
+    which made a declared directory input impossible on Windows.
+    """
+    size = 0 if stat.S_ISDIR(info.st_mode) else info.st_size
+    return (info.st_dev, info.st_ino, info.st_mode, size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _plain_source_identities(source: Path, repo: Path,
+                             relative: str) -> dict[str, tuple[int, ...]]:
+    # Windows may hand tempfile/Git paths back through an 8.3 alias
+    # (C:\Users\RUNNER~1) while Path.resolve() expands a descendant through
+    # the long spelling (C:\Users\runneradmin).  Compare canonical spellings
+    # on both sides; otherwise a real project-local input is falsely rejected
+    # as an escape on the guarded no-dir_fd fallback.
+    repo = repo.resolve()
+    source = source.resolve()
+    identities: dict[str, tuple[int, ...]] = {}
+    pending = [source]
+    while pending:
+        current = pending.pop()
+        if _is_link_or_reparse(current):
+            raise LoopError(f"declared input contains a symlink/reparse point: {relative}",
+                            "Materialize it inside real project-local directories.")
+        try:
+            resolved = current.resolve()
+            resolved.relative_to(repo)
+            info = current.lstat()
+        except (ValueError, OSError) as exc:
+            raise LoopError(f"declared input escapes or changed: {relative}",
+                            "Restore a stable project-local input and retry.") from exc
+        identities[resolved.relative_to(repo).as_posix()] = _plain_identity(info)
+        if stat.S_ISDIR(info.st_mode):
+            pending.extend(Path(entry.path) for entry in os.scandir(current))
+        elif not stat.S_ISREG(info.st_mode):
+            raise LoopError(f"declared input contains a special file: {relative}",
+                            "Use only regular files/directories as oracle inputs.")
+    return identities
+
+
+def _plain_ancestor_identities(repo: Path, parts: tuple[str, ...],
+                               relative: str) -> dict[str, tuple[int, ...]]:
+    """Bind every source ancestor for runtimes without dir_fd support."""
+    repo = repo.resolve()
+    identities: dict[str, tuple[int, ...]] = {}
+    current = repo
+    for part in parts[:-1]:
+        current /= part
+        if _is_link_or_reparse(current):
+            raise LoopError(f"declared input ancestor is linked: {relative}",
+                            "Use real project-local source directories.")
+        try:
+            resolved = current.resolve()
+            resolved.relative_to(repo)
+            info = current.lstat()
+        except (ValueError, OSError) as exc:
+            raise LoopError(f"declared input ancestor escapes or changed: {relative}",
+                            "Restore stable project-local source directories.") from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise LoopError(f"declared input ancestor is not a directory: {relative}",
+                            "Use real project-local source directories.")
+        identities[resolved.relative_to(repo).as_posix()] = _plain_identity(info)
+    return identities
+
+
+def secure_copy_declared_source(repo: Path, relative: str, destination: Path) -> None:
+    """Copy from pinned no-follow descriptors into a private snapshot."""
+    parts = Path(relative).parts
+    directory_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                       | getattr(os, "O_NOFOLLOW", 0))
+    if os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd:
+        current_fd = os.open(repo, directory_flags)
+        try:
+            for part in parts[:-1]:
+                info = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise LoopError(f"declared input ancestor is linked: {relative}",
+                                    "Use real project-local source directories.")
+                next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            info = os.stat(parts[-1], dir_fd=current_fd, follow_symlinks=False)
+            flags = directory_flags if stat.S_ISDIR(info.st_mode) else (
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            source_fd = os.open(parts[-1], flags, dir_fd=current_fd)
+            try:
+                opened = os.fstat(source_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise LoopError(f"declared input changed while opening: {relative}",
+                                    "Freeze the input and retry the machine oracle.")
+                if stat.S_ISDIR(info.st_mode):
+                    _copy_open_directory(source_fd, destination, relative)
+                elif stat.S_ISREG(info.st_mode):
+                    _copy_open_file(source_fd, destination, info, relative)
+                else:
+                    raise LoopError(f"declared input is linked/special: {relative}",
+                                    "Use a regular file or directory.")
+            finally:
+                os.close(source_fd)
+        finally:
+            os.close(current_fd)
+        return
+    canonical_repo = repo.resolve()
+    source = canonical_repo.joinpath(*parts)
+    before_ancestors = _plain_ancestor_identities(canonical_repo, parts, relative)
+    before = _plain_source_identities(source, canonical_repo, relative)
+    shutil.copytree(source, destination, symlinks=False) if source.is_dir() else shutil.copy2(source, destination)
+    after_ancestors = _plain_ancestor_identities(canonical_repo, parts, relative)
+    after = _plain_source_identities(source, canonical_repo, relative)
+    if (before_ancestors != after_ancestors or before != after
+            or input_snapshot(source, relative) != input_snapshot(destination, relative)):
+        raise LoopError(f"declared input changed during guarded fallback copy: {relative}",
+                        "Freeze the input or track it on this host.")
+
+
+@contextlib.contextmanager
+def sealed_declared_inputs(repo: Path, raw_inputs: list[str], policy: dict[str, Any]):
+    with tempfile.TemporaryDirectory(prefix="itd-declared-inputs-") as raw:
+        snapshot_root = Path(raw)
+        manifests: list[dict[str, Any]] = []
+        for relative in _declared_input_paths(repo, raw_inputs, policy):
+            destination = secure_destination(snapshot_root, relative)
+            secure_copy_declared_source(repo, relative, destination)
+            manifests.append(input_snapshot(destination, relative))
+        yield sorted(manifests, key=lambda item: str(item["path"])), snapshot_root
+
+
+def secure_destination(candidate: Path, relative: str) -> Path:
+    """Create destination parents without following staged-tree symlinks."""
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or not relative_path.parts \
+            or any(part in {"", ".", ".."} for part in relative_path.parts):
+        raise LoopError(
+            f"declared input destination is not a normalized relative path: {relative}",
+            "Regenerate the declared-input manifest through the harness.",
+        )
+    root = candidate.resolve()
+    destination = root.joinpath(*relative_path.parts)
+    parent_parts = relative_path.parts[:-1]
+
+    # POSIX can keep every lookup relative to a no-follow directory handle.
+    # The fallback retains the same fail-closed lstat/containment checks on
+    # hosts whose Python runtime lacks dir_fd support (notably Windows).
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd_capable = (os.open in os.supports_dir_fd
+                      and os.mkdir in os.supports_dir_fd
+                      and os.stat in os.supports_dir_fd)
+    if dir_fd_capable:
+        current_fd = os.open(root, flags)
+        try:
+            for part in parent_parts:
+                try:
+                    info = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                    info = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise LoopError(
+                        f"declared input destination ancestor is linked or not a directory: {relative}",
+                        "Remove the staged-tree collision; declared inputs may use only real directories.",
+                    )
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+        finally:
+            os.close(current_fd)
+    else:
+        current = root
+        for part in parent_parts:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                current.mkdir(mode=0o700)
+                info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise LoopError(
+                    f"declared input destination ancestor is linked or not a directory: {relative}",
+                    "Remove the staged-tree collision; declared inputs may use only real directories.",
+                )
+            try:
+                current.resolve().relative_to(root)
+            except ValueError as exc:
+                raise LoopError(
+                    f"declared input destination escapes the isolated checkout: {relative}",
+                    "Regenerate the declared-input manifest through the harness.",
+                ) from exc
+
+    try:
+        destination.parent.resolve().relative_to(root)
+    except ValueError as exc:
+        raise LoopError(
+            f"declared input destination escapes the isolated checkout: {relative}",
+            "Regenerate the declared-input manifest through the harness.",
+        ) from exc
+    return destination
+
+
+def copy_declared_inputs(repo: Path, candidate: Path,
+                         manifests: list[dict[str, Any]]) -> None:
+    """Copy the already-sealed input snapshot into the disposable checkout."""
+    for manifest in manifests:
+        relative = str(manifest["path"])
+        source = repo / relative
+        if input_snapshot(source, relative) != manifest:
+            raise LoopError(f"declared input changed before snapshot copy: {relative}",
+                            "Freeze the input and retry verification.")
+        destination = secure_destination(candidate, relative)
+        if destination.exists() or destination.is_symlink():
+            raise LoopError(f"declared input collides with the staged tree: {relative}",
+                            "Track the file or choose a non-overlapping external input.")
+        if source.is_dir():
+            shutil.copytree(source, destination, symlinks=False)
+        else:
+            shutil.copy2(source, destination)
+
+
+def validate_declared_inputs(repo: Path, manifests: Any,
+                             policy: dict[str, Any]) -> None:
+    if not isinstance(manifests, list):
+        raise LoopError("machine declared-input manifest is malformed",
+                        "Regenerate the machine receipt through the harness.")
+    paths: list[str] = []
+    for manifest in manifests:
+        if not isinstance(manifest, dict) or not str(manifest.get("path") or ""):
+            raise LoopError("machine declared-input entry is malformed",
+                            "Regenerate the machine receipt through the harness.")
+        paths.append(str(manifest["path"]))
+    if len(paths) != len(set(paths)):
+        raise LoopError("machine declared-input manifest contains duplicates",
+                        "Regenerate the machine receipt through the harness.")
+    with sealed_declared_inputs(repo, paths, policy) as (current, _snapshot_root):
+        if current != manifests:
+            raise LoopError("declared machine input is missing or changed",
+                            "Restore/freeze the exact input or rerun machine verification.")
+
+
+def trusted_shell_path() -> Path | None:
+    """Resolve a host-owned shell without trusting PATH/COMSPEC/SystemRoot."""
+    if os.name == "nt":
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+        if not length or length >= len(buffer):
+            return None
+        candidate = Path(buffer.value) / "cmd.exe"
+    else:
+        candidate = Path("/bin/sh")
+    try:
+        resolved = candidate.resolve(strict=True)
+        info = resolved.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    if os.name != "nt" and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return None
+    return resolved
+
+
+def verification_shell(
+    command: str, repo: Path
+) -> tuple[list[str] | str, str | None, str, str] | None:
+    """Return an absolute hash-bound native shell transport."""
+    shell = trusted_shell_path()
+    if shell is None:
+        return None
+    shell_digest = sha256_file(shell)
+    if os.name == "nt":
+        # cmd.exe rejects a UNC current directory and silently falls back to
+        # C:\Windows. Start in the trusted system directory, then pushd maps
+        # the UNC path for this short-lived process.
+        native = f'pushd "{repo}" && {command}'
+        start = str(shell.parent)
+        # A list argv makes Python encode the inner quotes as \"; cmd.exe does
+        # not treat backslash as a quote escape. Pass the exact native command
+        # line string while keeping shell=False (the default).
+        return (f'"{shell}" /d /c {native}', start, str(shell), shell_digest)
+    return ([str(shell), "-c", command], str(repo), str(shell), shell_digest)
+
+
+def seal_receipt(payload: dict[str, Any]) -> dict[str, Any]:
+    value = dict(payload)
+    value.pop("receiptSha256", None)
+    value["receiptSha256"] = sha256_bytes(canonical(value))
+    return value
+
+
+def receipt_digest_valid(receipt: dict[str, Any]) -> bool:
+    expected = str(receipt.get("receiptSha256") or "")
+    value = dict(receipt)
+    value.pop("receiptSha256", None)
+    return len(expected) == 64 and expected == sha256_bytes(canonical(value))
+
+
+def write_json_exclusive(path: Path, value: dict[str, Any]) -> None:
+    """Atomically publish immutable JSON without exposing a partial final file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise LoopError(f"stale evidence transaction exists: {tmp}",
+                        "Remove only the unlinked .tmp transaction after confirming its owner is gone.") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            if os.name == "nt":
+                # Windows rename is atomic and refuses an existing target;
+                # unlike hard links, it is supported by WSL UNC/SMB shares.
+                os.rename(tmp, path)
+            else:
+                os.link(tmp, path)
+        except FileExistsError as exc:
+            raise LoopError(f"immutable evidence already exists: {path}",
+                            "Use the next automatically allocated attempt; never overwrite evidence.") from exc
+    except Exception:
+        raise
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def receipt_root(repo: Path, policy: dict[str, Any]) -> Path:
+    path = (repo / str(policy["receiptDirectory"])).resolve()
+    try:
+        path.relative_to(repo)
+    except ValueError as exc:
+        raise LoopError("receipt directory escapes the repository",
+                        "Use the project-local .itd-memory/verification-loop directory.") from exc
+    return path
+
+
+def inside(path: Path, parent: Path, label: str) -> Path:
+    resolved = path.resolve()
+    resolved_parent = parent.resolve()
+    try:
+        resolved.relative_to(resolved_parent)
+    except ValueError as exc:
+        # Native Windows can expose the same directory through both its long
+        # Unicode name and an 8.3 alias (for example ``Dmitry`` versus
+        # ``AACE~1``).  Path.relative_to() is lexical, so that harmless alias
+        # must be reconciled by filesystem identity without weakening the
+        # containment check.  Rebuild the accepted path under the trusted
+        # parent spelling so later relative-path bindings stay deterministic.
+        if os.name == "nt":
+            candidates = (resolved, *resolved.parents)
+            for candidate in candidates:
+                try:
+                    if candidate.exists() and candidate.samefile(resolved_parent):
+                        suffix = resolved.relative_to(candidate)
+                        return resolved_parent / suffix
+                except OSError:
+                    continue
+        raise LoopError(f"{label} escapes {parent}",
+                        f"Place {label} under the durable Verification Loop directory.") from exc
+    return resolved
+
+
+def default_path(repo: Path, policy: dict[str, Any], unit_id: str,
+                 kind: str, context: dict[str, Any], attempt: int | None = None,
+                 identity: str | None = None) -> Path:
+    digest = candidate_digest(context).split(":", 1)[1][:16]
+    safe_unit = re.sub(r"[^A-Za-z0-9_.-]+", "-", unit_id).strip("-") or "unit"
+    suffix = f"-a{attempt}" if attempt is not None else (f"-{identity}" if identity else "")
+    return receipt_root(repo, policy) / "receipts" / digest / f"{safe_unit}-{kind}{suffix}.json"
+
+
+def _attempt_directory(repo: Path, policy: dict[str, Any], context: dict[str, Any],
+                       unit_id: str, risk: str) -> Path:
+    digest = candidate_digest(context).split(":", 1)[1]
+    safe_unit = re.sub(r"[^A-Za-z0-9_.-]+", "-", unit_id).strip("-") or "unit"
+    claim_hash = sha256_bytes(f"{unit_id}\0{risk}".encode("utf-8"))[:16]
+    return receipt_root(repo, policy) / "attempts" / digest / f"{safe_unit}-{risk}-{claim_hash}"
+
+
+def _ledger_entry_digest_valid(entry: dict[str, Any]) -> bool:
+    expected = str(entry.get("entrySha256") or "")
+    value = dict(entry)
+    value.pop("entrySha256", None)
+    return len(expected) == 64 and expected == sha256_bytes(canonical(value))
+
+
+def _read_attempt_entries(directory: Path, *, context: dict[str, Any], unit_id: str,
+                          risk: str, policy_sha: str) -> list[tuple[Path, dict[str, Any]]]:
+    entries: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(directory.glob("attempt-*.json")) if directory.is_dir() else []:
+        match = re.fullmatch(r"attempt-([1-9][0-9]*)\.json", path.name)
+        if not match:
+            raise LoopError(f"attempt ledger contains an invalid entry: {path}",
+                            "Preserve the append-only ledger and escalate for recovery.")
+        entry = read_json(path, "attempt ledger entry")
+        number = int(match.group(1))
+        if (entry.get("version") != 1
+                or entry.get("attempt") != number
+                or entry.get("candidateDigest") != candidate_digest(context)
+                or entry.get("unitId") != unit_id
+                or entry.get("riskTier") != risk
+                or entry.get("policySha256") != policy_sha
+                or not _ledger_entry_digest_valid(entry)):
+            raise LoopError(f"attempt ledger entry is invalid or belongs to another claim: {path}",
+                            "Do not repair history in place; preserve evidence and escalate.")
+        entries.append((path, entry))
+    actual = [int(entry["attempt"]) for _, entry in entries]
+    expected = list(range(1, len(entries) + 1))
+    if actual != expected:
+        raise LoopError(f"attempt ledger is non-contiguous: {actual}",
+                        "Do not renumber or delete attempts; escalate for recovery.")
+    return entries
+
+
+def process_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        query_limited_information = 0x1000
+        still_active = 259
+        handle = ctypes.windll.kernel32.OpenProcess(query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+@contextlib.contextmanager
+def reserve_attempt(repo: Path, policy: dict[str, Any], context: dict[str, Any],
+                    unit_id: str, risk: str, policy_sha: str,
+                    requested: int | None):
+    """Serialize and monotonically allocate one durable candidate/claim attempt."""
+    directory = _attempt_directory(repo, policy, context, unit_id, risk)
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = directory / ".allocate.lock"
+    for acquisition in range(2):
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as handle:
+                handle.write(f"{os.getpid()}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            break
+        except FileExistsError as exc:
+            try:
+                owner = int(lock.read_text(encoding="ascii").strip())
+                owner_alive = process_alive(owner)
+            except (OSError, ValueError):
+                owner_alive = (dt.datetime.now().timestamp() - lock.stat().st_mtime) < 60
+            if acquisition == 0 and not owner_alive:
+                lock.unlink(missing_ok=True)
+                continue
+            raise LoopError("another adjudication is allocating this attempt",
+                            "Wait for the current honest-host adjudication to finish, then retry.") from exc
+    try:
+        entries = _read_attempt_entries(
+            directory, context=context, unit_id=unit_id, risk=risk, policy_sha=policy_sha)
+        attempt = len(entries) + 1
+        if requested is not None and requested != attempt:
+            raise LoopError(
+                f"non-monotonic attempt requested: {requested}; next durable attempt is {attempt}",
+                "Omit --attempt and let the harness allocate the next attempt.",
+            )
+        if attempt > policy["maxAttemptsPerCandidate"]:
+            raise LoopError("attempt budget exhausted",
+                            "Stop the loop and mark RECOVERY_REQUIRED; do not add another agent vote.")
+        yield attempt, directory / f"attempt-{attempt}.json"
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def validate_attempt_entry(repo: Path, policy: dict[str, Any], context: dict[str, Any],
+                           unit_id: str, risk: str, policy_sha: str, attempt: int,
+                           receipt_path: Path, receipt: dict[str, Any]) -> None:
+    directory = _attempt_directory(repo, policy, context, unit_id, risk)
+    entries = _read_attempt_entries(
+        directory, context=context, unit_id=unit_id, risk=risk, policy_sha=policy_sha)
+    if attempt > len(entries):
+        raise LoopError("adjudication is absent from the durable attempt ledger",
+                        "Use only receipts minted by the monotonic harness adjudicator.")
+    entry_path, entry = entries[attempt - 1]
+    ledger_ref = receipt.get("attemptLedger") or {}
+    expected_entry_rel = entry_path.relative_to(repo).as_posix()
+    expected_receipt_rel = receipt_path.relative_to(repo).as_posix()
+    if (ledger_ref.get("entryPath") != expected_entry_rel
+            or ledger_ref.get("sequence") != attempt
+            or entry.get("receiptPath") != expected_receipt_rel
+            or entry.get("receiptFileSha256") != sha256_file(receipt_path)):
+        raise LoopError("adjudication and append-only attempt ledger do not match",
+                        "Discard copied/overwritten evidence and use the original minted receipt.")
+
+
+def make_attempt_entry(repo: Path, receipt_path: Path, receipt: dict[str, Any]) -> dict[str, Any]:
+    entry = {
+        "version": 1,
+        "createdAt": now_iso(),
+        "candidateDigest": receipt["candidateDigest"],
+        "unitId": receipt["unitId"],
+        "riskTier": receipt["riskTier"],
+        "policySha256": receipt["policySha256"],
+        "attempt": receipt["attempt"],
+        "receiptPath": receipt_path.relative_to(repo).as_posix(),
+        "receiptFileSha256": sha256_file(receipt_path),
+    }
+    entry["entrySha256"] = sha256_bytes(canonical(entry))
+    return entry
+
+
+def parse_time(value: str) -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    except Exception as exc:
+        raise LoopError(f"receipt timestamp is invalid: {value!r}",
+                        "Regenerate the receipt through the harness.") from exc
+
+
+def ensure_fresh(receipt: dict[str, Any], policy: dict[str, Any]) -> None:
+    created = parse_time(str(receipt.get("createdAt") or ""))
+    age = (dt.datetime.now(dt.timezone.utc) - created).total_seconds()
+    if age < -300 or age > policy["maxReceiptAgeSeconds"]:
+        raise LoopError(f"receipt is stale or future-dated ({int(age)} seconds)",
+                        "Rerun verification/checker on the current candidate.")
+
+
+def parse_report(text: str) -> dict[str, Any]:
+    objects: list[dict[str, Any]] = []
+    for match in FENCED_JSON_RE.finditer(text):
+        try:
+            value = json.loads(match.group(1))
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+    try:
+        whole = json.loads(text)
+        if isinstance(whole, dict):
+            objects.append(whole)
+    except Exception:
+        pass
+    for value in reversed(objects):
+        if set(value) != {"verdict", "findings", "unverified"}:
+            continue
+        verdict = str(value.get("verdict") or "").upper()
+        if (
+            verdict in ALLOWED_VERDICTS
+            and isinstance(value.get("findings"), list)
+            and isinstance(value.get("unverified"), list)
+        ):
+            return value
+    raise LoopError("checker report has no valid verdict/findings/unverified JSON block",
+                    "Finish the review report with the canonical vendor-neutral verdict block.")
+
+
+def relative_artifact(repo: Path, path: Path, allowed: Path, label: str) -> str:
+    resolved = inside(path, allowed, label)
+    if not resolved.is_file():
+        raise LoopError(f"{label} is missing: {resolved}",
+                        f"Persist the complete {label} before minting a receipt.")
+    return resolved.relative_to(repo).as_posix()
+
+
+def validate_common(receipt: dict[str, Any], *, kind: str, repo: Path,
+                    risk: str, unit_id: str, policy: dict[str, Any],
+                    policy_sha: str, candidate_mode: str = "staged") -> None:
+    if receipt.get("version") != RECEIPT_VERSION or receipt.get("kind") != kind:
+        raise LoopError(f"expected {kind} receipt version {RECEIPT_VERSION}",
+                        "Regenerate the receipt through itd_verification_loop.py.")
+    if not receipt_digest_valid(receipt):
+        raise LoopError("receipt digest is invalid", "Discard the edited/forged receipt and rerun the producer.")
+    if receipt.get("policySha256") != policy_sha:
+        raise LoopError("receipt policy binding is stale",
+                        "Regenerate receipts after a Verification Loop policy change.")
+    if str(receipt.get("unitId") or "") != unit_id:
+        raise LoopError("receipt belongs to another unit", "Use receipts produced for the active unit.")
+    if str(receipt.get("riskTier") or "") != risk:
+        raise LoopError("receipt risk tier does not match adjudication",
+                        "Recreate evidence under the current risk route.")
+    current = candidate_context(repo, risk, candidate_mode)
+    assert_checkout_matches_candidate(repo, current)
+    if receipt.get("candidate") != current \
+            or receipt.get("candidateDigest") != candidate_digest(current):
+        raise LoopError("receipt does not match the exact current candidate",
+                        "Any candidate change invalidates evidence; rerun verifier/checker.")
+    # Only after the receipt is proven to describe THIS candidate: a matching
+    # receipt over an empty diff is the dangerous case, because it reads as
+    # evidence while attesting to nothing. A mismatching receipt keeps its own
+    # historical refusal above, which this must not rewrite.
+    assert_candidate_not_empty(current, candidate_mode)
+    ensure_fresh(receipt, policy)
+    producer = receipt.get("producer") or {}
+    if producer.get("id") != "itd-verification-loop" or producer.get("role") == "maker":
+        raise LoopError("receipt producer provenance is invalid",
+                        "Only the harness verifier/checker producer may mint receipts.")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(receipt.get("producerRunId") or "")):
+        raise LoopError("receipt producer run id is invalid",
+                        "Regenerate unique immutable evidence through the harness.")
+    assurance = receipt.get("assurance") or {}
+    if (assurance.get("trustRoot") != "honest-host-orchestrator"
+            or assurance.get("class") != "integrity-and-process"
+            or assurance.get("samePrincipalByzantineResistance") is not False):
+        raise LoopError("receipt assurance boundary is missing or overstated",
+                        "Regenerate the receipt with the canonical honest-orchestrator threat model.")
+
+
+def validate_machine(receipt: dict[str, Any], *, repo: Path, risk: str,
+                     unit_id: str, policy: dict[str, Any], policy_sha: str,
+                     candidate_mode: str = "staged") -> None:
+    validate_common(receipt, kind="machine-verification", repo=repo, risk=risk,
+                    unit_id=unit_id, policy=policy, policy_sha=policy_sha,
+                    candidate_mode=candidate_mode)
+    runs = receipt.get("runs")
+    validate_declared_inputs(repo, receipt.get("declaredInputs"), policy)
+    if not isinstance(runs, list) or not runs:
+        raise LoopError("machine receipt has no command runs", "Execute at least one declared oracle command.")
+    receipt_created = parse_time(str(receipt.get("createdAt") or ""))
+    previous_completed: dt.datetime | None = None
+    for run in runs:
+        if (not isinstance(run, dict) or not str(run.get("command") or "")
+                or not str(run.get("shell") or "")
+                or len(str(run.get("shellSha256") or "")) != 64
+                or len(str(run.get("commandSha256") or "")) != 64
+                or len(str(run.get("stdoutSha256") or "")) != 64
+                or len(str(run.get("stderrSha256") or "")) != 64
+                or run.get("executionMode") != "isolated-staged-tree"
+                or type(run.get("exitCode")) is not int):
+            raise LoopError("machine command evidence is malformed", "Rerun the oracle through the harness producer.")
+        unexpected_fields = set(run) - MACHINE_RUN_FIELDS
+        if unexpected_fields:
+            raise LoopError(
+                "machine command evidence contains non-schema fields: "
+                + ", ".join(sorted(unexpected_fields)),
+                "Keep only the closed run schema with stdout/stderr hashes and rerun the producer.",
+            )
+        started = parse_time(str(run.get("startedAt") or ""))
+        completed = parse_time(str(run.get("completedAt") or ""))
+        if (completed < started
+                or (previous_completed is not None and started < previous_completed)
+                or completed > receipt_created):
+            raise LoopError(
+                "machine command chronology is impossible or non-monotonic",
+                "Rerun the oracle with the monotonic evidence clock.",
+            )
+        previous_completed = completed
+        if run.get("executedTree") != receipt.get("candidate", {}).get("reviewedTree"):
+            raise LoopError("machine command ran against a different tree",
+                            "Rerun with a checkout exactly matching the staged candidate.")
+        if run["commandSha256"] != sha256_bytes(str(run["command"]).encode("utf-8")):
+            raise LoopError("machine command hash is invalid", "Discard the edited receipt and rerun verification.")
+        if run["shell"] == "unavailable":
+            if (run["exitCode"] != 127
+                    or run["shellSha256"] != sha256_bytes(b"")):
+                raise LoopError("unavailable shell evidence is inconsistent",
+                                "Discard the edited receipt and rerun verification.")
+        else:
+            trusted = trusted_shell_path()
+            if (trusted is None or str(trusted) != run["shell"]
+                    or sha256_file(trusted) != run["shellSha256"]):
+                raise LoopError("machine shell identity is stale or untrusted",
+                                "Rerun verification with the current host-owned shell.")
+    expected = "PASSED" if all(run["exitCode"] == 0 for run in runs) else "FAILED"
+    if receipt.get("verdict") != expected:
+        raise LoopError("machine verdict contradicts command exit codes",
+                        "A failing command cannot be narrated into PASSED.")
+
+
+def finding_digest(value: Any) -> str:
+    return sha256_bytes(canonical(value))
+
+
+def adjudication_targets(checker: dict[str, Any]) -> list[Any]:
+    """Return checker targets in source order, deduplicating only exact bytes."""
+    targets = list(checker.get("findings") or []) + list(checker.get("unverified") or [])
+    result: list[Any] = []
+    seen: set[str] = set()
+    for target in targets:
+        digest = finding_digest(target)
+        if digest not in seen:
+            seen.add(digest)
+            result.append(target)
+    return result
+
+
+def validate_dispositions(checker: dict[str, Any], rows: Any) -> None:
+    """Shared ADR-007 row validation for v2 drafts and final minting."""
+    targets = list(checker.get("findings") or []) + list(checker.get("unverified") or [])
+    if not targets:
+        raise LoopError("BLOCKED review carries no findings to adjudicate",
+                        "Rerun the checker; a finding-free BLOCKED verdict is malformed evidence.")
+    if not isinstance(rows, list) or not rows:
+        raise LoopError("human dispositions are absent",
+                        "Disposition every checker finding or fix the candidate instead.")
+    required = {"findingSha256", "finding", "class", "rationale"}
+    expected = {finding_digest(item) for item in targets}
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise LoopError("a disposition row is malformed",
+                            "Each disposition must be a JSON object.")
+        missing = required - set(row)
+        extra = set(row) - (required | {"evidence"})
+        if missing or extra:
+            diagnostics = []
+            if missing:
+                diagnostics.append("missing " + ", ".join(sorted(missing)))
+            if extra:
+                diagnostics.append("unknown " + ", ".join(sorted(extra)))
+            raise LoopError("a disposition row is malformed: " + "; ".join(diagnostics),
+                            "Keep only findingSha256, finding, class, rationale and optional evidence.")
+        digest = row.get("findingSha256")
+        if digest not in expected or digest != finding_digest(row.get("finding")):
+            raise LoopError("a disposition names no checker finding",
+                            "Bind each disposition to the exact finding it adjudicates.")
+        if digest in seen:
+            raise LoopError("duplicate disposition for one finding",
+                            "Record exactly one human disposition per finding.")
+        seen.add(digest)
+        if row.get("class") not in DISPOSITION_CLASSES:
+            raise LoopError("disposition class is unknown",
+                            "Use accepted-trade-off, refuted-by-evidence or fixed.")
+        if not isinstance(row.get("rationale"), str) or not row["rationale"].strip():
+            raise LoopError("disposition rationale is absent",
+                            "State why the human accepted, refuted or fixed the finding.")
+        if row["class"] in ("refuted-by-evidence", "fixed") and (
+                not isinstance(row.get("evidence"), str) or not row["evidence"].strip()):
+            raise LoopError("disposition evidence is absent",
+                            "Name the evidence that refutes or fixes the finding.")
+        for field in ("rationale", "evidence"):
+            if isinstance(row.get(field), str) and DRAFT_PLACEHOLDER in row[field]:
+                raise LoopError(f"disposition {field} is the unfilled draft placeholder",
+                                "Replace the stop rule's draft text with the human's own wording.")
+    if seen != expected:
+        raise LoopError("a checker finding has no human disposition",
+                        "Disposition every checker finding (accepted-trade-off, "
+                        "refuted-by-evidence or fixed) or fix the candidate.")
+
+
+def v2_primary_unit(claim_id: str) -> str:
+    """Derive the sole v2 primary unit from an exact permitted claim."""
+    suffix = ":general-review"
+    if claim_id and ":" not in claim_id:
+        return claim_id
+    if claim_id.endswith(suffix):
+        primary = claim_id[:-len(suffix)]
+        if primary and ":" not in primary:
+            return primary
+    raise LoopError("v2 primary unit must not be a review subclaim",
+                    "Use a root unit or its exact :general-review claim; security and foreign subclaims are not primary units.")
+
+
+def v2_claims(primary_unit: str, claims: Any, current_claim: str) -> list[str]:
+    """Validate the deliberately tiny v2 approval authority set."""
+    if (not isinstance(claims, list) or any(not isinstance(x, str) for x in claims)
+            or len(set(claims)) != len(claims)):
+        raise LoopError("v2 approval claims are malformed",
+                        "Provide each explicit allowed claim exactly once.")
+    allowed = {primary_unit, primary_unit + ":general-review"}
+    if (not claims or set(claims) - allowed or primary_unit not in claims
+            or current_claim not in claims):
+        raise LoopError("v2 approval claims exceed the permitted unit authority",
+                        "Authorize the root unit and the exact current claim; only its general-review claim is optional.")
+    return claims
+
+
+def v2_binding(context: dict[str, Any], policy_sha: str, current_claim: str,
+               claims: Any, checker: dict[str, Any], dispositions: Any) -> dict[str, Any]:
+    """Build the closed, order-sensitive semantic approval binding.
+
+    Findings remain in checker order.  Reordering is a semantic change so a
+    human never unknowingly approves a differently presented review.
+    """
+    if not isinstance(dispositions, list):
+        raise LoopError("v2 approval dispositions are malformed",
+                        "Provide one complete disposition list.")
+    validate_dispositions(checker, dispositions)
+    targets = adjudication_targets(checker)
+    by_digest = {row["findingSha256"]: row for row in dispositions}
+    primary_unit = v2_primary_unit(current_claim)
+    return {
+        "domain": V2_APPROVAL_DOMAIN,
+        "candidate": context,
+        "policySha256": policy_sha,
+        "primaryUnit": primary_unit,
+        "claims": v2_claims(primary_unit, claims, current_claim),
+        "targets": [
+            {"findingSha256": finding_digest(target), "finding": target,
+             "disposition": row}
+            for target in targets
+            for row in (by_digest[finding_digest(target)],)
+        ],
+    }
+
+
+def validate_v2_human_adjudication(block: Any, checker: dict[str, Any],
+                                   checker_sha256: str, context: dict[str, Any],
+                                   policy_sha: str, unit_id: str) -> None:
+    fields = {"version", "confirmedBy", "confirmedAt", "confirmation",
+              "checkerReceiptSha256", "approvalBinding", "dispositions"}
+    if not isinstance(block, dict) or set(block) != fields:
+        raise LoopError("v2 human adjudication block is malformed",
+                        "Provide only the closed v2 adjudication fields.")
+    if block.get("version") != V2_ADJUDICATION_VERSION:
+        raise LoopError("human adjudication version is unknown",
+                        "Use legacy v1 without a version, or the exact supported v2 version.")
+    for field in ("confirmedBy", "confirmedAt", "confirmation"):
+        if not isinstance(block.get(field), str) or not block[field].strip():
+            raise LoopError(f"v2 human adjudication {field} is absent",
+                            "Record the explicit human confirmation before minting.")
+    if any(DRAFT_PLACEHOLDER in str(block.get(key, ""))
+           for key in ("confirmedBy", "confirmation")):
+        raise LoopError("v2 adjudication still contains a draft placeholder",
+                        "Replace every draft placeholder with the human's own entry.")
+    if block.get("checkerReceiptSha256") != checker_sha256:
+        raise LoopError("v2 human adjudication binds another checker receipt",
+                        "Use the whole-file SHA-256 of this exact checker receipt.")
+    binding = block.get("approvalBinding")
+    if not isinstance(binding, dict):
+        raise LoopError("v2 approval binding is malformed", "Provide the closed approvalBinding object.")
+    expected = v2_binding(context, policy_sha, unit_id, binding.get("claims"),
+                          checker, block.get("dispositions"))
+    if set(binding) != set(expected) or binding != expected:
+        raise LoopError("v2 approval binding does not match the exact candidate and findings",
+                        "Reprepare and affirm approval after any candidate, policy, claim or finding change.")
+    digest = sha256_bytes(canonical(binding))
+    if block.get("confirmation") != V2_CONFIRMATION_TEMPLATE.format(sha256=digest):
+        raise LoopError("v2 human confirmation is not the explicit affirmative statement",
+                        "Use the exact affirmative template naming the v2 approval binding digest.")
+    # Retain ADR-007's strict target/disposition validation before accepting
+    # the v2 binding that embeds those same rows.
+    legacy = {"confirmedBy": block["confirmedBy"], "confirmedAt": block["confirmedAt"],
+              "confirmation": CONFIRMATION_TEMPLATE.format(sha256=checker_sha256),
+              "checkerReceiptSha256": checker_sha256, "dispositions": block["dispositions"]}
+    validate_human_adjudication(legacy, checker, checker_sha256)
+
+
+def validate_human_adjudication(block: Any, checker: dict[str, Any],
+                                checker_sha256: str) -> None:
+    """Fail-closed validation of a per-finding human adjudication (ADR-007)."""
+    fields = {"confirmedBy", "confirmedAt", "confirmation",
+              "checkerReceiptSha256", "dispositions"}
+    if not isinstance(block, dict) or set(block) != fields:
+        raise LoopError("human adjudication block is malformed",
+                        "Provide exactly confirmedBy, confirmedAt, confirmation, "
+                        "checkerReceiptSha256 and dispositions.")
+    for field in ("confirmedBy", "confirmedAt", "confirmation"):
+        if not isinstance(block.get(field), str) or not block[field].strip():
+            raise LoopError(
+                f"human adjudication {field} is absent",
+                "Adjudication requires the explicit human confirmation; never mint without it.")
+    if DRAFT_PLACEHOLDER in block["confirmedBy"]:
+        raise LoopError("human adjudication confirmedBy is the unfilled draft placeholder",
+                        "Name the human who adjudicated; the stop rule's draft is not a signature.")
+    if block.get("checkerReceiptSha256") != checker_sha256:
+        raise LoopError("human adjudication binds another checker receipt",
+                        "Adjudicate the exact BLOCKED checker receipt this mint depends on.")
+    if block.get("confirmation") != CONFIRMATION_TEMPLATE.format(
+            sha256=checker_sha256):
+        raise LoopError(
+            "human confirmation is not the explicit affirmative statement",
+            "Write the exact affirmative confirmation sentence naming this "
+            "checker receipt sha256; free-form or negated text never mints.")
+    if checker.get("verdict") != "BLOCKED":
+        raise LoopError("human adjudication over a non-BLOCKED review",
+                        "A clean review needs no adjudication; mint plain PASSED evidence.")
+    validate_dispositions(checker, block.get("dispositions"))
+    targets = list(checker.get("findings") or []) + list(checker.get("unverified") or [])
+    if not targets:
+        raise LoopError("BLOCKED review carries no findings to adjudicate",
+                        "Rerun the checker; a finding-free BLOCKED verdict is malformed evidence.")
+    rows = block.get("dispositions")
+    if not isinstance(rows, list) or not rows:
+        raise LoopError("human dispositions are absent",
+                        "Disposition every checker finding or fix the candidate instead.")
+    required = {"findingSha256", "finding", "class", "rationale"}
+    expected = {finding_digest(item) for item in targets}
+    seen: set[str] = set()
+    for row in rows:
+        if (not isinstance(row, dict) or not required <= set(row)
+                or not set(row) <= required | {"evidence"}):
+            raise LoopError("a disposition row is malformed",
+                            "Each disposition needs findingSha256, finding, class and rationale.")
+        digest = row.get("findingSha256")
+        if digest not in expected or digest != finding_digest(row.get("finding")):
+            raise LoopError("a disposition names no checker finding",
+                            "Bind each disposition to the exact finding it adjudicates.")
+        if digest in seen:
+            raise LoopError("duplicate disposition for one finding",
+                            "Record exactly one human disposition per finding.")
+        seen.add(digest)
+        if row.get("class") not in DISPOSITION_CLASSES:
+            raise LoopError("disposition class is unknown",
+                            "Use accepted-trade-off, refuted-by-evidence or fixed.")
+        if not isinstance(row.get("rationale"), str) or not row["rationale"].strip():
+            raise LoopError("disposition rationale is absent",
+                            "State why the human accepted, refuted or fixed the finding.")
+        if row["class"] in ("refuted-by-evidence", "fixed") and (
+                not isinstance(row.get("evidence"), str) or not row["evidence"].strip()):
+            raise LoopError("disposition evidence is absent",
+                            "Name the evidence that refutes or fixes the finding.")
+        for field in ("rationale", "evidence"):
+            if isinstance(row.get(field), str) and DRAFT_PLACEHOLDER in row[field]:
+                raise LoopError(
+                    f"disposition {field} is the unfilled draft placeholder",
+                    "Replace the stop rule's draft text with the human's own wording.")
+    if seen != expected:
+        raise LoopError("a checker finding has no human disposition",
+                        "Disposition every finding (accepted-trade-off, "
+                        "refuted-by-evidence or fixed) or fix the candidate.")
+
+
+def validate_checker(receipt: dict[str, Any], *, repo: Path, risk: str,
+                     unit_id: str, policy: dict[str, Any], policy_sha: str,
+                     required_mode: str,
+                     candidate_mode: str = "staged",
+                     require_mandatory_route: bool = False,
+                     expected_repository: str | None = None,
+                     expected_producer_keyring_sha256: str | None = None,
+                     allow_adjudicated_blocked: bool = False,
+                     accept_adjudicated_route: bool = False,
+                     ) -> dict[str, Any] | None:
+    validate_common(receipt, kind="checker", repo=repo, risk=risk,
+                    unit_id=unit_id, policy=policy, policy_sha=policy_sha,
+                    candidate_mode=candidate_mode)
+    mode = str(receipt.get("checkerMode") or "")
+    if receipt.get("inspectedTree") != receipt.get("candidate", {}).get("reviewedTree"):
+        raise LoopError("checker was not observed on the exact reviewed tree",
+                        "Rerun the checker with a checkout identical to the staged candidate.")
+    if required_mode == "full" and mode != "full":
+        raise LoopError("full checker evidence is required", "Run a different-session, different-model/provider checker.")
+    if required_mode == "targeted" and mode not in {"targeted", "full"}:
+        raise LoopError("targeted checker evidence is required", "Run a focused checker for uncovered claims/risks.")
+    provenance = receipt.get("provenance") or {}
+    maker = provenance.get("maker") or {}
+    checker = provenance.get("checker") or {}
+    identity_fields = ("provider", "model", "session")
+    if (not all(isinstance(maker.get(k), str) and maker[k].strip() for k in identity_fields)
+            or not all(isinstance(checker.get(k), str) and checker[k].strip()
+                       for k in identity_fields)):
+        raise LoopError(
+            "maker/checker identity is incomplete",
+            "Record host-observed provider, model and session provenance for both roles.",
+        )
+    maker_identity = {key: maker[key].strip() for key in identity_fields}
+    checker_identity = {key: checker[key].strip() for key in identity_fields}
+    if checker_identity["session"] == maker_identity["session"]:
+        raise LoopError("checker reused the maker session", "Use a fresh checker context.")
+    if mode == "full" and (checker_identity["provider"] == maker_identity["provider"]
+                           and checker_identity["model"] == maker_identity["model"]):
+        raise LoopError("full checker is not model/provider-independent",
+                        "Use a different model or provider; otherwise remain UNVERIFIED.")
+    artifacts = receipt.get("artifacts") or {}
+    for name in ("report", "prompt"):
+        item = artifacts.get(name) or {}
+        path = (repo / str(item.get("path") or "")).resolve()
+        if not path.is_file() or sha256_file(path) != item.get("sha256"):
+            raise LoopError(f"checker {name} artifact is missing or changed",
+                            "Preserve the exact durable checker inputs and regenerate the receipt.")
+    mandatory_route = receipt.get("mandatoryRoute")
+    # The producer never mints a signed phase-one receipt for a BLOCKED
+    # verdict, so an honestly adjudicated route (ADR-007) is authorized by its
+    # human adjudication instead — but only through the explicit opt-in flag;
+    # a clean PASSED outcome always requires the signed route.
+    adjudicated_route_authorized = (
+        accept_adjudicated_route and allow_adjudicated_blocked
+    )
+    if (require_mandatory_route and not isinstance(mandatory_route, dict)
+            and not adjudicated_route_authorized):
+        raise LoopError(
+            "mandatory keyless route evidence is missing",
+            "Run the shared fresh opposite-GPT producer and bind its signed phase-one receipt.",
+        )
+    verified_route = None
+    if mandatory_route is not None:
+        verified_route = validate_mandatory_route_evidence(
+            mandatory_route, repo=repo, policy=policy,
+            context=receipt["candidate"], maker=maker_identity,
+            checker=checker_identity,
+            report_path=(repo / artifacts["report"]["path"]).resolve(),
+            prompt_path=(repo / artifacts["prompt"]["path"]).resolve(),
+            candidate_mode=candidate_mode,
+            expected_repository=expected_repository,
+            expected_producer_keyring_sha256=(
+                expected_producer_keyring_sha256
+            ),
+        )
+    if receipt.get("verdict") not in policy["acceptedVerdicts"] and not (
+            allow_adjudicated_blocked and receipt.get("verdict") == "BLOCKED"):
+        raise LoopError(f"checker verdict is {receipt.get('verdict')}, not accepted",
+                        "Resolve findings and run a fresh checker; do not downgrade the verdict.")
+    return verified_route
+
+
+def validate_adjudication_evidence(receipt: dict[str, Any], *, repo: Path, risk: str,
+                                   unit_id: str, policy: dict[str, Any],
+                                   policy_sha: str,
+                                   candidate_mode: str = "staged",
+                                   require_mandatory_route: bool = False,
+                                   expected_repository: str | None = None,
+                                   expected_producer_keyring_sha256: str | None = None,
+                                   accept_adjudicated_route: bool = False,
+                                   ) -> dict[str, Any] | None:
+    dependencies = receipt.get("dependencies") or {}
+    machine_ref = dependencies.get("machine") or {}
+    machine_path = (repo / str(machine_ref.get("path") or "")).resolve()
+    if not machine_path.is_file() or sha256_file(machine_path) != machine_ref.get("sha256"):
+        raise LoopError("machine receipt dependency is missing or changed", "Rerun and re-adjudicate the current candidate.")
+    machine = read_json(machine_path, "machine receipt")
+    validate_machine(machine, repo=repo, risk=risk, unit_id=unit_id,
+                     policy=policy, policy_sha=policy_sha,
+                     candidate_mode=candidate_mode)
+    if machine.get("verdict") != "PASSED":
+        raise LoopError("machine verification failed", "Fix the candidate and rerun the oracle.")
+    route = policy["riskRoutes"][risk]
+    checker_ref = dependencies.get("checker")
+    adjudicated = receipt.get("outcome") == "ADJUDICATED"
+    if adjudicated and not route["checkerRequired"]:
+        raise LoopError("ADJUDICATED outcome without a checker route",
+                        "Only independent-review findings can be humanly adjudicated.")
+    if not adjudicated and receipt.get("humanAdjudication") is not None:
+        raise LoopError("PASSED adjudication carries a human adjudication block",
+                        "Mint clean evidence as PASSED without dispositions, or mint ADJUDICATED honestly.")
+    if route["checkerRequired"]:
+        if not isinstance(checker_ref, dict):
+            raise LoopError("required checker receipt is missing", "Remain UNVERIFIED until the risk-tier checker completes.")
+        checker_path = (repo / str(checker_ref.get("path") or "")).resolve()
+        if not checker_path.is_file() or sha256_file(checker_path) != checker_ref.get("sha256"):
+            raise LoopError("checker receipt dependency is missing or changed", "Run a fresh checker and re-adjudicate.")
+        checker = read_json(checker_path, "checker receipt")
+        verified_route = validate_checker(
+            checker, repo=repo, risk=risk, unit_id=unit_id,
+            policy=policy, policy_sha=policy_sha,
+            required_mode=route["checkerMode"],
+            candidate_mode=candidate_mode,
+            require_mandatory_route=require_mandatory_route,
+            expected_repository=expected_repository,
+            expected_producer_keyring_sha256=(
+                expected_producer_keyring_sha256
+            ),
+            allow_adjudicated_blocked=adjudicated,
+            accept_adjudicated_route=accept_adjudicated_route,
+        )
+        if adjudicated:
+            human = receipt.get("humanAdjudication")
+            if isinstance(human, dict) and "version" in human:
+                validate_v2_human_adjudication(
+                    human, checker, str(checker_ref.get("sha256") or ""),
+                    receipt["candidate"], policy_sha, unit_id)
+            else:
+                validate_human_adjudication(
+                    human, checker, str(checker_ref.get("sha256") or ""))
+        validate_route_machine_binding(verified_route, machine_path)
+        return verified_route
+    elif checker_ref is not None:
+        raise LoopError("low-risk machine-only route contains a checker receipt",
+                        "Remove the unnecessary checker cost and adjudicate machine evidence only.")
+    return None
+
+
+def validate_adjudication(root: Path | str, receipt_path: Path | str,
+                          risk_tier: str, unit_id: str,
+                          candidate_mode: str = "staged",
+                          require_mandatory_route: bool = False,
+                          expected_repository: str | None = None,
+                          expected_producer_keyring_sha256: str | None = None,
+                          accept_adjudicated_route: bool = False,
+                          return_route: bool = False,
+                          ) -> Any:
+    policy, policy_sha = load_policy()
+    repo = repository_root(root)
+    risk = str(risk_tier or "unknown").lower()
+    resolved_receipt = inside(Path(receipt_path), receipt_root(repo, policy), "adjudication receipt")
+    receipt = read_json(resolved_receipt, "adjudication receipt")
+    validate_common(receipt, kind="adjudication", repo=repo, risk=risk,
+                    unit_id=unit_id, policy=policy, policy_sha=policy_sha,
+                    candidate_mode=candidate_mode)
+    if receipt.get("outcome") not in ADJUDICATION_OUTCOMES:
+        raise LoopError("adjudication outcome is not PASSED or ADJUDICATED",
+                        "Resolve failed/unverified evidence and re-adjudicate.")
+    if (receipt.get("outcome") == "ADJUDICATED"
+            and not isinstance(receipt.get("humanAdjudication"), dict)):
+        raise LoopError("ADJUDICATED receipt lacks its human adjudication block",
+                        "Mint through the human adjudication channel; never relabel evidence.")
+    attempt = receipt.get("attempt")
+    if type(attempt) is not int or not 1 <= attempt <= policy["maxAttemptsPerCandidate"]:
+        raise LoopError("adjudication attempt is outside the bounded policy",
+                        "Stop after the approved attempt budget and escalate RECOVERY_REQUIRED.")
+    validate_attempt_entry(repo, policy, receipt["candidate"], unit_id, risk, policy_sha,
+                           attempt, resolved_receipt, receipt)
+    verified_route = validate_adjudication_evidence(
+        receipt, repo=repo, risk=risk, unit_id=unit_id,
+        policy=policy, policy_sha=policy_sha,
+        candidate_mode=candidate_mode,
+        require_mandatory_route=require_mandatory_route,
+        expected_repository=expected_repository,
+        expected_producer_keyring_sha256=(
+            expected_producer_keyring_sha256
+        ),
+        accept_adjudicated_route=(
+            accept_adjudicated_route
+        ))
+    if return_route:
+        return receipt, verified_route
+    return receipt
+
+
+def assert_oracle_legs_declared(repo: Path, tree: str, claim: str,
+                                leg_ids: list[str]) -> None:
+    """Refuse to mint the unit receipt when its legs miss a declared oracle.
+
+    ORACLE-LEGS-1: the Sol producer requires every ``reviewEvidence.oracleIds``
+    entry of the active unit's criteria to be a run id of the machine receipt
+    (``itd_review_evidence.coverage_matrix``). A receipt minted without one of
+    them was only rejected there, after it had been minted and a reviewer run
+    paid for. The contract is read from the candidate tree, so the check sees
+    the same bytes the producer later reviews. Only the claim equal to the
+    open ``activeFollowup.unitId`` is checked; a ``:general-review`` claim, a
+    foreign or closed unit, a candidate without the contract and a contract
+    that is not a JSON object are left to the consumers as before. A follow-up
+    without ``reviewPolicy`` is checked too, although the producer enforces
+    coverage only under a policy: declared ``oracleIds`` name legs whether or
+    not a policy is set (owner-approved criterion, 2026-10-03).
+    """
+    def probe(*git_args: str) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                ["git", *git_args], cwd=str(repo), capture_output=True,
+                timeout=CHECKOUT_PROBE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise LoopError("acceptance contract probe of the candidate timed out",
+                            "Repair Git object access and retry; no leg ran.") from exc
+
+    listed = probe("ls-tree", "--name-only", tree, "--", ACCEPTANCE_CONTRACT_PATH)
+    if listed.returncode != 0:
+        raise LoopError("acceptance contract lookup in the candidate failed",
+                        "Repair Git object access and retry; no leg ran.")
+    if not listed.stdout.strip():
+        return
+    blob = probe("cat-file", "blob", f"{tree}:{ACCEPTANCE_CONTRACT_PATH}")
+    if blob.returncode != 0:
+        raise LoopError("acceptance contract of the candidate could not be read",
+                        "Repair Git object access and retry; no leg ran.")
+    try:
+        acceptance = json.loads(blob.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return
+    followup = acceptance.get("activeFollowup") if isinstance(acceptance, dict) else None
+    if not claim or not isinstance(followup, dict) or followup.get("unitId") != claim:
+        return
+    evidence = _review_evidence_module()
+    if evidence.followup_is_closed(followup):
+        return
+    try:
+        criteria = evidence.active_criteria(acceptance, claim)
+    except evidence.ReviewEvidenceError as exc:
+        raise LoopError(
+            f"acceptance criteria of {claim} are malformed: {exc}",
+            f"Repair the criteria of {claim} in {ACCEPTANCE_CONTRACT_PATH}; no leg ran.",
+        ) from exc
+    legs = set(leg_ids)
+    missing: list[str] = []
+    for row in criteria:
+        if "reviewEvidence" not in row:
+            continue
+        # A declared but malformed oracle list is refused here with the
+        # producer's own rule (Sol s1): skipping it would mint and run every
+        # leg for a criterion the producer then rejects.
+        spec = row["reviewEvidence"]
+        try:
+            if not isinstance(spec, dict):
+                raise evidence.ReviewEvidenceError(
+                    f"{row['id']} review evidence is not an object")
+            oracle_ids = evidence._string_list(
+                spec.get("oracleIds"), f"{row['id']} oracle IDs")
+        except evidence.ReviewEvidenceError as exc:
+            raise LoopError(
+                f"acceptance criteria of {claim} are malformed: {exc}",
+                f"Repair reviewEvidence of {row['id']} in {ACCEPTANCE_CONTRACT_PATH}; no leg ran.",
+            ) from exc
+        missing.extend(f"{row['id']} oracle {oracle}"
+                       for oracle in oracle_ids if oracle not in legs)
+    if missing:
+        raise LoopError(
+            "machine legs do not cover the declared oracles: "
+            + "; ".join(f"{item} is missing" for item in missing),
+            "Add a --command <oracle>=<command> leg for each missing oracle id, or correct "
+            f"reviewEvidence.oracleIds in {ACCEPTANCE_CONTRACT_PATH}; no leg ran.",
+        )
+
+
+def command_machine(args: argparse.Namespace) -> int:
+    policy, policy_sha = load_policy()
+    repo = repository_root(args.root)
+    risk = args.risk_tier
+    context = candidate_context(repo, risk, args.candidate_mode)
+    assert_candidate_not_empty(context, args.candidate_mode)
+    executed_tree = assert_checkout_matches_candidate(repo, context)
+    commands: list[tuple[str, str]] = []
+    for raw in args.command:
+        ident, sep, command = raw.partition("=")
+        if not sep or not ident.strip() or not command.strip():
+            raise LoopError(f"invalid --command value: {raw!r}", "Use --command id=executable command.")
+        commands.append((ident.strip(), command.strip()))
+    assert_oracle_legs_declared(repo, executed_tree, args.unit_id,
+                                [ident for ident, _ in commands])
+    runs: list[dict[str, Any]] = []
+    evidence_clock = EvidenceClock()
+    with sealed_declared_inputs(repo, args.input, policy) as (input_manifests, input_root):
+        for ident, command in commands:
+            with isolated_candidate(repo, context) as execution_repo:
+                copy_declared_inputs(input_root, execution_repo, input_manifests)
+                started = evidence_clock.now_iso()
+                shell_transport = verification_shell(command, execution_repo)
+                if shell_transport is None:
+                    stdout, stderr, rc = b"", b"native verification shell is unavailable", 127
+                    shell_name = "unavailable"
+                    shell_digest = sha256_bytes(b"")
+                else:
+                    shell_argv, shell_cwd, shell_name, shell_digest = shell_transport
+                    try:
+                        proc = subprocess.run(shell_argv, cwd=shell_cwd,
+                                              capture_output=True, timeout=args.timeout)
+                        stdout, stderr, rc = proc.stdout or b"", proc.stderr or b"", proc.returncode
+                    except subprocess.TimeoutExpired as exc:
+                        stdout = exc.stdout or b""
+                        stderr = (exc.stderr or b"") + f"\ntimeout after {args.timeout}s".encode()
+                        rc = 124
+                    if sha256_file(Path(shell_name)) != shell_digest:
+                        stderr += b"\ntrusted verification shell changed during execution"
+                        rc = 126
+                runs.append({
+                    "id": ident,
+                    "command": command,
+                    "commandSha256": sha256_bytes(command.encode("utf-8")),
+                    "shell": shell_name,
+                    "shellSha256": shell_digest,
+                    "startedAt": started,
+                    "completedAt": evidence_clock.now_iso(),
+                    "timeoutSeconds": args.timeout,
+                    "executionMode": "isolated-staged-tree",
+                    "executedTree": executed_tree,
+                    "exitCode": rc,
+                    "stdoutSha256": sha256_bytes(stdout),
+                    "stderrSha256": sha256_bytes(stderr),
+                })
+                assert_isolated_candidate(execution_repo, executed_tree)
+                validate_declared_inputs(execution_repo, input_manifests, policy)
+    verdict = "PASSED" if runs and all(run["exitCode"] == 0 for run in runs) else "FAILED"
+    # A verification command must not mutate the candidate it is proving.
+    assert_checkout_matches_candidate(repo, context)
+    receipt = seal_receipt({
+        "version": RECEIPT_VERSION,
+        "kind": "machine-verification",
+        "createdAt": evidence_clock.now_iso(),
+        "unitId": args.unit_id,
+        "riskTier": risk,
+        "candidate": context,
+        "candidateDigest": candidate_digest(context),
+        "policySha256": policy_sha,
+        "producer": {"id": "itd-verification-loop", "role": "machine-verifier", "host": platform.system()},
+        "producerRunId": secrets.token_hex(16),
+        "assurance": {"class": "integrity-and-process", "trustRoot": "honest-host-orchestrator",
+                      "samePrincipalByzantineResistance": False},
+        "declaredInputs": input_manifests,
+        "runs": runs,
+        "verdict": verdict,
+    })
+    output = (Path(args.output).resolve() if args.output else
+              default_path(repo, policy, args.unit_id, "machine", context,
+                           identity=receipt["receiptSha256"][:16]))
+    output = inside(output, receipt_root(repo, policy), "machine receipt")
+    write_json_exclusive(output, receipt)
+    print(output.as_posix())
+    return 0 if verdict == "PASSED" else 1
+
+
+def command_checker(args: argparse.Namespace) -> int:
+    policy, policy_sha = load_policy()
+    repo = repository_root(args.root)
+    risk = args.risk_tier
+    context = candidate_context(repo, risk, args.candidate_mode)
+    assert_candidate_not_empty(context, args.candidate_mode)
+    inspected_tree = assert_checkout_matches_candidate(repo, context)
+    root = receipt_root(repo, policy)
+    checker = {"provider": args.checker_provider.strip(),
+               "model": args.checker_model.strip(),
+               "session": args.checker_session.strip()}
+    maker = {"provider": args.maker_provider.strip(),
+             "model": args.maker_model.strip(),
+             "session": args.maker_session.strip()}
+    # Pre-flight: validate every independent input in one pass so a caller
+    # learns ALL violations from a single run instead of one UNVERIFIED per
+    # run (measured: three wasted checker runs on GENG-S03, 2026-08-22).
+    violations: list[LoopError] = []
+    report_rel = prompt_rel = None
+    try:
+        report_rel = relative_artifact(
+            repo, Path(args.report), root / "reports", "checker report")
+    except LoopError as exc:
+        violations.append(exc)
+    try:
+        prompt_rel = relative_artifact(
+            repo, Path(args.prompt_file), root / "prompts", "checker prompt")
+    except LoopError as exc:
+        violations.append(exc)
+    # A resolvable report is parsed here, not after the block: a malformed
+    # report is an independent violation and must not wait for another run.
+    verdict = None
+    if report_rel is not None:
+        try:
+            verdict = parse_report(
+                (repo / report_rel).read_text(encoding="utf-8", errors="replace"))
+        except LoopError as exc:
+            violations.append(exc)
+    mandatory_route = None
+    if bool(args.phase_one_receipt) != bool(args.producer_keyring):
+        violations.append(LoopError(
+            "mandatory route receipt/keyring pair is incomplete",
+            "Provide both --phase-one-receipt and --producer-keyring, or neither for non-publication diagnostics.",
+        ))
+    elif args.phase_one_receipt:
+        # phase-one and keyring are INDEPENDENT inputs: resolve each on its own
+        # so two bad paths are named together instead of one run apiece.
+        references: dict[str, dict[str, str]] = {}
+        reference_shape_ok = True
+        for field, raw, label in (
+            ("phaseOne", args.phase_one_receipt, "phase-one route receipt"),
+            ("producerKeyring", args.producer_keyring,
+             "phase-one producer keyring"),
+        ):
+            try:
+                resolved_path = secure_dependency_path(repo, root, raw, label)
+                references[field] = dependency(repo, root, resolved_path, label)
+            except LoopError as exc:
+                violations.append(exc)
+                reference_shape_ok = False
+                continue
+            # Each resolved reference is shape-checked on its own, so a broken
+            # counterpart cannot hide it.  Cross-input checks (signature
+            # verification, candidate binding) genuinely need BOTH inputs and
+            # are reported once their prerequisites resolve.
+            try:
+                value = read_json(resolved_path, label)
+            except LoopError as exc:
+                violations.append(exc)
+                reference_shape_ok = False
+                continue
+            if field == "producerKeyring":
+                try:
+                    _phase_one_public_keys(value)
+                except LoopError as exc:
+                    violations.append(exc)
+                    reference_shape_ok = False
+            elif not isinstance(value, dict):
+                violations.append(LoopError(
+                    f"{label} is not an object",
+                    "Regenerate the receipt through the keyless producer.",
+                ))
+                reference_shape_ok = False
+        if len(references) == 2 and reference_shape_ok:
+            mandatory_route = {
+                "kind": "itd-mandatory-keyless-route-v1",
+                "phaseOne": references["phaseOne"],
+                "producerKeyring": references["producerKeyring"],
+            }
+            try:
+                validate_mandatory_route_evidence(
+                    mandatory_route, repo=repo, policy=policy,
+                    context=context, maker=maker, checker=checker,
+                    report_path=(repo / report_rel) if report_rel else None,
+                    prompt_path=(repo / prompt_rel) if prompt_rel else None,
+                    candidate_mode=args.candidate_mode,
+                    expected_repository=None,
+                    expected_producer_keyring_sha256=None,
+                    bind_artifacts=(
+                        report_rel is not None and prompt_rel is not None
+                        and verdict is not None),
+                )
+            except LoopError as exc:
+                violations.append(exc)
+                mandatory_route = None
+    if len(violations) == 1:
+        raise violations[0]
+    if violations:
+        # Declared guarantee (honest, not maximal): every INDEPENDENTLY
+        # checkable input is reported in this run.  A check that genuinely
+        # needs another input to be valid first — signature verification needs
+        # both route references, artifact binding needs resolvable artifacts —
+        # is reported once its prerequisite resolves.  Claiming more would be
+        # false: those checks cannot run at all until then.
+        raise LoopError(
+            "checker pre-flight found "
+            f"{len(violations)} violations "
+            "(checks that depend on a failed input follow once it is fixed): "
+            + " | ".join(exc.why for exc in violations),
+            " | ".join(exc.fix for exc in violations),
+        )
+    report_path, prompt_path = repo / report_rel, repo / prompt_rel
+    payload = {
+        "version": RECEIPT_VERSION,
+        "kind": "checker",
+        "createdAt": now_iso(),
+        "unitId": args.unit_id,
+        "riskTier": risk,
+        "candidate": context,
+        "candidateDigest": candidate_digest(context),
+        "policySha256": policy_sha,
+        "producer": {"id": "itd-verification-loop", "role": "semantic-checker", "host": platform.system()},
+        "producerRunId": secrets.token_hex(16),
+        "assurance": {"class": "integrity-and-process", "trustRoot": "honest-host-orchestrator",
+                      "samePrincipalByzantineResistance": False},
+        "inspectedTree": inspected_tree,
+        "checkerMode": args.mode,
+        "provenance": {"maker": maker, "checker": checker},
+        "artifacts": {
+            "report": {"path": report_rel, "sha256": sha256_file(report_path)},
+            "prompt": {"path": prompt_rel, "sha256": sha256_file(prompt_path)},
+        },
+        "verdict": str(verdict["verdict"]).upper(),
+        "findings": verdict["findings"],
+        "unverified": verdict["unverified"],
+    }
+    if mandatory_route is not None:
+        payload["mandatoryRoute"] = mandatory_route
+    receipt = seal_receipt(payload)
+    output = (Path(args.output).resolve() if args.output else
+              default_path(repo, policy, args.unit_id, "checker", context,
+                           identity=receipt["receiptSha256"][:16]))
+    output = inside(output, root, "checker receipt")
+    write_json_exclusive(output, receipt)
+    # Validate independence immediately; a non-PASS report remains durable but cannot gate.
+    validate_checker(receipt, repo=repo, risk=risk, unit_id=args.unit_id,
+                     policy=policy, policy_sha=policy_sha,
+                     required_mode=policy["riskRoutes"][risk]["checkerMode"],
+                     candidate_mode=args.candidate_mode)
+    print(output.as_posix())
+    return 0
+
+
+def dependency(repo: Path, root: Path, path: Path, label: str) -> dict[str, str]:
+    resolved = inside(path, root, label)
+    if not resolved.is_file():
+        raise LoopError(f"{label} is missing: {resolved}", f"Create {label} before adjudication.")
+    return {"path": resolved.relative_to(repo).as_posix(), "sha256": sha256_file(resolved)}
+
+
+def secure_dependency_path(repo: Path, root: Path, raw: str, label: str) -> Path:
+    supplied = Path(raw)
+    candidate = Path(os.path.abspath(supplied if supplied.is_absolute() else repo / supplied))
+    boundary = Path(os.path.abspath(root))
+    try:
+        candidate.relative_to(boundary)
+    except ValueError as exc:
+        matched_boundary: Path | None = None
+        if os.name == "nt":
+            cursor = candidate
+            while True:
+                if _is_link_or_reparse(cursor):
+                    raise LoopError(
+                        f"{label} traverses a symlink or reparse point: {cursor}",
+                        "Use a real regular file under the evidence root.",
+                    ) from exc
+                try:
+                    if cursor.exists() and cursor.samefile(boundary):
+                        matched_boundary = cursor
+                        break
+                except OSError:
+                    pass
+                if cursor.parent == cursor:
+                    break
+                cursor = cursor.parent
+        if matched_boundary is None:
+            raise LoopError(
+                f"{label} escapes the Verification Loop evidence root: {candidate}",
+                f"Keep {label} inside {boundary}.",
+            ) from exc
+        # Preserve the trusted boundary spelling after proving that the 8.3
+        # alias denotes the exact same directory by filesystem identity.
+        candidate = boundary / candidate.relative_to(matched_boundary)
+    cursor = candidate
+    while True:
+        if _is_link_or_reparse(cursor):
+            raise LoopError(
+                f"{label} traverses a symlink or reparse point: {cursor}",
+                "Use a real regular file under the evidence root.",
+            )
+        if cursor == boundary:
+            break
+        cursor = cursor.parent
+    try:
+        info = candidate.lstat()
+    except OSError as exc:
+        raise LoopError(f"{label} is missing: {candidate}",
+                        f"Create {label} before adjudication.") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise LoopError(f"{label} is not a regular file: {candidate}",
+                        "Use a regular machine-readable receipt.")
+    if info.st_size > JSON_INPUT_MAX_BYTES:
+        raise LoopError(
+            f"{label} exceeds the {JSON_INPUT_MAX_BYTES}-byte limit: {candidate}",
+            "Regenerate a compact receipt before adjudication.",
+        )
+    return candidate
+
+
+def _free_reviewer_module():
+    spec = importlib.util.spec_from_file_location(
+        "itd_loop_free_reviewer", FREE_REVIEWER_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise LoopError(
+            "mandatory keyless producer is unavailable",
+            "Restore the shared itd_free_reviewer_producer.py module.",
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _phase_one_public_keys(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or not value or any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(public_key, str)
+        or not public_key
+        for key, public_key in value.items()
+    ):
+        raise LoopError(
+            "phase-one producer keyring is malformed",
+            "Use a closed non-empty key-id to raw Ed25519 public-key map.",
+        )
+    return dict(value)
+
+
+def validate_mandatory_route_evidence(
+    route: object, *, repo: Path, policy: dict[str, Any],
+    context: dict[str, Any], maker: dict[str, str], checker: dict[str, str],
+    report_path: Path | None, prompt_path: Path | None, candidate_mode: str,
+    expected_repository: str | None,
+    expected_producer_keyring_sha256: str | None,
+    bind_artifacts: bool = True,
+) -> dict[str, Any]:
+    # bind_artifacts=False is a REPORTING-ONLY mode used by the checker
+    # pre-flight when the report/prompt paths themselves are already invalid:
+    # every route violation that does not need those bytes is still surfaced in
+    # the same run.  That path always raises afterwards, so a receipt can never
+    # be minted from a partially validated route.
+    if (
+        not isinstance(route, dict)
+        or set(route) != {"kind", "phaseOne", "producerKeyring"}
+        or route.get("kind") != "itd-mandatory-keyless-route-v1"
+    ):
+        raise LoopError(
+            "mandatory route reference is malformed",
+            "Regenerate the checker from one signed phase-one route receipt.",
+        )
+    root = receipt_root(repo, policy)
+    resolved: dict[str, Path] = {}
+    for field, label in (
+        ("phaseOne", "phase-one route receipt"),
+        ("producerKeyring", "phase-one producer keyring"),
+    ):
+        reference = route[field]
+        if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
+            raise LoopError(
+                f"{label} reference is malformed",
+                "Keep the closed path/SHA-256 dependency reference.",
+            )
+        path = secure_dependency_path(repo, root, reference["path"], label)
+        if sha256_file(path) != reference["sha256"]:
+            raise LoopError(
+                f"{label} is missing or changed",
+                "Restore the exact route artifact and regenerate the checker.",
+            )
+        resolved[field] = path
+    if (
+        expected_producer_keyring_sha256 is not None
+        and route["producerKeyring"]["sha256"]
+        != expected_producer_keyring_sha256
+    ):
+        raise LoopError(
+            "phase-one producer keyring is not authorized by the host registry",
+            "Register the trusted producer keyring hash outside the candidate checkout.",
+        )
+    free = _free_reviewer_module()
+    phase_one = read_json(resolved["phaseOne"], "phase-one route receipt")
+    keys = _phase_one_public_keys(
+        read_json(resolved["producerKeyring"], "phase-one producer keyring")
+    )
+    try:
+        signed = free.verify_phase_one(phase_one, keys)
+    except free.FreeReviewError as exc:
+        raise LoopError(
+            f"mandatory route receipt is {exc.status}: {exc.reason}",
+            "Run the shared keyless producer again; do not substitute generic checker narration.",
+        ) from exc
+    if (
+        expected_repository is not None
+        and signed["target"]["repository"] != expected_repository
+    ):
+        raise LoopError(
+            "mandatory route target names another repository",
+            "Bind phase one to the exact repository selected for guarded publication.",
+        )
+    phase_candidate = signed["candidate"]
+    if (
+        phase_candidate["parentCommit"] != context.get("baseCommit")
+        or phase_candidate["tree"] != context.get("reviewedTree")
+        or signed["inputBindings"]["scopeSha256"]
+        != context.get("scopeContractHash")
+        or signed["inputBindings"]["acceptanceSha256"]
+        != context.get("acceptanceContractHash")
+    ):
+        raise LoopError(
+            "mandatory route receipt belongs to another candidate",
+            "Regenerate route evidence for the exact machine/checker candidate.",
+        )
+    try:
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor",
+             phase_candidate["baseCommit"], phase_candidate["parentCommit"]],
+            cwd=repo, capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LoopError(
+            "mandatory route ancestry could not be reconstructed",
+            "Restore the exact candidate history and rerun the keyless producer.",
+        ) from exc
+    if ancestry.returncode != 0:
+        raise LoopError(
+            "mandatory route base is not an ancestor of its parent",
+            "Review one exact candidate range rooted in its real Git ancestry.",
+        )
+    diff_arguments = [
+        "git", "diff", "--binary", "--full-index", "--no-ext-diff",
+    ]
+    if candidate_mode == "staged":
+        diff_arguments.append("--cached")
+    diff_arguments.append(phase_candidate["baseCommit"])
+    if candidate_mode == "committed-head":
+        diff_arguments.append("HEAD")
+    diff_arguments.append("--")
+    try:
+        exact_diff = subprocess.run(
+            diff_arguments, cwd=repo, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LoopError(
+            "mandatory route diff could not be reconstructed",
+            "Restore the exact candidate history and rerun the keyless producer.",
+        ) from exc
+    if exact_diff.returncode != 0:
+        raise LoopError(
+            "mandatory route diff could not be reconstructed",
+            "Restore the exact candidate history and rerun the keyless producer.",
+        )
+    if (
+        phase_candidate["diffSha256"] != sha256_bytes(exact_diff.stdout)
+        or phase_candidate["diffBytes"] != len(exact_diff.stdout)
+    ):
+        raise LoopError(
+            "mandatory route diff binding is foreign",
+            "Review the exact base-to-candidate diff that will be submitted.",
+        )
+    if candidate_mode == "committed-head":
+        head = str(_review_cache_module().git(repo, "rev-parse", "HEAD")).strip()
+        expected_head = signed["target"]["expectedHeadSha"]
+        if expected_head is not None and expected_head != head:
+            raise LoopError(
+                "mandatory route target does not name the committed HEAD",
+                "Bind phase one to the exact submission commit before guarded publication.",
+            )
+    if bind_artifacts:
+        if report_path is None or prompt_path is None:
+            raise LoopError(
+                "mandatory route artifacts are unavailable",
+                "Persist the exact checker report and prompt before binding the route.",
+            )
+        report = parse_report(
+            report_path.read_text(encoding="utf-8", errors="replace"))
+        if (
+            signed["report"] != report
+            or signed["reportSha256"] != sha256_bytes(free.canonical_bytes(report))
+            or signed["promptSha256"] != sha256_file(prompt_path)
+        ):
+            raise LoopError(
+                "mandatory route prompt/report artifacts are foreign",
+                "Use the exact artifacts emitted by the signed producer run.",
+            )
+    if (
+        signed["maker"] != maker
+        or any(signed["reviewer"].get(field) != checker[field]
+               for field in ("provider", "model", "session"))
+    ):
+        raise LoopError(
+            "mandatory route provenance differs from checker provenance",
+            "Copy only host-observed maker/reviewer identity from phase one.",
+        )
+    return signed
+
+
+def validate_route_machine_binding(
+    verified_route: dict[str, Any] | None, machine_path: Path
+) -> None:
+    if (
+        verified_route is not None
+        and verified_route["inputBindings"]["machineReceiptSha256"]
+        != sha256_file(machine_path)
+    ):
+        raise LoopError(
+            "mandatory route receipt binds another machine receipt",
+            "Run the keyless reviewer only after the exact machine oracle passes.",
+        )
+
+
+def command_adjudicate(args: argparse.Namespace) -> int:
+    policy, policy_sha = load_policy()
+    repo = repository_root(args.root)
+    risk = args.risk_tier
+    context = candidate_context(repo, risk, args.candidate_mode)
+    assert_candidate_not_empty(context, args.candidate_mode)
+    root = receipt_root(repo, policy)
+    machine_path = secure_dependency_path(repo, root, args.machine, "machine receipt")
+    machine = read_json(machine_path, "machine receipt")
+    validate_machine(machine, repo=repo, risk=risk, unit_id=args.unit_id,
+                     policy=policy, policy_sha=policy_sha,
+                     candidate_mode=args.candidate_mode)
+    if machine.get("verdict") != "PASSED":
+        raise LoopError("machine verification failed", "Repair the candidate before semantic review/adjudication.")
+    route = policy["riskRoutes"][risk]
+    dependencies: dict[str, Any] = {"machine": dependency(repo, root, machine_path, "machine receipt")}
+    human_block: dict[str, Any] | None = None
+    if args.dispositions and not route["checkerRequired"]:
+        raise LoopError("machine-only route has no findings to adjudicate",
+                        "Human adjudication applies only to an independent checker's findings.")
+    if route["checkerRequired"]:
+        if not args.checker:
+            raise LoopError("required checker receipt is missing",
+                            "Run the risk-tier checker or remain UNVERIFIED.")
+        checker_path = secure_dependency_path(repo, root, args.checker, "checker receipt")
+        checker = read_json(checker_path, "checker receipt")
+        if args.dispositions:
+            raw = Path(args.dispositions)
+            supplied = read_json(
+                (raw if raw.is_absolute() else repo / raw).resolve(),
+                "human dispositions")
+            if not isinstance(supplied, dict):
+                raise LoopError("human dispositions file is not an object",
+                                "Provide a JSON object in legacy v1 or closed v2 format.")
+            if "version" in supplied:
+                if supplied.get("version") != V2_ADJUDICATION_VERSION:
+                    raise LoopError("human adjudication version is unknown",
+                                    "Use legacy v1 without a version, or the exact supported v2 version.")
+                allowed = {"version", "confirmedBy", "confirmation",
+                           "checkerReceiptSha256", "approvalBinding", "dispositions"}
+                if set(supplied) != allowed:
+                    unknown = sorted(set(supplied) - allowed)
+                    missing = sorted(allowed - set(supplied))
+                    detail = []
+                    if unknown:
+                        detail.append("unknown " + ", ".join(unknown))
+                    if missing:
+                        detail.append("missing " + ", ".join(missing))
+                    raise LoopError("v2 human dispositions file is malformed: "
+                                    + "; ".join(detail),
+                                    "Provide exactly the closed v2 draft fields before minting.")
+                human_block = dict(supplied)
+                human_block["confirmedAt"] = now_iso()
+                validate_v2_human_adjudication(human_block, checker,
+                                               sha256_file(checker_path), context,
+                                               policy_sha, args.unit_id)
+            else:
+                allowed = {"confirmedBy", "confirmation",
+                           "checkerReceiptSha256", "dispositions"}
+                if not {"confirmedBy", "confirmation",
+                        "dispositions"} <= set(supplied) <= allowed:
+                    raise LoopError("human dispositions file is malformed",
+                                    "Provide confirmedBy, confirmation, checkerReceiptSha256 and dispositions.")
+                human_block = {
+                    "confirmedBy": supplied.get("confirmedBy"),
+                    "confirmedAt": now_iso(),
+                    "confirmation": supplied.get("confirmation"),
+                    "checkerReceiptSha256": supplied.get("checkerReceiptSha256"),
+                    "dispositions": supplied.get("dispositions"),
+                }
+                validate_human_adjudication(human_block, checker,
+                                            sha256_file(checker_path))
+        verified_route = validate_checker(
+            checker, repo=repo, risk=risk, unit_id=args.unit_id,
+            policy=policy, policy_sha=policy_sha,
+            required_mode=route["checkerMode"],
+            candidate_mode=args.candidate_mode,
+            allow_adjudicated_blocked=human_block is not None,
+        )
+        validate_route_machine_binding(verified_route, machine_path)
+        dependencies["checker"] = dependency(repo, root, checker_path, "checker receipt")
+    elif args.checker:
+        raise LoopError("low-risk machine-only route must not spend a checker",
+                        "Adjudicate the machine receipt without --checker.")
+    outcome = "ADJUDICATED" if human_block is not None else "PASSED"
+    assert_checkout_matches_candidate(repo, context)
+    with reserve_attempt(repo, policy, context, args.unit_id, risk, policy_sha,
+                         args.attempt) as (attempt, entry_path):
+        output = (Path(args.output).resolve() if args.output
+                  else default_path(repo, policy, args.unit_id, "adjudication", context, attempt))
+        output = inside(output, root, "adjudication receipt")
+        if output.exists():
+            # Recover the only safe crash window: a complete immutable receipt
+            # was linked, but its append-only ledger entry was not yet linked.
+            receipt = read_json(output, "orphaned adjudication receipt")
+            validate_common(receipt, kind="adjudication", repo=repo, risk=risk,
+                            unit_id=args.unit_id, policy=policy,
+                            policy_sha=policy_sha,
+                            candidate_mode=args.candidate_mode)
+            expected_ledger = {
+                "entryPath": entry_path.relative_to(repo).as_posix(),
+                "sequence": attempt,
+            }
+            if (receipt.get("outcome") != outcome
+                    or receipt.get("attempt") != attempt
+                    or receipt.get("attemptLedger") != expected_ledger
+                    or receipt.get("dependencies") != dependencies):
+                raise LoopError("orphaned adjudication does not match the pending transaction",
+                                "Preserve the conflicting evidence and escalate for manual recovery.")
+            validate_adjudication_evidence(
+                receipt, repo=repo, risk=risk, unit_id=args.unit_id,
+                policy=policy, policy_sha=policy_sha,
+                candidate_mode=args.candidate_mode)
+        else:
+            payload = {
+                "version": RECEIPT_VERSION,
+                "kind": "adjudication",
+                "createdAt": now_iso(),
+                "unitId": args.unit_id,
+                "riskTier": risk,
+                "candidate": context,
+                "candidateDigest": candidate_digest(context),
+                "policySha256": policy_sha,
+                "producer": {"id": "itd-verification-loop", "role": "adjudicator", "host": platform.system()},
+                "producerRunId": secrets.token_hex(16),
+                "assurance": {"class": "integrity-and-process", "trustRoot": "honest-host-orchestrator",
+                              "samePrincipalByzantineResistance": False},
+                "attempt": attempt,
+                "attemptLedger": {
+                    "entryPath": entry_path.relative_to(repo).as_posix(),
+                    "sequence": attempt,
+                },
+                "checkerMode": route["checkerMode"],
+                "dependencies": dependencies,
+                "outcome": outcome,
+            }
+            if human_block is not None:
+                payload["humanAdjudication"] = human_block
+            receipt = seal_receipt(payload)
+            write_json_exclusive(output, receipt)
+        entry = make_attempt_entry(repo, output, receipt)
+        write_json_exclusive(entry_path, entry)
+        validate_adjudication(
+            repo, output, risk, args.unit_id, args.candidate_mode)
+    print(output.as_posix())
+    return 0
+
+
+def command_prepare_adjudication(args: argparse.Namespace) -> int:
+    """Emit a deterministic, non-authorizing v2 approval draft.
+
+    The caller supplies the completed disposition rows.  This command seals
+    their exact meaning into the candidate binding, but deliberately leaves
+    `confirmedBy` as a draft placeholder; only a later human-filled file can
+    be passed to `adjudicate`.
+    """
+    policy, policy_sha = load_policy()
+    repo = repository_root(args.root)
+    context = candidate_context(repo, args.risk_tier, args.candidate_mode)
+    assert_candidate_not_empty(context, args.candidate_mode)
+    root = receipt_root(repo, policy)
+    checker_path = secure_dependency_path(repo, root, args.checker, "checker receipt")
+    checker = read_json(checker_path, "checker receipt")
+    source = Path(args.dispositions)
+    source = source if source.is_absolute() else repo / source
+    try:
+        raw = source.read_bytes()
+        if len(raw) > JSON_INPUT_MAX_BYTES:
+            raise ValueError("oversized")
+        dispositions = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise LoopError("v2 draft dispositions are unreadable",
+                        "Provide one bounded JSON list of completed disposition rows.") from exc
+    binding = v2_binding(context, policy_sha, args.unit_id, args.claim,
+                         checker, dispositions)
+    digest = sha256_bytes(canonical(binding))
+    print(json.dumps({
+        "version": V2_ADJUDICATION_VERSION,
+        "confirmedBy": DRAFT_PLACEHOLDER,
+        "confirmation": V2_CONFIRMATION_TEMPLATE.format(sha256=digest),
+        "checkerReceiptSha256": sha256_file(checker_path),
+        "approvalBinding": binding,
+        "dispositions": dispositions,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def command_check(args: argparse.Namespace) -> int:
+    if args.require_mandatory_route and not args.expected_repository:
+        raise LoopError(
+            "mandatory publication repository is missing",
+            "Provide --expected-repository with --require-mandatory-route.",
+        )
+    receipt, verified_route = validate_adjudication(
+        args.root, args.receipt, args.risk_tier, args.unit_id,
+        args.candidate_mode,
+        require_mandatory_route=args.require_mandatory_route,
+        expected_repository=args.expected_repository,
+        expected_producer_keyring_sha256=(
+            args.expected_producer_keyring_sha256
+        ),
+        accept_adjudicated_route=args.accept_adjudicated_route,
+        return_route=True)
+    if args.accept_adjudicated_route:
+        # Route-evidence label for the opt-in caller only; the default check
+        # surface stays byte-identical (silent stdout on success). The honest
+        # independence label comes from the signed phase-one route when the
+        # producer minted one; pre-batch receipts and ADJUDICATED outcomes
+        # without a route report null instead of a fabricated level.
+        print(json.dumps({
+            "outcome": receipt.get("outcome"),
+            "routeIndependence": (verified_route or {}).get(
+                "independenceLevel"
+            ),
+        }, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def command_mint_override(args: argparse.Namespace) -> int:
+    """Mint the audited HUMAN_OVERRIDE_NO_INDEPENDENT_REVIEW record.
+
+    The record documents a human decision to proceed with NO independent
+    review at all. It is validated fail-closed by the shared independence
+    policy, is bound to the exact candidate digest, and is deliberately not
+    an adjudication receipt: every gate that requires an independent review
+    keeps treating the candidate as review-absent.
+    """
+    policy_module = _independence_module()
+    record = {
+        "outcome": policy_module.HUMAN_OVERRIDE_NO_INDEPENDENT_REVIEW,
+        "candidateDigest": args.candidate_digest,
+        "confirmedBy": args.confirmed_by,
+        "reason": args.reason,
+        "crossVendorUnavailability": {
+            "status": "UNAVAILABLE", "route": policy_module.CROSS_VENDOR,
+            "detail": args.cross_vendor_detail,
+        },
+        "fallbackUnavailability": {
+            "status": "UNAVAILABLE",
+            "route": policy_module.SAME_VENDOR_DIFFERENT_MODEL,
+            "detail": args.fallback_detail,
+        },
+    }
+    try:
+        validated = policy_module.validate_human_override(
+            record, args.candidate_digest
+        )
+    except policy_module.IndependenceError as exc:
+        raise LoopError(
+            f"human override record is {exc.status}: {exc}",
+            "Provide the exact candidate digest, confirmer and typed "
+            "unavailability details.",
+        ) from exc
+    policy, _policy_sha = load_policy()
+    repo = repository_root(args.root)
+    output = inside(
+        Path(args.output), receipt_root(repo, policy), "override record"
+    )
+    payload = {
+        "kind": "itd-human-override-no-independent-review-v1",
+        "unitId": args.unit_id,
+        "recordedAt": now_iso(),
+        **validated,
+    }
+    write_json_exclusive(output, payload)
+    print(output.as_posix())
+    return 0
+
+
+def _independence_module():
+    import importlib.util as _util
+    path = Path(__file__).resolve().parent / "itd_reviewer_independence.py"
+    spec = _util.spec_from_file_location("itd_reviewer_independence", path)
+    if spec is None or spec.loader is None:
+        raise LoopError(
+            "independence policy module is unavailable",
+            "Restore skills/_shared/itd_reviewer_independence.py.",
+        )
+    module = _util.module_from_spec(spec)
+    sys.modules.setdefault("itd_reviewer_independence", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _review_evidence_module():
+    # Compile the source bytes: an import may run a __pycache__ entry whose
+    # size and mtime still match after an edit, and the pre-leg check must
+    # apply the producer's current rules (Sol s3).
+    import types as _types
+    path = Path(__file__).resolve().parent / "itd_review_evidence.py"
+    try:
+        source = path.read_bytes()
+    except OSError as exc:
+        raise LoopError(
+            "review evidence module is unavailable",
+            "Restore skills/_shared/itd_review_evidence.py.",
+        ) from exc
+    module = _types.ModuleType("itd_review_evidence")
+    module.__file__ = str(path)
+    exec(compile(source, str(path), "exec"), module.__dict__)
+    return module
+
+
+def fail(exc: LoopError) -> int:
+    print(json.dumps({"status": "UNVERIFIED", "why": exc.why, "fix": exc.fix},
+                     ensure_ascii=False, sort_keys=True))
+    return 1
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Risk-tiered proof-carrying Verification Loop")
+    sub = p.add_subparsers(dest="action")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--root", type=Path, default=Path.cwd())
+    common.add_argument("--unit-id", required=True)
+    common.add_argument("--risk-tier", choices=sorted(RISK_TIERS), required=True)
+    common.add_argument(
+        "--candidate-mode", choices=("staged", "committed-head"),
+        default="staged",
+        help=("staged (default), or committed-head to bind the clean "
+              "single-parent HEAD to its parent using the same exact tree/diff"),
+    )
+    machine = sub.add_parser("machine", parents=[common])
+    machine.add_argument("--command", action="append", required=True, help="id=command")
+    machine.add_argument(
+        "--input", action="append", default=[],
+        help="explicit ignored/untracked file or directory copied and hash-bound into the isolated oracle")
+    machine.add_argument("--timeout", type=int, default=600)
+    machine.add_argument("--output")
+    checker = sub.add_parser("checker", parents=[common])
+    checker.add_argument("--mode", choices=sorted(CHECKER_MODES), required=True)
+    checker.add_argument("--report", required=True)
+    checker.add_argument("--prompt-file", required=True)
+    checker.add_argument("--maker-provider", required=True)
+    checker.add_argument("--maker-model", required=True)
+    checker.add_argument("--maker-session", required=True)
+    checker.add_argument("--checker-provider", required=True)
+    checker.add_argument("--checker-model", required=True)
+    checker.add_argument("--checker-session", required=True)
+    checker.add_argument("--phase-one-receipt")
+    checker.add_argument("--producer-keyring")
+    checker.add_argument("--output")
+    adjudicate = sub.add_parser("adjudicate", parents=[common])
+    adjudicate.add_argument("--machine", required=True)
+    adjudicate.add_argument("--checker")
+    adjudicate.add_argument(
+        "--dispositions",
+        help="JSON file with the human's per-finding adjudication (ADR-007)")
+    adjudicate.add_argument(
+        "--attempt", type=int,
+        help="optional assertion of the next durable attempt; allocation is automatic")
+    adjudicate.add_argument("--output")
+    prepare = sub.add_parser("prepare-adjudication", parents=[common],
+                             help="emit a deterministic non-authorizing v2 human approval draft")
+    prepare.add_argument("--checker", required=True)
+    prepare.add_argument("--dispositions", required=True,
+                         help="JSON list of completed disposition rows")
+    prepare.add_argument("--claim", action="append", required=True,
+                         help="explicit allowed claim (root unit and optional root:general-review)")
+    check = sub.add_parser("check", parents=[common])
+    check.add_argument("--receipt", required=True)
+    check.add_argument("--require-mandatory-route", action="store_true")
+    check.add_argument(
+        "--accept-adjudicated-route", action="store_true",
+        help=("with --require-mandatory-route: accept an ADJUDICATED outcome "
+              "through its human adjudication channel; a PASSED outcome "
+              "still requires the signed phase-one route"))
+    check.add_argument("--expected-repository")
+    check.add_argument("--expected-producer-keyring-sha256")
+    override = sub.add_parser(
+        "mint-override", parents=[common],
+        help=("record an audited HUMAN_OVERRIDE_NO_INDEPENDENT_REVIEW "
+              "decision; the record is never a review outcome and satisfies "
+              "no review gate"))
+    override.add_argument("--candidate-digest", required=True)
+    override.add_argument("--confirmed-by", required=True)
+    override.add_argument("--reason", required=True)
+    override.add_argument("--cross-vendor-detail", required=True)
+    override.add_argument("--fallback-detail", required=True)
+    override.add_argument("--output", required=True)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    if not args_list:
+        return 0
+    args = parser().parse_args(args_list)
+    try:
+        if args.action == "machine":
+            if args.timeout <= 0:
+                raise LoopError("timeout must be positive", "Use a finite positive command timeout.")
+            return command_machine(args)
+        if args.action == "checker":
+            return command_checker(args)
+        if args.action == "adjudicate":
+            return command_adjudicate(args)
+        if args.action == "prepare-adjudication":
+            return command_prepare_adjudication(args)
+        if args.action == "check":
+            return command_check(args)
+        if args.action == "mint-override":
+            return command_mint_override(args)
+        raise LoopError("a Verification Loop action is required", "Use machine, checker, adjudicate, check or mint-override.")
+    except LoopError as exc:
+        return fail(exc)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

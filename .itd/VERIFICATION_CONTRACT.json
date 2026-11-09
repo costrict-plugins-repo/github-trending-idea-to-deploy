@@ -1,0 +1,358 @@
+{
+  "version": 2,
+  "purpose": "Executable regression and exact-candidate acceptance contract for GPG-003 single fresh opposite-GPT independent review, preserving the nine-point plan and GPG-001/GPG-002 trust boundaries.",
+  "trustedPathSemantics": "Every commands[].argv directly invokes its declared launcher and verifier. Extra declared files such as tests/run-all.sh are read-only inputs inspected by that verifier, not indirectly executed suites; the protected machine gate binds every declared input to the protected base before execution.",
+  "unitId": "GPG-003",
+  "createdAt": "2026-07-30",
+  "activationState": "gpg003_unified_keyless_review_in_progress",
+  "bootstrapAcceptance": {
+    "currentCandidate": "The candidate simplifies the mandatory keyless producer to one fresh opposite OpenAI subscription model/session: Sol maker to Terra reviewer, Terra maker to Sol reviewer, then fail closed. Optional transports remain non-blocking and separately invoked. It preserves all evidence-first machine-oracle, nine-point, GPG-001/GPG-002 exact-candidate, MEM-8, secret-isolation and protection-claim anchors.",
+    "protectedMachineGate": "Not activated and not required for the selected local-review claim. Any future PROTECTED claim remains RECOVERY_REQUIRED until this contract and every trusted verifier path are identical regular Git objects in the protected base and the live workflow/ruleset canaries pass.",
+    "localMachineEvidence": "The commands below are local regression evidence for an exact-candidate Verification Loop. The mandatory keyless producer supplies the fresh independent semantic result; the adjudicator remains the only acceptance authority. Neither route asserts live App authority, branch protection or PROTECTED status.",
+    "anchorSequence": "The reviewed bootstrap and release are complete. A separate optional profile-upgrade unit may install and pin the protected workflow/ruleset to a protected release SHA without changing its attesting anchors before claiming protected-machine enforcement.",
+    "externalCandidatePreparationEvidence": "Before the checker receipt, the honest host records the same tree/base, exact reconstruction, review-diff SHA-256, secretScrub=clean, and redactions=0 in the bound report. Any secret match is UNVERIFIED; candidate commands cannot self-attest egress scrub."
+  },
+  "commandSchema": {
+    "requiredFields": [
+      "id",
+      "argv",
+      "trustedVerifierPaths",
+      "timeoutSeconds",
+      "expectedOutput",
+      "passFailParser"
+    ],
+    "allowedPassFailParsers": [
+      "exit_code_zero",
+      "stdout_contains",
+      "json_field_equals",
+      "manual_evidence"
+    ]
+  },
+  "commands": [
+    {
+      "id": "mandatory-keyless-review-regression",
+      "argv": [
+        "sh",
+        "skills/_shared/itd_py.sh",
+        "--itd-isolated",
+        "tests/verify_mandatory_keyless_review.py"
+      ],
+      "trustedVerifierPaths": [
+        "tests",
+        "skills/_shared/itd_py.sh",
+        "tests/verify_mandatory_keyless_review.py"
+      ],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "free-reviewer-producer",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_free_reviewer_producer.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_free_reviewer_producer.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "copilot-reviewer",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_copilot_reviewer.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_copilot_reviewer.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "reviewer-provider-freshness",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_reviewer_provider_freshness.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_reviewer_provider_freshness.py", ".itd/REVIEW_PROVIDER_FRESHNESS.json"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "independent-review-efficacy",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_independent_review_efficacy.py", "--expected-keyring-sha256", "dd4c6dea0fd05351ae5026d36635618573938c0fc1d8d0b49605866c18ddc5e2"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_independent_review_efficacy.py", "tests/run-independent-review-efficacy.py", "benchmarks/independent-review-efficacy/cases.json"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "live-model-evidence-replay",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_live_model_benchmark.py", "--require-evidence"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_live_model_benchmark.py", "tests/run-live-model-benchmark.py", "tests/fixtures/live-model-evidence"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "passed, 0 failed",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "broker-orchestration",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_review_broker.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_review_broker.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+        {
+            "id": "broker-server",
+            "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_review_broker_server.py"],
+            "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_review_broker_server.py"],
+            "timeoutSeconds": 180,
+            "expectedOutput": "\"status\": \"PASSED\"",
+            "passFailParser": "stdout_contains"
+        },
+        {
+            "id": "broker-operator",
+            "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_review_broker_operator.py"],
+            "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_review_broker_operator.py"],
+            "timeoutSeconds": 120,
+            "expectedOutput": "\"status\": \"PASSED\"",
+            "passFailParser": "stdout_contains"
+        },
+        {
+            "id": "broker-deployment",
+            "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_review_broker_deployment.py"],
+            "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_review_broker_deployment.py", "tests/run-all.sh"],
+            "timeoutSeconds": 120,
+            "expectedOutput": "\"status\": \"PASSED\"",
+            "passFailParser": "stdout_contains"
+        },
+        {
+            "id": "github-app-manifest",
+            "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_github_app_manifest.py"],
+            "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_github_app_manifest.py"],
+            "timeoutSeconds": 120,
+            "expectedOutput": "\"status\": \"PASSED\"",
+            "passFailParser": "stdout_contains"
+        },
+    {
+      "id": "broker-policy-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_review_broker_policy.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_review_broker_policy.py"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "broker-primitives-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_review_broker_primitives.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_review_broker_primitives.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "machine-oracle-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_machine_oracle.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_machine_oracle.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "gate-control-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_gate_control.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_gate_control.py"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "verification-loop-commit-bridge-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_verification_loop.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_verification_loop.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "passed, 0 failed",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "gate-profile-doctor-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_gate_profile_doctor.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_gate_profile_doctor.py"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "gate-registry-profiles-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_gate_registry_profiles.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_gate_registry_profiles.py"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "gate-registry-binding-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_gate_registry_binding.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_gate_registry_binding.py"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "guarded-pr-cli-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_itd_cli.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_itd_cli.py"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "global-git-gate-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_git_gate_hooks.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_git_gate_hooks.py"],
+      "timeoutSeconds": 120,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "api-reviewer-migration-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_api_reviewer.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_api_reviewer.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "\"status\": \"PASSED\"",
+      "passFailParser": "stdout_contains"
+    },
+    {
+      "id": "api-reviewer-curl-transport-regression",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_api_reviewer_curl_transport.py"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_api_reviewer_curl_transport.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "",
+      "passFailParser": "exit_code_zero"
+    },
+        {
+            "id": "external-reviewer-release-regression",
+            "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_external_reviewer_release.py"],
+            "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_external_reviewer_release.py", "tests/verify_api_reviewer.py", "tests/run-all.sh"],
+            "timeoutSeconds": 180,
+            "expectedOutput": "",
+            "passFailParser": "exit_code_zero"
+        },
+        {
+            "id": "host-adapter-regression",
+            "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/verify_host_adapters.py"],
+            "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/verify_host_adapters.py"],
+            "timeoutSeconds": 180,
+            "expectedOutput": "",
+            "passFailParser": "exit_code_zero"
+        },
+    {
+      "id": "methodology-meta-review",
+      "argv": ["sh", "skills/_shared/itd_py.sh", "--itd-isolated", "tests/meta_review.py", "--verbose"],
+      "trustedVerifierPaths": ["tests", "skills/_shared/itd_py.sh", "tests/meta_review.py"],
+      "timeoutSeconds": 180,
+      "expectedOutput": "FINAL STATUS: PASSED",
+      "passFailParser": "stdout_contains"
+    }
+  ],
+  "requiredArtifacts": [
+    ".itd/ACCEPTANCE_CONTRACT.json",
+    ".itd/SCOPE_LOCK.md",
+    ".itd/VERIFICATION_CONTRACT.json",
+    ".itd-memory/STATE.json",
+    ".itd/GPG-003_ROOT_CAUSE.md",
+    ".itd/REVIEW_PROVIDER_FRESHNESS.json",
+    ".itd/REVIEW_EFFICACY_KEYRING.json",
+    ".itd/COPILOT_LIVE_WSL.json",
+    ".itd/COPILOT_LIVE_WINDOWS.json",
+    "skills/review/SKILL.md",
+    "skills/cross-review/SKILL.md",
+    "skills/cross-review/references/cli-adapters.md",
+    "tests/verify_mandatory_keyless_review.py",
+    "skills/_shared/REVIEW_BROKER_POLICY.json",
+    "skills/_shared/REVIEW_BROKER_POLICY.schema.json",
+    "skills/_shared/REVIEW_BROKER_RUNTIME.schema.json",
+    "skills/_shared/GATE_DEPLOYMENT_PROFILES.json",
+    "skills/_shared/itd_review_broker_primitives.py",
+    "skills/_shared/itd_review_broker.py",
+    "skills/_shared/itd_free_reviewer_producer.py",
+    "skills/_shared/itd_review_evidence.py",
+    "benchmarks/independent-review-efficacy/cases.json",
+    "benchmarks/independent-review-efficacy/results/wsl.json",
+    "benchmarks/independent-review-efficacy/results/windows.json",
+    "tests/run-independent-review-efficacy.py",
+    "tests/verify_independent_review_efficacy.py",
+    "docs/adr/ADR-005-evidence-first-deep-independent-review.md",
+        "services/review_broker/server.py",
+        "services/review_broker/operator.py",
+        "services/review_broker/Dockerfile",
+        "services/review_broker/requirements.lock",
+        "services/review_broker/deploy/compose.yaml",
+        "services/review_broker/deploy/systemd/itd-review-broker.service",
+        "docs/templates/github/itd-machine-oracle.yml",
+        "scripts/itd.py",
+        "scripts/itd_gate_profile_doctor.py",
+        "scripts/itd_github_app_manifest.py",
+        "scripts/itd_install_cli.py",
+        "scripts/itd_machine_oracle.py",
+        "scripts/itd_pre_push.py",
+        "scripts/itd_install_git_hooks.py",
+    "docs/API_REVIEWER.md",
+    "docs/CI.md",
+    "skills/_shared/itd_gate_control.py",
+    "tests/verify_machine_oracle.py",
+    "tests/verify_gate_control.py",
+    "tests/verify_gate_profile_doctor.py",
+    "tests/verify_gate_registry_profiles.py",
+    "tests/verify_itd_cli.py",
+    "tests/verify_git_gate_hooks.py",
+    "tests/verify_review_broker_policy.py",
+    "tests/verify_review_broker_primitives.py",
+    "tests/verify_review_broker.py",
+    "tests/verify_free_reviewer_producer.py",
+        "tests/verify_review_broker_server.py",
+    "tests/verify_review_broker_operator.py",
+    "tests/verify_review_broker_deployment.py",
+        "tests/verify_github_app_manifest.py",
+    ".itd/GPG-001_COMPLETION_EVIDENCE.json",
+    ".itd-memory/verification-loop/receipts/360a8d71643b981a/GPG-001-live-evidence-machine-12fd738043afe851.json",
+    ".itd-memory/verification-loop/receipts/360a8d71643b981a/GPG-001-live-evidence-checker-d3d4438d2080871b.json",
+    ".itd-memory/verification-loop/receipts/360a8d71643b981a/GPG-001-live-evidence-adjudication-a1.json",
+    ".itd-memory/verification-loop/GPG-001-release-1.95.0-machine.json",
+    ".itd-memory/verification-loop/GPG-001-release-1.95.0-checker.json",
+    ".itd-memory/verification-loop/GPG-001-release-1.95.0-adjudication.json",
+    ".itd/GPG-002_ROOT_CAUSE.md",
+    ".itd/GPG-002_COMPLETION_EVIDENCE.json",
+    ".itd-memory/verification-loop/GPG-002-fix-final-machine.json",
+    ".itd-memory/verification-loop/GPG-002-fix-final-checker.json",
+    ".itd-memory/verification-loop/GPG-002-fix-final-adjudication.json",
+    ".itd-memory/verification-loop/receipts/811a95a4aa31177c/GPG-002-windows-unc-live-machine-212b660bb873e4c2.json",
+    ".itd-memory/verification-loop/receipts/811a95a4aa31177c/GPG-002-windows-unc-live-checker-ee5f565223ab85cd.json",
+    ".itd-memory/verification-loop/receipts/811a95a4aa31177c/GPG-002-windows-unc-live-adjudication-a1.json",
+    ".itd-memory/verification-loop/prompts/GPG-002-windows-unc-live-terra.md",
+    ".itd-memory/verification-loop/reports/GPG-002-windows-unc-live-terra.json"
+  ],
+  "passCriteria": [
+    "All required commands exit 0.",
+    "Expected output rules match.",
+    "Required artifacts exist.",
+    "Portable v2 local-review validates the registered exact HEAD and current independent adjudication without requiring product adoption artifacts; App-backed and legacy profiles retain adoption and machine-preflight controls.",
+    "The default producer route is exactly one OpenAI subscription reviewer with strict Sol-to-Terra or Terra-to-Sol selection, no provider API key, no automatic provider fallback and no paid dispatch.",
+    "Findings, unverified output, malformed provenance, stale candidate, unknown maker model and mandatory-reviewer UNAVAILABLE block PR publication without caller bypass.",
+    "A scrubbed review diff above the direct bound is completely covered by at most 16 deterministic exact-byte units plus one integration review; the signed prompt bundle rejects missing, reordered, mutated, session-reused or mixed-model evidence.",
+    "Every direct, hierarchical-unit and integration prompt ends with a trusted closed RFC 8259 output contract after all untrusted material; fenced, prefixed, suffixed or otherwise non-strict JSON remains UNVERIFIED.",
+    "Every active criterion maps declared impact classes to exact-tree oracle IDs; missing or failed evidence is UNVERIFIED before reviewer dispatch.",
+    "Medium/high/unknown risk requires one clean fresh opposite-GPT provider/model/session report, and deterministic host adjudication preserves every machine, unit, integration and reviewer finding.",
+    "The frozen efficacy pack reports 100% critical/high detection, 100% missing-evidence detection, 100% unit-finding retention, at least 90% medium detection and at most 10% clean-control false blocks on WSL and native Windows.",
+    "Dual-host efficacy and provider live proofs are host-derived Ed25519-signed envelopes; critical/high efficacy requires a blocking verdict and the host-owned local-review registry pins the authorized producer keyring SHA-256.",
+    "/review, /cross-review and Verification Loop name the same producer and adjudication authority.",
+    "Focused routing and host-adapter tests pass on WSL and native Windows.",
+    "Bound external candidate-preparation evidence reports exact reconstruction and a clean zero-redaction secret scrub.",
+    "A fresh different-model full checker reports an empty findings list.",
+    "A fresh full different-model checker and high-risk GPG-003 adjudication receipt revalidate the exact candidate."
+  ],
+  "failureMode": "RECOVERY_REQUIRED",
+  "failClosed": "A missing shell-free argv, protected-base content-bound verifier, artifact, checker, receipt, ambiguous parser, redaction, changed staged tree, same model/session, inherited context, reviewer tool use, mandatory opposite-GPT reviewer unavailable, caller bypass, candidate-selected producer keyring, unsigned live result, or attempt by this bootstrap candidate to self-attest changed verifier paths is RECOVERY_REQUIRED, never success.",
+  "machineGateTrust": {
+    "activation": "Future protected-machine enforcement only, after the bootstrap anchors are merged and remain unchanged in the activating candidate.",
+    "currentCandidateDisposition": "Ineligible for protected-machine attestation; commands run now are local regression evidence under bootstrapAcceptance.",
+    "contractSource": "target-protected-base-head-after-separate-anchor-merge",
+    "commandExecution": "shell-free-argv",
+    "trustedVerifierPolicy": "Every commands[].trustedVerifierPaths entry must resolve to identical regular Git objects in protected base and candidate before any command may run; each command binds its exact executable verifier file plus every verifier-side file it reads or executes.",
+    "interpreterIsolation": "The protected itd_py.sh --itd-isolated mode adds Python -I, so the verifier script directory, the candidate working directory, user site packages, and candidate-only startup modules such as sitecustomize.py cannot participate through Python import resolution.",
+    "subjectUnderTestBoundary": "Candidate broker, server, policy, schema, CLI, workflow, hook, document, and adapter paths explicitly loaded or read by a protected verifier are subjects under test, not verifier authority. They may differ from protected base and remain bound by the exact candidate tree and required-artifact hashes. Because -I removes implicit candidate import roots, only explicit loads present in the protected verifier can cross this boundary; any test-side helper used to decide pass/fail belongs in trustedVerifierPaths.",
+    "rotation": "Add a verifier under a new path and merge it, update this protected contract to trust that already-protected path in a second merge, then use it for implementation changes; the attesting verifier is never replaced by the PR it evaluates."
+  }
+}

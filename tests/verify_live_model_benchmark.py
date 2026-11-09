@@ -1,0 +1,1357 @@
+#!/usr/bin/env python3
+"""Fail-closed verifier for the scheduled, externally judged H4 benchmark."""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import copy
+import datetime as dt
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+from decimal import Decimal
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+import tempfile
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EVIDENCE = ROOT / "tests" / "fixtures" / "live-model-evidence" / "latest.json"
+passed = failed = 0
+METHODOLOGY_TREE_ROOTS = (
+    "AGENTS.md", ".codex-plugin", ".claude-plugin", "skills", "agents", "hooks",
+    "docs/templates/itd", "docs/templates/itd-memory",
+    "docs/HOST_ADAPTER_CONTRACT.md", "docs/host-adapters.json",
+)
+GENERATED_STATUS_PREFIXES = ("tests/fixtures/live-model-evidence/",)
+EXPECTED_TRANSCRIPT_LIMIT_BYTES = 8 * 1024 * 1024
+
+
+def load_live_runner():
+    path = ROOT / "tests" / "run-live-model-benchmark.py"
+    spec = importlib.util.spec_from_file_location("itd_live_model_runner", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load live-model benchmark runner")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    global passed, failed
+    print(f"{'PASS' if condition else 'FAIL'}  {name}" + (f" [{detail[:240]}]" if detail and not condition else ""))
+    if condition:
+        passed += 1
+    else:
+        failed += 1
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def bounded_gzip_read(path: Path, limit_bytes: int) -> bytes:
+    with gzip.open(path, "rb") as handle:
+        raw = handle.read(limit_bytes + 1)
+    if len(raw) > limit_bytes:
+        raise ValueError("retained transcript exceeds the declared byte limit")
+    return raw
+
+
+def transcript_result_events(raw: bytes, provider: str) -> list[dict]:
+    rows: list[dict] = []
+    terminal_type = "result" if provider == "anthropic" else "turn.completed"
+    for line in raw.decode("utf-8", errors="strict").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("type") == terminal_type:
+            rows.append(row)
+    return rows
+
+
+def stable_git_status(raw: bytes) -> bytes:
+    kept = []
+    for line in raw.splitlines(keepends=True):
+        decoded = line.decode("utf-8", errors="replace")
+        path_field = decoded.rstrip("\r\n")[3:] if len(decoded) >= 3 else decoded
+        paths = [item.strip().strip('"') for item in path_field.split(" -> ")]
+        generated_only = bool(paths) and all(
+            any(path.startswith(prefix) for prefix in GENERATED_STATUS_PREFIXES)
+            for path in paths)
+        if generated_only:
+            continue
+        kept.append(line)
+    return b"".join(kept)
+
+
+def git_status_bytes() -> bytes:
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=ROOT,
+        capture_output=True, timeout=20)
+    return (stable_git_status(result.stdout) if result.returncode == 0
+            else b"git-status-unavailable")
+
+
+def git_ignored_relatives(relatives: list[str]) -> set[str]:
+    """Repository-relative paths that Git ignores, resolved in one batch.
+
+    The tree pin must digest the methodology, not harness debris that happens
+    to sit inside it: a stray file under `skills/_shared/.claude/traces/` once
+    entered the pin silently and only surfaced later, in an isolated staged
+    candidate, as three failing checks. Git already knows which paths are
+    debris, so the pin defers to it instead of maintaining a second, always
+    incomplete, name-based denylist. A Git that cannot answer raises - a pin
+    that silently widens on a broken Git is the exact failure mode being
+    removed here. Tracked files are never reported by `check-ignore` unless
+    `--no-index` is passed, so a tracked path matching an ignore rule stays in
+    the pin.
+    """
+    if not relatives:
+        return set()
+    result = subprocess.run(
+        ["git", "check-ignore", "-z", "--stdin"], cwd=ROOT,
+        input="\0".join(relatives).encode("utf-8") + b"\0",
+        capture_output=True, timeout=60,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            "git check-ignore failed while pinning the methodology tree: "
+            + result.stderr.decode("utf-8", errors="replace").strip()[:200]
+        )
+    return {item for item in result.stdout.decode("utf-8").split("\0") if item}
+
+
+def load_pin_module():
+    # LPD-003-2: набор пина живёт одним модулем на раннер и оракул.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "itd_benchmark_pin", ROOT / "tests" / "itd_benchmark_pin.py")
+    module = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(module)
+    return module
+
+
+def methodology_tree_sha256() -> str:
+    return load_pin_module().tree_sha256(ROOT)
+
+
+CD_TARGET_RE = re.compile(
+    r"\b(?:cd|pushd)\s+(?:--\s+)?['\"]?(?:\.\./)*\.itd-plugin"
+    r"(?:/([\w./\-]*))?['\"]?(?=\s|$|[;&|)])")
+# Любое упоминание .itd-plugin как самостоятельного пути (не префикса
+# .itd-plugin/...) рядом со сменой каталога — независимо от формы записи.
+CD_CONSERVATIVE_RE = re.compile(r"\.itd-plugin(?![\w/\-])")
+CD_VERB_RE = re.compile(r"\b(?:cd|pushd)\b")
+
+
+def cd_targets_in_command(command: str) -> set[str]:
+    """cd-цели внутри .itd-plugin в одной команде — fail-closed к форме записи.
+
+    Сторож дважды ловился на перечислении форм шелла: pub4 — `cd .itd-plugin`
+    без слэша, pub6 — кавычки, `--`, `pushd`. По правилу остановки это повтор
+    механизма, поэтому сменена форма: точный паттерн покрывает известные
+    написания, а НЕРАСПОЗНАННАЯ команда, где рядом стоят смена каталога и
+    самостоятельный путь .itd-plugin, консервативно СЧИТАЕТСЯ переходом в
+    корень плагина (расширяет замер, никогда не сужает). Непонятная форма
+    больше не может молча ускользнуть — только заставить нас пересчитать
+    больше, чем нужно.
+    """
+    command = command or ""
+    targets = {(match.group(1) or "").rstrip("/")
+               for match in CD_TARGET_RE.finditer(command)}
+    if (not targets and CD_VERB_RE.search(command)
+            and CD_CONSERVATIVE_RE.search(command)):
+        targets.add("")
+    return targets
+
+
+def independent_pin_recomputation() -> tuple[list[str], str]:
+    """НЕЗАВИСИМЫЙ пересчёт файлов и хеша пина — намеренный дубль реализации.
+
+    Находка pub10 (security): tests/itd_benchmark_pin.py — одновременно
+    авторитет пина и реализация для раннера с оракулом; его порча ослабила бы
+    хеш у ВСЕХ потребителей согласованно, и сверки самоссылочно сходились бы.
+    Верификатор обязан считать САМ: обход и хеш здесь написаны заново и не
+    импортируют модуль пина. Это осознанное исключение из правила «один
+    источник правды»: расхождение двух реализаций — красный, и именно это
+    делает подделку модуля видимой. Корни при этом берутся из модуля, но
+    проверяются против внешних источников (декларация раннера, пересчитанный
+    замер) отдельными проверками ниже.
+    """
+    import subprocess
+    _pin = load_pin_module()
+    roots = [r for rs in _pin.BENCHMARK_PIN_REASONS.values() for r in rs]
+    files: list[Path] = []
+    for raw in sorted(set(roots)):
+        path = ROOT / raw
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(c for c in path.rglob("*")
+                         if c.is_file() and "__pycache__" not in c.parts
+                         and c.suffix != ".pyc")
+    relatives = sorted({f.relative_to(ROOT).as_posix() for f in files})
+    proc = subprocess.run(["git", "check-ignore", "-z", "--stdin"], cwd=ROOT,
+                          input="\0".join(relatives).encode() + b"\0",
+                          capture_output=True, timeout=60)
+    if proc.returncode not in (0, 1):
+        raise RuntimeError("git check-ignore failed in independent recomputation")
+    ignored = {i for i in proc.stdout.decode().split("\0") if i}
+    relatives = [r for r in relatives if r not in ignored]
+    digest = hashlib.sha256()
+    for rel in relatives:
+        content = (ROOT / rel).read_bytes()
+        encoded = rel.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return relatives, "sha256:" + digest.hexdigest()
+
+
+def measured_cd_targets() -> set[str]:
+    """Литеральные cd-цели внутри .itd-plugin из записанных транскриптов."""
+    targets: set[str] = set()
+    runs_dir = ROOT / "tests" / "fixtures" / "live-model-evidence" / "runs"
+    for run in sorted(runs_dir.iterdir()) if runs_dir.is_dir() else []:
+        if not run.is_dir():
+            continue
+        # Тот же фильтр успешности, что у measured_transcript_reads: провальный
+        # прогон не имеет права ни расширять, ни ронять контракт замера
+        # (находка ревьюера, pub9).
+        report = run / "run-report.json"
+        if report.is_file():
+            try:
+                outcome = json.loads(report.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(outcome.get("status", "")).upper() != "PASS":
+                continue
+        elif "-fail-" in run.name:
+            continue
+        for transcript in sorted(run.rglob("transcript.jsonl.gz")):
+            with gzip.open(transcript, "rt", encoding="utf-8",
+                           errors="replace") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    item = event.get("item") or {}
+                    if item.get("type") != "command_execution":
+                        continue
+                    targets.update(cd_targets_in_command(item.get("command")))
+    return targets
+
+
+check("cd без хвостового слэша попадает в замер",
+      cd_targets_in_command("cd .itd-plugin && cat skills/blueprint/SKILL.md") == {""})
+check("cd со слэшем и подкаталогом попадает в замер",
+      cd_targets_in_command("cd .itd-plugin/skills/blueprint") == {"skills/blueprint"})
+check("похожий каталог не матчится",
+      cd_targets_in_command("cd .itd-plugin-backup/x") == set())
+check("кавычки вокруг пути не прячут переход",
+      cd_targets_in_command('cd ".itd-plugin" && cat skills/x/SKILL.md') == {""})
+check("cd -- .itd-plugin не прячет переход",
+      cd_targets_in_command("cd -- .itd-plugin") == {""})
+check("pushd не прячет переход",
+      cd_targets_in_command("pushd .itd-plugin/skills") == {"skills"})
+check("нераспознанная форма рядом с cd считается переходом консервативно",
+      cd_targets_in_command("cd $PLUGIN_DIR # .itd-plugin resolved") == {""})
+check("упоминание без смены каталога переходом не считается",
+      cd_targets_in_command("echo .itd-plugin") == set())
+check("составная команда даёт обе цели",
+      cd_targets_in_command("cd .itd-plugin; cd .itd-plugin/skills")
+      == {"", "skills"})
+
+
+def measured_transcript_reads() -> set[str]:
+    """Динамика влияния: файлы, структурно читаемые записанными прогонами.
+
+    Считаются только события command_execution из транскриптов успешных runs;
+    упоминание в выводе ls/find/tree чтением не является — листинг каталога
+    упоминает всё дерево и делал бы замер тождественно пустым по смыслу
+    (substring-базлайн: 240 «упомянутых» файлов против 19 читаемых).
+    Относительные обращения из каталога скилла (references/...,
+    ../../references/...) нормализуются к repo-relative пути.
+    """
+    reads: set[str] = set()
+    runs_dir = ROOT / "tests" / "fixtures" / "live-model-evidence" / "runs"
+    for run in sorted(runs_dir.iterdir()) if runs_dir.is_dir() else []:
+        if not run.is_dir():
+            continue
+        # Успешность прогона — записанный исход, а не имя каталога: провал с
+        # другим именем включался бы, успех с токеном в имени терялся бы
+        # (находка ревьюера r1). Имя остаётся резервом только для прогонов,
+        # записанных до появления run-report.json.
+        report = run / "run-report.json"
+        if report.is_file():
+            try:
+                outcome = json.loads(report.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(outcome.get("status", "")).upper() != "PASS":
+                continue
+        elif "-fail-" in run.name:
+            continue
+        for transcript in sorted(run.rglob("transcript.jsonl.gz")):
+            with gzip.open(transcript, "rt", encoding="utf-8",
+                           errors="replace") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    item = event.get("item") or {}
+                    if item.get("type") != "command_execution":
+                        continue
+                    command = item.get("command") or ""
+                    for match in re.finditer(r"\.itd-plugin/([\w./\-]+)", command):
+                        raw = match.group(1).rstrip(".").rstrip("/")
+                        if "." not in raw.rsplit("/", 1)[-1]:
+                            continue
+                        # Префикс — непосредственно перед ЭТИМ совпадением, а
+                        # не до первого .itd-plugin в команде: составная
+                        # команда `ls .itd-plugin/a; cat .itd-plugin/b` иначе
+                        # роняла cat-чтение как листинг (находка ревьюера r1).
+                        prefix = command[max(0, match.start() - 30):match.start()]
+                        if re.search(r"\b(ls|find|tree)\b", prefix.split(";")[-1]
+                                     .split("&&")[-1].split("|")[-1]):
+                            continue
+                        normalized = PurePosixPath(
+                            re.sub(r"^(references/)", "skills/blueprint/\\1",
+                                   re.sub(r"^(_shared/)", "skills/\\1", raw)))
+                        parts: list[str] = []
+                        for part in normalized.parts:
+                            if part == "..":
+                                if parts:
+                                    parts.pop()
+                            elif part != ".":
+                                parts.append(part)
+                        candidate = "/".join(parts)
+                        if (ROOT / candidate).is_file():
+                            reads.add(candidate)
+    return reads
+
+
+def parse_time(raw: str) -> dt.datetime:
+    value = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        raise ValueError("timestamp has no timezone")
+    return value.astimezone(dt.timezone.utc)
+
+
+def status_passes(report: dict) -> bool:
+    return report.get("status") == "PASS"
+
+
+def independent_verdict_passes(report: dict) -> bool:
+    verdict = report.get("independentVerdict") or {}
+    return (verdict.get("actor") == "deterministic-external-oracle"
+            and verdict.get("candidateSelfReportAccepted") is False
+            and verdict.get("oracle") == "tests/verify_snapshot.py"
+            and verdict.get("exitCode") == 0
+            and verdict.get("status") == "PASS")
+
+
+def workflow_enabled(text: str) -> bool:
+    return re.search(r"\bif\s*:\s*false\b", text, re.I) is None
+
+
+def inside(root: Path, raw: str) -> Path | None:
+    candidate = Path(str(raw or ""))
+    if not raw or candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    target = (ROOT / candidate).resolve(strict=False)
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+def inside_base(base: Path, raw: str) -> Path | None:
+    candidate = Path(str(raw or ""))
+    if not raw or candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    target = (base / candidate).resolve(strict=False)
+    try:
+        target.relative_to(base.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+def source_pin_paths(fixture: str, provider: str) -> dict[str, Path]:
+    fixture_dir = ROOT / "tests" / "fixtures" / fixture
+    return {
+        "benchmarkRunner": ROOT / "tests" / "run-live-model-benchmark.py",
+        "candidateAdapter": ROOT / "tests" / "run-live-model-benchmark.py",
+        "oracle": ROOT / "tests" / "verify_snapshot.py",
+        "fixturePrompt": fixture_dir / "live-prompt.md",
+        "fixtureContract": fixture_dir / "expected-snapshot.json",
+        "codexAdapterTemplate": ROOT / "skills" / "adopt" / "references" / "codex-project-hooks.json",
+        "agentsTemplate": ROOT / "skills" / "adopt" / "references" / "agents-md-template.md",
+    }
+
+
+def verify_evidence(path: Path, max_age_days: int) -> None:
+    evidence_root = (ROOT / "tests" / "fixtures" / "live-model-evidence").resolve()
+    check("live evidence artifact exists", path.is_file())
+    if not path.is_file():
+        return
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        check("live evidence is valid JSON", False, str(exc))
+        return
+    check("live evidence schema is v1", report.get("schemaVersion") == 1)
+    check(
+        "live workflow evidence is not mislabeled as reviewer isolation evidence",
+        report.get("evidencePurpose") == "workflow-output-quality"
+        and report.get("independentReviewEvidence") is False,
+    )
+    check("only a real PASS can satisfy H4", status_passes(report),
+          str(report.get("status")))
+    if not status_passes(report):
+        return
+    check("candidate provider is external", report.get("provider") in {"anthropic", "openai"})
+    check("candidate command is a live headless model",
+          any(marker in str((report.get("candidate") or {}).get("commandFamily"))
+              for marker in ("claude -p", "codex exec")))
+    source_state = report.get("source") or {}
+    status_bytes = git_status_bytes()
+    current_tree = methodology_tree_sha256()
+    check("current methodology tree is content-pinned",
+          source_state.get("methodologyTreeSha256") == current_tree)
+    check("dirty-state digest is pinned",
+          source_state.get("workingTreeStatusSha256") ==
+          "sha256:" + hashlib.sha256(status_bytes).hexdigest()
+          and source_state.get("workingTreeDirty") is bool(status_bytes.strip()))
+    try:
+        observed = parse_time(str(report.get("observedAt") or ""))
+        frozen = parse_time(json.loads((ROOT / "docs" / "HARNESS_CONFORMANCE_CONTRACT.json").read_text())
+                            ["frozenAt"])
+        age = dt.datetime.now(dt.timezone.utc) - observed
+        check("live evidence is fresh", dt.timedelta(0) <= age <= dt.timedelta(days=max_age_days),
+              str(age))
+        check("live evidence postdates the frozen oracle", observed >= frozen)
+    except Exception as exc:
+        check("live evidence timestamp is valid", False, str(exc))
+
+    run_report = inside(evidence_root, str(report.get("runReport") or ""))
+    check("run report path stays inside evidence root",
+          run_report is not None and run_report.is_file())
+    if run_report and run_report.is_file():
+        try:
+            check("latest evidence exactly matches immutable run report",
+                  json.loads(run_report.read_text(encoding="utf-8")) == report)
+        except Exception as exc:
+            check("run report is valid JSON", False, str(exc))
+
+    candidate = report.get("candidate") or {}
+    check("live candidate exited zero", candidate.get("exitCode") == 0)
+    check("live transcript contains a result event",
+          type(candidate.get("liveResultEvents")) is int and candidate.get("liveResultEvents", 0) >= 1)
+    check("live result is not an error", candidate.get("isError") is False)
+    attempts = candidate.get("attempts") or []
+    blueprint_attempts = [
+        item for item in attempts if item.get("phase") != "devils-advocate"]
+    advocate_attempts = [
+        item for item in attempts if item.get("phase") == "devils-advocate"]
+    attempt_count = candidate.get("attemptCount")
+    check("live candidate attempt count stays within bounded policy",
+          attempt_count in {1, 2} and len(blueprint_attempts) == attempt_count)
+    check("live candidate recovery flag matches attempt count",
+          candidate.get("recoveryTriggered") is (attempt_count == 2))
+    # The prose reason must agree with the structured recovery flag: a
+    # devils-advocate phase entry in attempts[] is not a retry, and a reason
+    # claiming "bounded recovery" over recoveryTriggered=false misleads any
+    # consumer that reads only one of the two (S7 route finding, 2026-08-14).
+    check("live candidate reason agrees with the recovery flag",
+          ("after bounded recovery" in str(report.get("reason", "")))
+          is (candidate.get("recoveryTriggered") is True))
+    check("exactly one devils-advocate phase ran last",
+          len(advocate_attempts) == 1 and attempts
+          and attempts[-1].get("phase") == "devils-advocate")
+    check("live candidate records its writable workspace transport",
+          candidate.get("workspaceTransport")
+          in {"native-temp", "host-mounted-temp"})
+    check("live candidate used a no-escalation approval policy",
+          candidate.get("approvalPolicy") == "never-no-escalation")
+    capture_limit = candidate.get("captureLimitBytes")
+    check("live transcript has an enforced byte ceiling",
+          capture_limit == EXPECTED_TRANSCRIPT_LIMIT_BYTES
+          and type(candidate.get("transcriptBytes")) is int
+          and 0 < candidate.get("transcriptBytes", 0) <= capture_limit)
+    check("live transcript records fail-closed sanitization",
+          candidate.get("transcriptSanitized") is True
+          and type(candidate.get("transcriptRedactionCount")) is int
+          and candidate.get("transcriptRedactionCount", -1) >= 0)
+    check("all recorded live attempts exited zero",
+          bool(attempts)
+          and all(item.get("exitCode") == 0
+                  and type(item.get("liveResultEvents")) is int
+                  and item.get("liveResultEvents", 0) >= 1
+                  and item.get("isError") is False
+                  and type(item.get("captureLimitBytes")) is int
+                  and item.get("captureLimitBytes", 0) > 0
+                  and type(item.get("transcriptRedactionCount")) is int
+                  and item.get("transcriptRedactionCount", -1) >= 0
+                  for item in attempts))
+    check("final live attempt completed the required output set",
+          bool(blueprint_attempts)
+          and blueprint_attempts[-1].get("missingAfter") == [])
+    if attempt_count == 2 and len(blueprint_attempts) == 2:
+        check("recovery continued exactly the first attempt's missing outputs",
+              bool(blueprint_attempts[0].get("missingAfter"))
+              and blueprint_attempts[1].get("missingBefore")
+              == blueprint_attempts[0].get("missingAfter"))
+    transcript = inside(evidence_root, str(candidate.get("transcriptArtifact") or ""))
+    check("compressed sanitized transcript is retained",
+          transcript is not None and transcript.is_file())
+    if transcript and transcript.is_file():
+        check("compressed transcript hash is pinned",
+              sha256_file(transcript) == candidate.get("transcriptGzipSha256"))
+        try:
+            raw = bounded_gzip_read(
+                transcript, EXPECTED_TRANSCRIPT_LIMIT_BYTES)
+            check("sanitized transcript hash is pinned",
+                  "sha256:" + hashlib.sha256(raw).hexdigest() == candidate.get("transcriptSha256"))
+            check("retained transcript length is pinned",
+                  len(raw) == candidate.get("transcriptBytes"))
+            provider = str(report.get("provider") or "")
+            rows = transcript_result_events(raw, provider)
+            check("retained transcript proves successful live result",
+                  bool(rows) and (provider != "anthropic"
+                                  or rows[-1].get("is_error") is not True))
+            cursor = 0
+            segments_valid = bool(attempts)
+            for index, attempt in enumerate(attempts, start=1):
+                length = attempt.get("transcriptBytes")
+                if type(length) is not int or length <= 0 or cursor + length > len(raw):
+                    check(f"attempt {index} transcript boundary is valid", False)
+                    segments_valid = False
+                    break
+                segment = raw[cursor:cursor + length]
+                cursor += length
+                segment_rows = transcript_result_events(segment, provider)
+                check(f"attempt {index} transcript segment hash is pinned",
+                      "sha256:" + hashlib.sha256(segment).hexdigest()
+                      == attempt.get("transcriptSha256"))
+                check(f"attempt {index} transcript proves successful terminal event",
+                      len(segment_rows) == attempt.get("liveResultEvents")
+                      and bool(segment_rows)
+                      and (provider != "anthropic"
+                           or segment_rows[-1].get("is_error") is not True))
+            check("attempt transcript segments exactly cover retained transcript",
+                  segments_valid and cursor == len(raw))
+            transcript_text = raw.decode("utf-8", errors="replace")
+            check("retained transcript proves actual ITD skill and reference loading",
+                  "skills/blueprint/SKILL.md" in transcript_text
+                  and "skills/blueprint/references/document-templates.md" in transcript_text
+                  and "--dangerously-bypass-hook-trust" not in transcript_text)
+        except Exception as exc:
+            check("retained transcript is readable", False, str(exc))
+
+    check("verdict is independent of candidate self-report",
+          independent_verdict_passes(report))
+    verdict = report.get("independentVerdict") or {}
+    check("independent snapshot oracle passed",
+          verdict.get("oracle") == "tests/verify_snapshot.py"
+          and verdict.get("exitCode") == 0 and verdict.get("status") == "PASS")
+
+    invocation = report.get("harnessInvocation") or {}
+    check("live run used the repository-local adopted ITD harness",
+          invocation.get("mode") == "repository-local-adopted-project"
+          and invocation.get("skill") == "$idea-to-deploy:blueprint"
+          and invocation.get("skillPath") == ".itd-plugin/skills/blueprint/SKILL.md"
+          and invocation.get("referencePath") ==
+          ".itd-plugin/skills/blueprint/references/document-templates.md"
+          and invocation.get("projectGuidance") == "AGENTS.md"
+          and invocation.get("projectContracts") == ".itd/"
+          and invocation.get("transcriptProvesSkillLoad") is True
+          and invocation.get("hookExecution") ==
+          "disabled-for-live-model-evidence"
+          and invocation.get("methodologyTreeSha256") == current_tree)
+
+    artifacts = report.get("artifacts") or {}
+    output_dir = inside(evidence_root, str(artifacts.get("outputDir") or ""))
+    hashes = artifacts.get("sha256") or {}
+    required = artifacts.get("requiredFiles") or []
+    advocate = report.get("devilsAdvocate") or {}
+    advocate_artifact = str(advocate.get("artifact") or "")
+    check("archived output is bounded and replayable",
+          output_dir is not None and output_dir.is_dir()
+          and isinstance(required, list) and bool(required)
+          and isinstance(hashes, dict)
+          and set(hashes) == set(required) | {advocate_artifact})
+    if output_dir and output_dir.is_dir() and isinstance(hashes, dict):
+        for rel, expected in hashes.items():
+            target = inside_base(output_dir, str(rel))
+            check(f"archived artifact hash matches: {rel}",
+                  target is not None and target.is_file() and sha256_file(target) == expected)
+        fixture_dir = ROOT / "tests" / "fixtures" / str(report.get("fixture") or "")
+        oracle = subprocess.run(
+            [sys.executable, str(ROOT / "tests" / "verify_snapshot.py"),
+             str(fixture_dir), "--output", str(output_dir)],
+            cwd=ROOT, capture_output=True, text=True, timeout=180)
+        check("independent verdict replays from archived artifacts",
+              oracle.returncode == 0, oracle.stdout + oracle.stderr)
+
+    # S3: the adversarial review must be the REAL devils-advocate agent
+    # definition executed in a harness-orchestrated fresh session — never an
+    # inline self-critique substituted inside the blueprint session.
+    agent_source = ROOT / str(advocate.get("agentPath") or "")
+    expected_isolation = {
+        "anthropic": "claude -p --no-session-persistence",
+        "openai": "codex exec --ephemeral",
+    }.get(str(report.get("provider") or ""))
+    check("devils-advocate ran as a harness-orchestrated fresh session",
+          advocate.get("mode") == "harness-orchestrated-fresh-session"
+          and advocate.get("agentPath") == "agents/devils-advocate.md"
+          and advocate_artifact == "DEVILS_ADVOCATE_REVIEW.md"
+          and advocate_artifact not in set(required)
+          and advocate.get("inlineSelfCritiqueSubstitution") is False
+          and expected_isolation is not None
+          and advocate.get("sessionIsolation") == expected_isolation)
+    check("devils-advocate phase completed successfully",
+          advocate.get("exitCode") == 0
+          and advocate.get("isError") is False
+          and type(advocate.get("liveResultEvents")) is int
+          and advocate.get("liveResultEvents", 0) >= 1
+          and advocate.get("phase1ArtifactsUnchanged") is True
+          and len(advocate_attempts) == 1
+          and advocate_attempts[0].get("exitCode") == 0
+          and advocate_attempts[0].get("isError") is False
+          and advocate_attempts[0].get("liveResultEvents")
+          == advocate.get("liveResultEvents"))
+    check("devils-advocate agent definition is pinned to the current tree",
+          agent_source.is_file()
+          and advocate.get("agentSha256") == sha256_file(agent_source))
+    advocate_file = (
+        inside_base(output_dir, advocate_artifact)
+        if output_dir and advocate_artifact else None)
+    advocate_text = (
+        advocate_file.read_text(encoding="utf-8", errors="replace")
+        if advocate_file is not None and advocate_file.is_file() else "")
+    check("devils-advocate review artifact is retained and hash-pinned",
+          advocate_file is not None and advocate_file.is_file()
+          and sha256_file(advocate_file) == advocate.get("artifactSha256")
+          and advocate.get("artifactSha256") == hashes.get(advocate_artifact)
+          and len(advocate_text.encode("utf-8"))
+          == advocate.get("artifactBytes"))
+    check("devils-advocate review is substantive",
+          len(advocate_text.encode("utf-8")) >= 400
+          and bool(re.search(r"^####\s+Challenge\s+\d+:", advocate_text,
+                             re.MULTILINE))
+          and "**Weakness:**" in advocate_text
+          and "**Risk level:**" in advocate_text
+          and "**Alternative:**" in advocate_text
+          and "**Trade-off:**" in advocate_text)
+
+    pins = report.get("sourcePins") or {}
+    expected_paths = source_pin_paths(str(report.get("fixture") or ""),
+                                      str(report.get("provider") or ""))
+    check("all benchmark/oracle/methodology inputs are source-pinned",
+          set(pins) == set(expected_paths) | {"methodologyTree"})
+    for name, source in expected_paths.items():
+        check(f"source pin matches: {name}", source.is_file() and pins.get(name) == sha256_file(source))
+    check("source pin matches: methodologyTree", pins.get("methodologyTree") == current_tree)
+
+    # Anti-false-green mutations exercise the same predicates and retained
+    # bytes used above. None may be accepted as equivalent evidence.
+    mutated = copy.deepcopy(report)
+    mutated["status"] = "UNVERIFIED"
+    check("mutation: UNVERIFIED cannot satisfy H4", not status_passes(mutated))
+    mutated = copy.deepcopy(report)
+    mutated["independentVerdict"]["candidateSelfReportAccepted"] = True
+    check("mutation: candidate self-verdict is rejected",
+          not independent_verdict_passes(mutated))
+    mutated = copy.deepcopy(report)
+    mutated["harnessInvocation"]["transcriptProvesSkillLoad"] = False
+    check("mutation: generic-model run cannot claim harness invocation",
+          mutated["harnessInvocation"].get("transcriptProvesSkillLoad") is not True)
+    mutated = copy.deepcopy(report)
+    mutated["sourcePins"]["methodologyTree"] = "sha256:" + "0" * 64
+    check("mutation: methodology-tree pin tampering is rejected",
+          mutated["sourcePins"].get("methodologyTree") != current_tree)
+    try:
+        stale = parse_time(str(report["observedAt"])) - dt.timedelta(days=max_age_days + 1)
+        age = dt.datetime.now(dt.timezone.utc) - stale
+        check("mutation: stale external evidence is rejected",
+              age > dt.timedelta(days=max_age_days))
+    except Exception:
+        check("mutation: stale external evidence is rejected", False)
+    if transcript and transcript.is_file():
+        mutated_hash = "sha256:" + "0" * 64
+        check("mutation: transcript hash tampering is rejected",
+              sha256_file(transcript) != mutated_hash)
+    if output_dir and output_dir.is_dir() and isinstance(hashes, dict) and hashes:
+        rel = next(iter(hashes))
+        target = inside_base(output_dir, str(rel))
+        check("mutation: output hash tampering is rejected",
+              target is not None and target.is_file()
+              and sha256_file(target) != "sha256:" + "0" * 64)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--require-evidence", action="store_true")
+    parser.add_argument("--max-age-days", type=int, default=30)
+    parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE)
+    args = parser.parse_args()
+    workflow = (ROOT / ".github" / "workflows" / "fixture-smoke.yml").read_text(encoding="utf-8")
+    check("live workflow has no permanent-disable guard",
+          workflow_enabled(workflow))
+    check("mutation: permanent-disable guard is rejected",
+          not workflow_enabled(workflow + "\nif: false\n"))
+    check("live workflow is regular and manually runnable",
+          "schedule:" in workflow and "workflow_dispatch:" in workflow)
+    check("live workflow invokes canonical benchmark runner",
+          "tests/run-live-model-benchmark.py" in workflow)
+    check("workflow uploads evidence even on failure",
+          "if: always()" in workflow and "live-model-evidence" in workflow)
+    runner = (ROOT / "tests" / "run-live-model-benchmark.py").read_text(encoding="utf-8")
+    runner_module = load_live_runner()
+    max_attempts = getattr(runner_module, "MAX_CANDIDATE_ATTEMPTS", None)
+    check("live candidate recovery is bounded to exactly two attempts",
+          max_attempts == 2)
+    check("mutation: one-shot candidate policy is rejected",
+          max_attempts == 2 and max_attempts != 1)
+    max_transcript = getattr(runner_module, "MAX_TRANSCRIPT_BYTES", None)
+    bounded_subprocess = getattr(runner_module, "bounded_subprocess", None)
+    sanitize_capture = getattr(runner_module, "sanitize_capture_text", None)
+    capture_limit_exit = getattr(
+        runner_module, "CAPTURE_LIMIT_EXIT_CODE", None)
+    check("live subprocess capture has a fixed byte ceiling",
+          max_transcript == EXPECTED_TRANSCRIPT_LIMIT_BYTES)
+    bounded_capture_ok = False
+    if callable(bounded_subprocess):
+        with tempfile.TemporaryDirectory(prefix="itd-live-capture-") as capture_tmp:
+            completed = bounded_subprocess(
+                [sys.executable, "-c",
+                 "import sys; sys.stdout.write('X' * 4096)"],
+                cwd=Path(capture_tmp), timeout_seconds=10,
+                capture_limit_bytes=512)
+            bounded_capture_ok = (
+                completed.returncode == capture_limit_exit
+                and (
+                    len(completed.stdout.encode("utf-8"))
+                    + len(completed.stderr.encode("utf-8"))
+                ) <= 512
+                and "capture limit" in completed.stderr.lower()
+            )
+    check("provider output overflow is killed before unbounded accumulation",
+          bounded_capture_ok)
+    sanitized_expansion_ok = False
+    if callable(bounded_subprocess):
+        with tempfile.TemporaryDirectory(
+                prefix="itd-live-sanitized-capture-") as capture_tmp:
+            completed = bounded_subprocess(
+                [sys.executable, "-c",
+                 "import sys; sys.stdout.write('a@b.co ' * 60)"],
+                cwd=Path(capture_tmp), timeout_seconds=10,
+                capture_limit_bytes=512)
+            retained = (
+                completed.stdout.encode("utf-8")
+                + completed.stderr.encode("utf-8")
+            )
+            sanitized_expansion_ok = (
+                completed.returncode == capture_limit_exit
+                and len(retained) <= 512
+                and "a@b.co" not in completed.stdout
+                and "capture limit" in completed.stderr.lower()
+                and getattr(completed, "itd_redaction_count", 0) == 60
+            )
+    check("sanitization expansion fails closed inside the aggregate byte ceiling",
+          sanitized_expansion_ok)
+    sanitization_ok = False
+    if callable(sanitize_capture):
+        fake_email = "alice" + "@example.test"
+        fake_key = "sk-" + "A" * 24
+        sanitized, redactions = sanitize_capture(
+            f"contact={fake_email}\napi_key={fake_key}\n")
+        sanitization_ok = (
+            fake_email not in sanitized and fake_key not in sanitized
+            and "[REDACTED" in sanitized and redactions >= 2
+        )
+    check("durable transcript text redacts secret and PII patterns",
+          sanitization_ok)
+    missing_outputs = getattr(runner_module, "missing_required_outputs", None)
+    recovery_decision = getattr(runner_module, "recovery_decision", None)
+    bounded_budget = getattr(runner_module, "bounded_attempt_budget", None)
+    workspace_parent_for = getattr(
+        runner_module, "workspace_temp_parent", None)
+    candidate_path_for = getattr(
+        runner_module, "candidate_workspace_path", None)
+    with tempfile.TemporaryDirectory(prefix="itd-live-verifier-") as tmp:
+        project = Path(tmp)
+        required_for_recovery = [
+            "STRATEGIC_PLAN.md", "PRD.md", "IMPLEMENTATION_PLAN.md",
+        ]
+        (project / "STRATEGIC_PLAN.md").write_text("existing\n", encoding="utf-8")
+        detected = (
+            missing_outputs(project, required_for_recovery)
+            if callable(missing_outputs) else None
+        )
+        check("bounded recovery detects only missing outputs",
+              detected == ["PRD.md", "IMPLEMENTATION_PLAN.md"])
+        first_decision = (
+            recovery_decision(project, required_for_recovery, 1)
+            if callable(recovery_decision) else (None, None)
+        )
+        first_missing, first_prompt = first_decision
+        check("partial first result schedules same-project continuation",
+              first_missing == ["PRD.md", "IMPLEMENTATION_PLAN.md"]
+              and isinstance(first_prompt, str)
+              and "same already-started repository" in first_prompt
+              and "`PRD.md`" in first_prompt
+              and "`IMPLEMENTATION_PLAN.md`" in first_prompt
+              and "`STRATEGIC_PLAN.md`" not in first_prompt)
+        second_decision = (
+            recovery_decision(project, required_for_recovery, 2)
+            if callable(recovery_decision) else (None, "unexpected")
+        )
+        check("bounded recovery cannot schedule a third attempt",
+              second_decision == (["PRD.md", "IMPLEMENTATION_PLAN.md"], None))
+    try:
+        per_attempt = (
+            Decimal(bounded_budget("5.00", 2))
+            if callable(bounded_budget) else Decimal("NaN")
+        )
+        budget_is_bounded = per_attempt > 0 and per_attempt * 2 <= Decimal("5.00")
+    except Exception:
+        budget_is_bounded = False
+    check("Anthropic budget is bounded across candidate attempts",
+          budget_is_bounded)
+    workspace_transport_ok = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="itd-live-host-temp-") as host_tmp:
+            host_root = Path(host_tmp).resolve()
+            windows_parent = (
+                workspace_parent_for(
+                    "openai", "/mnt/c/tools/codex.exe",
+                    configured_root=str(host_root))
+                if callable(workspace_parent_for) else None
+            )
+            native_parent = (
+                workspace_parent_for(
+                    "openai", "/usr/bin/codex", configured_root="")
+                if callable(workspace_parent_for) else host_root
+            )
+            workspace_transport_ok = (
+                windows_parent == host_root and native_parent is None
+            )
+    except Exception:
+        workspace_transport_ok = False
+    check("Windows Codex bridge uses a host-writable temp root",
+          workspace_transport_ok)
+    candidate_path_ok = False
+    try:
+        candidate_path_ok = (
+            callable(candidate_path_for)
+            and candidate_path_for(
+                "openai", "/mnt/c/tools/codex.exe",
+                Path("/mnt/c/tmp/itd-live-model-123/project"))
+            == "C:\\tmp\\itd-live-model-123\\project"
+            and candidate_path_for(
+                "openai", "/usr/bin/codex",
+                Path("/tmp/itd-live-model-123/project"))
+            == "/tmp/itd-live-model-123/project"
+        )
+    except Exception:
+        candidate_path_ok = False
+    check("Windows Codex bridge receives a native Windows -C path",
+          candidate_path_ok)
+    check("runner creates the adopted project under the selected host temp root",
+          "dir=workspace_parent" in runner)
+    check("candidate command uses the translated workspace path",
+          '"-C", candidate_project' in runner)
+    check("headless Codex uses explicit no-escalation workspace-write policy",
+          'executable, "--ask-for-approval", "never",' in runner
+          and '"--sandbox", "workspace-write", "exec",' in runner
+          and '"--disable", "hooks",' in runner
+          and "--dangerously-bypass-hook-trust" not in runner)
+    check("candidate attempts share one total timeout deadline",
+          "deadline = time.monotonic() + args.timeout_seconds" in runner
+          and "remaining_seconds = deadline - time.monotonic()" in runner)
+    check("runner executes the explicit bounded recovery loop",
+          "for attempt_number in range(1, MAX_CANDIDATE_ATTEMPTS + 1)" in runner)
+    run_candidate_region = runner[
+        runner.index("def run_candidate("):
+        runner.index("\ndef fail(")
+    ]
+    bounded_capture_wired = (
+        "bounded_subprocess(" in run_candidate_region
+        and "capture_output=True" not in run_candidate_region
+        and "capture_limit_bytes=capture_limit_bytes" in run_candidate_region
+    )
+    check("live candidate uses the bounded sanitized capture primitive",
+          bounded_capture_wired)
+    bounded_subprocess_region = runner[
+        runner.index("def bounded_subprocess("):
+        runner.index("\ndef atomic_json(")
+    ]
+    post_sanitize_bound = (
+        "sanitized_total_bytes > capture_limit_bytes"
+        in bounded_subprocess_region
+        and "sanitized provider output" in bounded_subprocess_region
+    )
+    mutated_post_sanitize_bound = bounded_subprocess_region.replace(
+        "sanitized_total_bytes > capture_limit_bytes", "False", 1)
+    check("mutation: removed post-sanitization aggregate bound is rejected",
+          sanitized_expansion_ok and post_sanitize_bound
+          and "sanitized_total_bytes > capture_limit_bytes"
+          not in mutated_post_sanitize_bound)
+    mutated_capture_region = run_candidate_region.replace(
+        "bounded_subprocess(", "subprocess.run(")
+    check("mutation: direct unbounded candidate capture is rejected",
+          bounded_capture_wired
+          and "bounded_subprocess(" not in mutated_capture_region)
+    candidate_region = runner[
+        runner.index("        def archive_current("):
+        runner.index("        transcript_hash = sha256_bytes(transcript_raw)")
+    ]
+    candidate_failures_archive = (
+        "def archive_failed_run(" in runner
+        and '"failureArtifacts": {' in runner
+        and "transcript.jsonl.gz" in runner
+        and candidate_region.count("return archive_current(") >= 7
+        and "return fail(" not in candidate_region
+    )
+    check("all real candidate failures retain bounded diagnostic evidence",
+          candidate_failures_archive)
+    mutated_candidate_region = candidate_region.replace(
+        "return archive_current(", "return fail(", 1)
+    check("mutation: minimal real-candidate FAIL bypass is rejected",
+          candidate_failures_archive
+          and "return fail(" in mutated_candidate_region)
+    fixture_dir = ROOT / "tests" / "fixtures" / "fixture-03-cli-tool"
+    diagnostic_ok = False
+    try:
+        evidence_parent = ROOT / "tests" / "fixtures" / "live-model-evidence"
+        with tempfile.TemporaryDirectory(
+                dir=evidence_parent, prefix=".diagnostic-selftest-") as evidence_tmp:
+            with tempfile.TemporaryDirectory(prefix="itd-live-failure-output-") as output_tmp:
+                output = Path(output_tmp)
+                (output / "PRD.md").write_text("partial\n", encoding="utf-8")
+                raw = b'{"type":"turn.completed"}\n'
+                attempt = {
+                    "attempt": 1,
+                    "exitCode": 0,
+                    "missingBefore": ["PRD.md", "IMPLEMENTATION_PLAN.md"],
+                    "missingAfter": ["IMPLEMENTATION_PLAN.md"],
+                    "liveResultEvents": 1,
+                    "isError": False,
+                    "transcriptBytes": len(raw),
+                    "transcriptSha256": runner_module.sha256_bytes(raw),
+                }
+                diagnostic_args = argparse.Namespace(
+                    evidence=Path(evidence_tmp) / "latest.json",
+                    resolved_provider="openai",
+                    provider="openai",
+                    fixture="fixture-03-cli-tool",
+                    model="",
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = runner_module.archive_failed_run(
+                        diagnostic_args, fixture_dir, output,
+                        ["PRD.md", "IMPLEMENTATION_PLAN.md"], raw, [attempt],
+                        "codex exec test", "synthetic bounded failure")
+                diagnostic = json.loads(
+                    diagnostic_args.evidence.read_text(encoding="utf-8"))
+                transcript_artifact = ROOT / diagnostic["candidate"]["transcriptArtifact"]
+                diagnostic_ok = (
+                    code == 1
+                    and diagnostic.get("status") == "FAIL"
+                    and diagnostic["failureArtifacts"]["presentFiles"] == ["PRD.md"]
+                    and diagnostic["failureArtifacts"]["missingRequiredFiles"]
+                    == ["IMPLEMENTATION_PLAN.md"]
+                    and transcript_artifact.is_file()
+                    and gzip.decompress(transcript_artifact.read_bytes()) == raw
+                    and diagnostic["candidate"]["captureLimitBytes"]
+                    == EXPECTED_TRANSCRIPT_LIMIT_BYTES
+                    and diagnostic["candidate"]["transcriptSanitized"] is True
+                )
+    except Exception:
+        diagnostic_ok = False
+    check("synthetic candidate failure is archived and replayable",
+          diagnostic_ok)
+    reverify_region = runner[
+        runner.index("def reverify_failed_run("):
+        runner.index("\ndef run(")
+    ]
+    reverify_is_oracle_only = (
+        "resolve(strict=True)" in reverify_region
+        and "relative_to(runs_root)" in reverify_region
+        and "failed output set is incomplete or changed" in reverify_region
+        and "failed transcript binding is invalid" in reverify_region
+        and "verify_snapshot.py" in reverify_region
+        and "run_candidate(" not in reverify_region
+        and "source_pins(" in reverify_region
+    )
+    check("oracle correction can reverify immutable archived output without a model rerun",
+          reverify_is_oracle_only)
+    mutated_reverify = reverify_region.replace(
+        "relative_to(runs_root)", "relative_to(ROOT)", 1
+    )
+    check("mutation: reverify source escape is rejected",
+          reverify_is_oracle_only
+          and "relative_to(runs_root)" not in mutated_reverify)
+    live_prompt = (fixture_dir / "live-prompt.md").read_text(encoding="utf-8")
+    snapshot = json.loads((fixture_dir / "expected-snapshot.json").read_text(encoding="utf-8"))
+    required_outputs = ((snapshot.get("files") or {}).get("required") or [])
+    prompt_names_all_outputs = (
+        bool(required_outputs)
+        and all(f"`{name}`" in live_prompt for name in required_outputs)
+    )
+    check("live prompt explicitly names every oracle-required output",
+          prompt_names_all_outputs)
+    prd_story_heading_directive = (
+        "- In `PRD.md`, place the user stories under the exact second-level heading\n"
+        "  `## User Stories` so the documented contract is explicit and replayable."
+    )
+    prompt_names_prd_story_heading = prd_story_heading_directive in live_prompt
+    check("live prompt explicitly names the oracle-required PRD story heading",
+          prompt_names_prd_story_heading)
+    architecture_cli_heading_directive = (
+        "- In `PROJECT_ARCHITECTURE.md`, place the commands, options, inputs, outputs,\n"
+        "  and exit-code contract under the exact second-level heading\n"
+        "  `## CLI Interface`."
+    )
+    prompt_names_architecture_cli_heading = (
+        architecture_cli_heading_directive in live_prompt
+    )
+    check("live prompt explicitly names the oracle-required CLI interface heading",
+          prompt_names_architecture_cli_heading)
+    codex_write_directive = getattr(
+        runner_module, "CODEX_WRITE_BOUNDARY_DIRECTIVE", "")
+    prompt_names_codex_write_boundary = codex_write_directive in live_prompt
+    check("live prompt names the Codex-native write boundary",
+          prompt_names_codex_write_boundary)
+    mutated_prompt = (
+        live_prompt.replace(f"`{required_outputs[0]}`", "", 1)
+        if required_outputs else live_prompt
+    )
+    check("mutation: omitted prompt output fails closed",
+          bool(required_outputs)
+          and not all(f"`{name}`" in mutated_prompt for name in required_outputs))
+    mutated_story_prompt = live_prompt.replace(prd_story_heading_directive, "", 1)
+    check("mutation: omitted PRD story heading fails closed",
+          prompt_names_prd_story_heading
+          and prd_story_heading_directive not in mutated_story_prompt)
+    mutated_architecture_prompt = live_prompt.replace(
+        architecture_cli_heading_directive, "", 1)
+    check("mutation: omitted CLI interface heading fails closed",
+          prompt_names_architecture_cli_heading
+          and architecture_cli_heading_directive not in mutated_architecture_prompt)
+    mutated_write_prompt = live_prompt.replace(codex_write_directive, "", 1)
+    mutation_guarded = False
+    with tempfile.TemporaryDirectory(prefix="itd-live-prompt-mutant-") as raw:
+        mutant_fixture = Path(raw)
+        (mutant_fixture / "live-prompt.md").write_text(
+            mutated_write_prompt, encoding="utf-8")
+        try:
+            runner_module.fixture_prompt(mutant_fixture)
+        except ValueError as exc:
+            mutation_guarded = "Codex-native write boundary" in str(exc)
+    check("mutation: omitted Codex write boundary fails closed",
+          prompt_names_codex_write_boundary
+          and mutation_guarded)
+    claude_inline_directive = getattr(
+        runner_module, "CLAUDE_INLINE_WORKFLOW_DIRECTIVE", "")
+    prompt_names_claude_inline_boundary = (
+        claude_inline_directive in live_prompt)
+    check("live prompt names the Claude inline-workflow boundary",
+          prompt_names_claude_inline_boundary)
+    mutated_claude_prompt = live_prompt.replace(
+        claude_inline_directive, "", 1)
+    claude_mutation_guarded = False
+    with tempfile.TemporaryDirectory(prefix="itd-live-claude-mutant-") as raw:
+        mutant_fixture = Path(raw)
+        (mutant_fixture / "live-prompt.md").write_text(
+            mutated_claude_prompt, encoding="utf-8")
+        try:
+            runner_module.fixture_prompt(mutant_fixture)
+        except ValueError as exc:
+            claude_mutation_guarded = (
+                "Claude inline-workflow boundary" in str(exc))
+    check("mutation: omitted Claude inline-workflow boundary fails closed",
+          prompt_names_claude_inline_boundary
+          and claude_mutation_guarded)
+    guide_literal_directive = getattr(
+        runner_module, "GUIDE_CARDINALITY_LITERAL_DIRECTIVE", "")
+    prompt_names_guide_literal = guide_literal_directive in live_prompt
+    check("live prompt pins the guide cardinality literal",
+          prompt_names_guide_literal)
+    mutated_guide_prompt = live_prompt.replace(
+        guide_literal_directive, "", 1)
+    guide_mutation_guarded = False
+    with tempfile.TemporaryDirectory(prefix="itd-live-guide-mutant-") as raw:
+        mutant_fixture = Path(raw)
+        (mutant_fixture / "live-prompt.md").write_text(
+            mutated_guide_prompt, encoding="utf-8")
+        try:
+            runner_module.fixture_prompt(mutant_fixture)
+        except ValueError as exc:
+            guide_mutation_guarded = (
+                "guide cardinality literal boundary" in str(exc))
+    check("mutation: omitted guide cardinality literal fails closed",
+          prompt_names_guide_literal and guide_mutation_guarded)
+    prd_story_format_directive = getattr(
+        runner_module, "PRD_USER_STORY_FORMAT_DIRECTIVE", "")
+    prompt_names_story_format = prd_story_format_directive in live_prompt
+    check("live prompt pins the PRD user-story line format",
+          prompt_names_story_format)
+    mutated_story_format_prompt = live_prompt.replace(
+        prd_story_format_directive, "", 1)
+    story_format_guarded = False
+    with tempfile.TemporaryDirectory(prefix="itd-live-story-mutant-") as raw:
+        mutant_fixture = Path(raw)
+        (mutant_fixture / "live-prompt.md").write_text(
+            mutated_story_format_prompt, encoding="utf-8")
+        try:
+            runner_module.fixture_prompt(mutant_fixture)
+        except ValueError as exc:
+            story_format_guarded = (
+                "PRD user-story format boundary" in str(exc))
+    check("mutation: omitted PRD user-story format fails closed",
+          prompt_names_story_format and story_format_guarded)
+    anthropic_args = argparse.Namespace(
+        resolved_provider="anthropic", model="sonnet")
+    anthropic_prompt = "line one\nline two with product context"
+    with tempfile.TemporaryDirectory(prefix="itd-live-stdin-") as raw:
+        transport_root = Path(raw)
+        with mock.patch.object(
+                runner_module, "bounded_subprocess") as bounded:
+            bounded.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="")
+            _, anthropic_family = runner_module.run_candidate(
+                anthropic_args, "claude", transport_root, transport_root,
+                anthropic_prompt, timeout_seconds=30,
+                attempt_budget="2.50", candidate_project=str(transport_root),
+                capture_limit_bytes=4096)
+    anthropic_command = bounded.call_args.args[0]
+    anthropic_kwargs = bounded.call_args.kwargs
+    check("Claude live prompt travels through stdin",
+          anthropic_kwargs.get("input_text") == anthropic_prompt
+          and anthropic_prompt not in anthropic_command
+          and anthropic_family
+          == "claude -p --stdin --repository-local-itd"
+          and "--plugin-dir" not in anthropic_command)
+    setting_index = (
+        anthropic_command.index("--setting-sources")
+        if "--setting-sources" in anthropic_command else -1)
+    check("Claude live transport excludes ambient user settings and MCP",
+          setting_index >= 0
+          and anthropic_command[setting_index + 1] == "project"
+          and "--strict-mcp-config" in anthropic_command
+          and "user" not in anthropic_command)
+    mutated_anthropic_command = [*anthropic_command, anthropic_prompt]
+    check("mutation: Claude positional prompt is rejected by the transport contract",
+          anthropic_prompt in mutated_anthropic_command
+          and anthropic_prompt not in anthropic_command)
+    with mock.patch.object(runner_module.subprocess, "run") as oracle_run:
+        oracle_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="")
+        runner_module.run_snapshot_oracle(
+            Path("fixture-root"), Path("output-root"))
+    oracle_kwargs = oracle_run.call_args.kwargs
+    check("snapshot oracle diagnostics are forced to UTF-8",
+          oracle_kwargs.get("encoding") == "utf-8"
+          and oracle_kwargs.get("errors") == "replace"
+          and (oracle_kwargs.get("env") or {}).get("PYTHONUTF8") == "1")
+    mutated_oracle_env = dict(oracle_kwargs.get("env") or {})
+    mutated_oracle_env.pop("PYTHONUTF8", None)
+    check("mutation: missing snapshot-oracle UTF-8 pin is detected",
+          mutated_oracle_env.get("PYTHONUTF8") != "1"
+          and (oracle_kwargs.get("env") or {}).get("PYTHONUTF8") == "1")
+    opaque_token = "".join((
+        "Ab3dE5fG", "h7Jk9LmN", "pQrStUvW", "xYz01234",
+        "56789_-A", "BcDefGhI", "jKlMnOp9",
+    ))
+    sanitized_entropy, entropy_redactions = (
+        runner_module.redact_high_entropy_capture(
+            f'before "{opaque_token}" after'))
+    benign_hex = "0123456789abcdef" * 4
+    preserved_hex, hex_redactions = runner_module.redact_high_entropy_capture(
+        benign_hex)
+    base64_token = "".join((
+        "Ab3dE5fG", "+h7Jk9/L", "mNpQrStU", "vWxYz012",
+        "3456789=", "ABcDefGh", "IjKlMnOp",
+    ))
+    dotted_token = "".join((
+        "Ab3dE5fG", ".h7Jk9Lm", ".NpQrStU", ".vWxYz01",
+        "23456789", ".ABcDefG", "hIjKlMn9",
+    ))
+    sanitized_base64, base64_redactions = (
+        runner_module.redact_high_entropy_capture(base64_token))
+    sanitized_dotted, dotted_redactions = (
+        runner_module.redact_high_entropy_capture(dotted_token))
+    check("opaque high-entropy capture tokens are redacted",
+          entropy_redactions == 1
+          and opaque_token not in sanitized_entropy
+          and "[REDACTED-HIGH-ENTROPY]" in sanitized_entropy)
+    check("mutation: lowercase digest is not over-redacted",
+          hex_redactions == 0 and preserved_hex == benign_hex)
+    check("base64-punctuation high-entropy token is redacted",
+          base64_redactions == 1 and base64_token not in sanitized_base64)
+    check("dotted high-entropy token is redacted",
+          dotted_redactions == 1 and dotted_token not in sanitized_dotted)
+    with tempfile.TemporaryDirectory(prefix="itd-live-workspace-") as raw:
+        workspace = Path(raw)
+        trace_dir = workspace / ".claude" / "traces"
+        trace_dir.mkdir(parents=True)
+        trace = (
+            trace_dir
+            / "session-26456a05-e576-42e4-a943-cfe93ad4671b.jsonl")
+        trace.write_text("host trace\n", encoding="utf-8")
+        foreign_trace = trace_dir / "candidate.jsonl"
+        foreign_trace.write_text("candidate data\n", encoding="utf-8")
+        product = workspace / "PRODUCT.md"
+        product.write_text("product\n", encoding="utf-8")
+        snapshot_with_trace = runner_module.workspace_snapshot(workspace)
+    check("complete advocate snapshot includes Claude trace-like paths",
+          ".claude/traces/session-26456a05-e576-42e4-a943-cfe93ad4671b.jsonl"
+          in snapshot_with_trace
+          and ".claude/traces/candidate.jsonl" in snapshot_with_trace
+          and "PRODUCT.md" in snapshot_with_trace)
+    mutated_snapshot = dict(snapshot_with_trace)
+    mutated_snapshot.pop(
+        ".claude/traces/session-26456a05-e576-42e4-a943-cfe93ad4671b.jsonl")
+    check("mutation: omitted Claude trace-like path changes workspace state",
+          mutated_snapshot != snapshot_with_trace)
+    check("missing external auth is explicit UNVERIFIED, never PASS",
+          'status = "UNVERIFIED" if code == 3 else "FAIL"' in runner
+          and "code=3" in runner and "resolve_provider(args)" in runner)
+    check("candidate output is judged by snapshot oracle", "verify_snapshot.py" in runner)
+    synthetic_status = (
+        b" M hooks/completion-gate.sh\n"
+        b"?? tests/fixtures/live-model-evidence/runs/generated/report.json\n"
+        b"R  hooks/completion-gate.sh -> "
+        b"tests/fixtures/live-model-evidence/completion-gate.sh\n"
+        b" M tests/unit/tests/fixtures/live-model-evidence/parser.py\n")
+    expected_stable_status = (
+        b" M hooks/completion-gate.sh\n"
+        b"R  hooks/completion-gate.sh -> "
+        b"tests/fixtures/live-model-evidence/completion-gate.sh\n"
+        b" M tests/unit/tests/fixtures/live-model-evidence/parser.py\n")
+    check("generated live evidence cannot invalidate its own dirty-state pin",
+          stable_git_status(synthetic_status)
+          == expected_stable_status)
+    # ------------------------------------------------------------------
+    # LPD-003-2: пин сужен до измеренного влияния — сужение доказано.
+    # ------------------------------------------------------------------
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "itd_benchmark_pin", ROOT / "tests" / "itd_benchmark_pin.py")
+    pin = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(pin)
+
+    check("pin set is defined once and importable by both consumers",
+          load_live_runner().methodology_tree_sha256()
+          == methodology_tree_sha256())
+    roots = list(pin.BENCHMARK_PIN_ROOTS)
+    check("every pin root exists in the repository",
+          all((ROOT / raw).exists() for raw in roots),
+          str([raw for raw in roots if not (ROOT / raw).exists()]))
+    check("pin roots carry no duplicates",
+          len(roots) == len(set(roots)))
+    check("every pin root is justified by a recorded reason",
+          set(roots) == {r for rs in pin.BENCHMARK_PIN_REASONS.values() for r in rs})
+    # Находка r3: пин не имеет права нести необоснованные лишние корни.
+    # static-половина сверяется с декларацией раннера У МЕСТА создания
+    # поверхности (независимый вывод, а не самоссылка на карту причин);
+    # каждый dynamic-корень обязан покрывать хотя бы один измеренный путь.
+    independent_files, independent_hash = independent_pin_recomputation()
+    _pin_module = load_pin_module()
+    check("independent recomputation agrees on the pinned file list",
+          independent_files == [p.relative_to(ROOT).as_posix()
+                                for p in _pin_module.pinned_files(ROOT)])
+    check("independent recomputation agrees on the pin hash",
+          independent_hash == _pin_module.tree_sha256(ROOT))
+    check("static pin half equals the runner-declared executable surface",
+          set(pin.BENCHMARK_PIN_REASONS["static"])
+          == set(load_live_runner().STATIC_EXECUTABLE_SURFACE))
+
+    pinned = {p.relative_to(ROOT).as_posix() for p in pin.pinned_files(ROOT)}
+    measured = measured_transcript_reads()
+    uncovered = sorted(measured - pinned)
+    check("every structurally measured transcript read is covered by the pin",
+          not uncovered, str(uncovered)[:400])
+    check("the measurement itself is non-trivial (recorded runs are readable)",
+          len(measured) >= 10, f"measured={len(measured)}")
+    static_set = set(pin.BENCHMARK_PIN_REASONS["static"])
+    unjustified_dynamic = sorted(
+        root for root in pin.BENCHMARK_PIN_REASONS["dynamic"]
+        if not any(path == root or path.startswith(root + "/")
+                   for path in measured))
+    check("every dynamic pin root covers at least one measured read",
+          not unjustified_dynamic, str(unjustified_dynamic))
+    check("reason halves do not overlap",
+          not (static_set & set(pin.BENCHMARK_PIN_REASONS["dynamic"])))
+    # Находка r2: чтение после `cd .itd-plugin/...` с относительным операндом
+    # литеральным сканом невидимо. Общий парс произвольного shell неразрешим
+    # (урок ADR-008), поэтому сторож fail-closed по ЛИТЕРАЛЬНОЙ cd-цели:
+    # каждая cd-цель внутри плагина обязана быть покрыта пином как каталог —
+    # тогда любые относительные чтения внутри неё покрыты надмножеством.
+    # На записанных 52 прогонах cd-целей ноль (замер 2026-08-26); сторож
+    # взводится будущим re-record, а не остаётся пустым обещанием.
+    cd_targets = measured_cd_targets()
+    pinned_dirs = {raw for raw in pin.BENCHMARK_PIN_ROOTS
+                   if (ROOT / raw).is_dir()}
+    uncovered_cd = sorted(
+        target for target in cd_targets
+        if not any(target == d or target.startswith(d + "/")
+                   for d in pinned_dirs))
+    check("every recorded cd-target inside the plugin is pin-covered as a "
+          f"directory (cdTargets={len(cd_targets)})",
+          not uncovered_cd, str(uncovered_cd)[:300])
+    # Сужение реально: репрезентативные горячие точки прежнего трения — вне пина.
+    for outsider in ("skills/review/SKILL.md", "skills/task/SKILL.md",
+                     "hooks/check-review-before-commit.sh"):
+        check(f"non-executed surface stays out of the pin: {outsider}",
+              outsider not in pinned and (ROOT / outsider).is_file())
+    check("executed surface stays inside the pin",
+          "skills/blueprint/SKILL.md" in pinned
+          and "agents/devils-advocate.md" in pinned)
+
+    # Мутации по построению: правка вне набора хеш НЕ меняет, внутри — меняет.
+    with tempfile.TemporaryDirectory(prefix="itd-pin-mutation-") as scratch:
+        mini = Path(scratch)
+        subprocess.run(["git", "init", "-q", str(mini)], check=True)
+        inside = mini / "skills" / "blueprint"
+        inside.mkdir(parents=True)
+        (inside / "SKILL.md").write_text("inside\n", encoding="utf-8")
+        outside = mini / "skills" / "review"
+        outside.mkdir(parents=True)
+        (outside / "SKILL.md").write_text("outside\n", encoding="utf-8")
+        (mini / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+        base_sha = pin.tree_sha256(mini)
+        (outside / "SKILL.md").write_text("outside CHANGED\n", encoding="utf-8")
+        check("editing a file OUTSIDE the pin does not invalidate the sha",
+              pin.tree_sha256(mini) == base_sha)
+        (inside / "SKILL.md").write_text("inside CHANGED\n", encoding="utf-8")
+        check("editing a file INSIDE the pin does invalidate the sha",
+              pin.tree_sha256(mini) != base_sha)
+
+    if args.require_evidence:
+        verify_evidence(args.evidence.resolve(), args.max_age_days)
+    print(f"\n{passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
